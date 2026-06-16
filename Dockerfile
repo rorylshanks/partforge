@@ -1,10 +1,15 @@
-FROM golang:1.24-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.24-bookworm AS build
 WORKDIR /src
+ARG TARGETARCH
 COPY go.mod go.sum* ./
 RUN go mod download
-RUN go install github.com/peak/s5cmd/v2@v2.3.0
+RUN mkdir -p /tmp/s5cmd-build /out \
+    && cd /tmp/s5cmd-build \
+    && go mod init example.com/s5cmd-build \
+    && go get github.com/peak/s5cmd/v2@v2.3.0 \
+    && CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -o /out/s5cmd github.com/peak/s5cmd/v2
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/partforge ./cmd/partforge
+RUN CGO_ENABLED=0 GOARCH=${TARGETARCH} go build -o /out/partforge ./cmd/partforge
 
 FROM ubuntu:24.04
 ARG DEBIAN_FRONTEND=noninteractive
@@ -23,7 +28,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/partforge /usr/local/bin/partforge
-COPY --from=build /go/bin/s5cmd /usr/local/bin/s5cmd
+COPY --from=build /out/s5cmd /usr/local/bin/s5cmd
 RUN chmod 0755 /usr/local/bin/partforge /usr/local/bin/s5cmd
 USER clickhouse
 ENTRYPOINT ["/usr/local/bin/partforge"]
