@@ -2,11 +2,13 @@ package rewrite
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,11 +22,12 @@ import (
 )
 
 type Processor struct {
-	S3Copy       s3copy.Copier
-	ClickHouse   chhttp.Client
-	WorkDir      string
-	MergeTimeout time.Duration
-	Metrics      metrics.Recorder
+	S3Copy         s3copy.Copier
+	ClickHouse     chhttp.Client
+	WorkDir        string
+	MergeTimeout   time.Duration
+	Metrics        metrics.Recorder
+	InsertSettings chhttp.QuerySettings
 }
 
 type WorkItem struct {
@@ -156,7 +159,7 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	}
 	p.recorder().SetActivePartStats("source", m, sourceStats)
 
-	if err := p.runInsertSelect(ctx, m); err != nil {
+	if err := p.runInsertSelectWithRetries(ctx, m, destDDL); err != nil {
 		return fmt.Errorf("run insert-select: %w", err)
 	}
 	if err := p.waitForMerges(ctx, m.Dest.Database, m.Dest.Table); err != nil {
@@ -191,14 +194,56 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	return artifact.WriteManifest(finishedRoot, m)
 }
 
-func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest) error {
-	queryID := "partforge-" + m.JobID + "-" + m.PartID
+func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Manifest, destDDL string) error {
+	settings := cloneQuerySettings(p.InsertSettings)
+	for attempt := 1; ; attempt++ {
+		if err := p.runInsertSelect(ctx, m, attempt, settings); err != nil {
+			if !retryableInsertSelectError(err) {
+				return err
+			}
+			nextSettings, reduced, reduceErr := reduceInsertSelectThreadSettings(settings)
+			if reduceErr != nil {
+				return reduceErr
+			}
+			if !reduced {
+				return err
+			}
+			backoff := insertSelectRetryBackoff(attempt)
+			slog.Warn(
+				"insert-select failed with retryable resource error; retrying with lower thread settings",
+				"job_id", m.JobID,
+				"part_id", m.PartID,
+				"attempt", attempt,
+				"next_attempt", attempt+1,
+				"backoff", backoff.String(),
+				"max_threads", nextSettings["max_threads"],
+				"max_insert_threads", nextSettings["max_insert_threads"],
+				"error", err,
+			)
+			if resetErr := resetDestinationTable(ctx, p.ClickHouse, m, destDDL); resetErr != nil {
+				return fmt.Errorf("insert-select failed with retryable resource error (%w), but reset destination table failed: %v", err, resetErr)
+			}
+			if err := sleepOrDone(ctx, backoff); err != nil {
+				return err
+			}
+			settings = nextSettings
+			continue
+		}
+		return nil
+	}
+}
+
+func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, attempt int, settings chhttp.QuerySettings) error {
+	queryID := fmt.Sprintf("partforge-%s-%s-attempt-%d", m.JobID, m.PartID, attempt)
 	queryCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- p.ClickHouse.ExecWithOptions(queryCtx, m.SQL.InsertSelect, chhttp.QueryOptions{QueryID: queryID})
+		errCh <- p.ClickHouse.ExecWithOptions(queryCtx, m.SQL.InsertSelect, chhttp.QueryOptions{
+			QueryID:  queryID,
+			Settings: settings,
+		})
 	}()
 
 	recorder := p.recorder()
@@ -237,6 +282,116 @@ func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest) err
 			<-errCh
 			return ctx.Err()
 		}
+	}
+}
+
+func resetDestinationTable(ctx context.Context, ch chhttp.Client, m manifest.Manifest, destDDL string) error {
+	table := chhttp.TableSQL(m.Dest.Database, m.Dest.Table)
+	if err := ch.Exec(ctx, "DROP TABLE IF EXISTS "+table+" SYNC"); err != nil {
+		return fmt.Errorf("drop destination table before retry: %w", err)
+	}
+	if err := ch.Exec(ctx, destDDL); err != nil {
+		return fmt.Errorf("recreate destination table before retry: %w", err)
+	}
+	return nil
+}
+
+func cloneQuerySettings(settings chhttp.QuerySettings) chhttp.QuerySettings {
+	if len(settings) == 0 {
+		return nil
+	}
+	out := make(chhttp.QuerySettings, len(settings))
+	for key, value := range settings {
+		out[key] = value
+	}
+	return out
+}
+
+func reduceInsertSelectThreadSettings(settings chhttp.QuerySettings) (chhttp.QuerySettings, bool, error) {
+	currentInsertThreads, ok, err := positiveIntSetting(settings, "max_insert_threads")
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	if currentInsertThreads <= 1 {
+		return nil, false, nil
+	}
+
+	next := cloneQuerySettings(settings)
+	next["max_insert_threads"] = strconv.Itoa(halvedAtLeastOne(currentInsertThreads))
+	if currentMaxThreads, ok, err := positiveIntSetting(settings, "max_threads"); err != nil {
+		return nil, false, err
+	} else if ok && currentMaxThreads > 1 {
+		next["max_threads"] = strconv.Itoa(halvedAtLeastOne(currentMaxThreads))
+	}
+	return next, true, nil
+}
+
+func positiveIntSetting(settings chhttp.QuerySettings, name string) (int, bool, error) {
+	if len(settings) == 0 {
+		return 0, false, nil
+	}
+	raw, ok := settings[name]
+	if !ok {
+		return 0, false, nil
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, false, fmt.Errorf("parse clickhouse setting %s=%q: %w", name, raw, err)
+	}
+	if value < 1 {
+		return 0, false, fmt.Errorf("clickhouse setting %s must be at least 1, got %d", name, value)
+	}
+	return value, true, nil
+}
+
+func halvedAtLeastOne(value int) int {
+	next := value / 2
+	if next < 1 {
+		return 1
+	}
+	return next
+}
+
+func retryableInsertSelectError(err error) bool {
+	var queryErr *chhttp.QueryError
+	if !errors.As(err, &queryErr) {
+		return false
+	}
+	body := strings.ToLower(queryErr.Body)
+	for _, marker := range []string{
+		"memory_limit_exceeded",
+		"memory limit",
+		"cannot allocate memory",
+		"not enough memory",
+		"std::bad_alloc",
+		"too many threads",
+	} {
+		if strings.Contains(body, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func insertSelectRetryBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		return time.Second
+	}
+	if attempt >= 5 {
+		return 10 * time.Second
+	}
+	backoff := time.Second << (attempt - 1)
+	return backoff
+}
+
+func sleepOrDone(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 

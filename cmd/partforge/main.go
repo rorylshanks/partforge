@@ -23,6 +23,7 @@ import (
 	"github.com/partforge/partforge/internal/manifest"
 	"github.com/partforge/partforge/internal/metrics"
 	"github.com/partforge/partforge/internal/parts"
+	"github.com/partforge/partforge/internal/resources"
 	"github.com/partforge/partforge/internal/rewrite"
 	"github.com/partforge/partforge/internal/s3copy"
 	"github.com/partforge/partforge/internal/state"
@@ -259,6 +260,23 @@ func runWorker(ctx context.Context, args []string) error {
 		return err
 	}
 
+	workerLimits, err := resources.DetectLimits()
+	if err != nil {
+		return fmt.Errorf("detect worker resource limits: %w", err)
+	}
+	insertSettings, err := resources.InsertSelectSettings(workerLimits)
+	if err != nil {
+		return fmt.Errorf("derive clickhouse insert settings: %w", err)
+	}
+	slog.Info(
+		"configured clickhouse insert-select settings",
+		"cpus", workerLimits.CPUs,
+		"memory_bytes", workerLimits.MemoryBytes,
+		"max_threads", insertSettings["max_threads"],
+		"max_insert_threads", insertSettings["max_insert_threads"],
+		"max_memory_usage", insertSettings["max_memory_usage"],
+	)
+
 	var server *chproc.Server
 	if *startClickHouse {
 		server, err = chproc.Start(ctx, chproc.Config{
@@ -286,11 +304,12 @@ func runWorker(ctx context.Context, args []string) error {
 
 	ch := chhttp.Client{URL: *clickHouseURL, User: *clickHouseUser, Password: *clickHousePassword}
 	processor := rewrite.Processor{
-		S3Copy:       s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
-		ClickHouse:   ch,
-		WorkDir:      *workDir,
-		MergeTimeout: *mergeTimeout,
-		Metrics:      recorder,
+		S3Copy:         s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
+		ClickHouse:     ch,
+		WorkDir:        *workDir,
+		MergeTimeout:   *mergeTimeout,
+		Metrics:        recorder,
+		InsertSettings: insertSettings,
 	}
 
 	for {

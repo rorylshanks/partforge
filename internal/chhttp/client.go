@@ -18,7 +18,19 @@ type Client struct {
 }
 
 type QueryOptions struct {
-	QueryID string
+	QueryID  string
+	Settings QuerySettings
+}
+
+type QuerySettings map[string]string
+
+type QueryError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *QueryError) Error() string {
+	return fmt.Sprintf("clickhouse query failed with status %d: %s", e.StatusCode, strings.TrimSpace(e.Body))
 }
 
 func (c Client) Exec(ctx context.Context, query string) error {
@@ -60,7 +72,7 @@ func (c Client) QueryStringWithOptions(ctx context.Context, query string, opts Q
 		return "", err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("clickhouse query failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", &QueryError{StatusCode: resp.StatusCode, Body: string(body)}
 	}
 	return string(body), nil
 }
@@ -70,9 +82,17 @@ func (c Client) endpoint(opts QueryOptions) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if opts.QueryID != "" {
+	if opts.QueryID != "" || len(opts.Settings) > 0 {
 		q := u.Query()
-		q.Set("query_id", opts.QueryID)
+		if opts.QueryID != "" {
+			q.Set("query_id", opts.QueryID)
+		}
+		for key, value := range opts.Settings {
+			if strings.TrimSpace(key) == "" {
+				return "", fmt.Errorf("clickhouse setting name is empty")
+			}
+			q.Set(key, value)
+		}
 		u.RawQuery = q.Encode()
 	}
 	return u.String(), nil
