@@ -49,13 +49,18 @@ docker compose exec -T localstack awslocal dynamodb create-table \
 
 docker compose exec -T clickhouse clickhouse-client --multiquery < e2e/sql/setup_and_freeze.sql
 
-part_count="$(find "$DATA_DIR" -path "*/shadow/e2e_freeze/*/checksums.txt" | wc -l | tr -d ' ')"
+clickhouse_owner="$(docker compose exec -T clickhouse stat -c '%u:%g' /var/lib/clickhouse)"
+
+part_count="$(
+  docker compose exec -T -u "$clickhouse_owner" clickhouse \
+    find /var/lib/clickhouse -path "*/shadow/e2e_freeze/*/checksums.txt" |
+    wc -l |
+    tr -d ' '
+)"
 if [[ "$part_count" == "0" ]]; then
   echo "no frozen parts found" >&2
   exit 1
 fi
-
-clickhouse_owner="$(stat -c '%u:%g' "$DATA_DIR")"
 
 CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --user "$clickhouse_owner" \
   --workdir /work \
