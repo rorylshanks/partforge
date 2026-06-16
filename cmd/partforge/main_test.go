@@ -149,6 +149,75 @@ func TestApplyConfigDefaultsDoesNotOverrideCLI(t *testing.T) {
 	}
 }
 
+func TestApplyClickHouseClientConfigDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.xml")
+	writeTestFile(t, path, `<config>
+  <user>alice</user>
+  <password>secret</password>
+</config>`)
+
+	user := ""
+	password := ""
+	if err := applyClickHouseClientConfigDefaultsFrom(path, &user, &password); err != nil {
+		t.Fatal(err)
+	}
+
+	if user != "alice" || password != "secret" {
+		t.Fatalf("credentials = %q/%q", user, password)
+	}
+}
+
+func TestApplyClickHouseClientConfigDefaultsFillsOnlyMissingCredentials(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.xml")
+	writeTestFile(t, path, `<config>
+  <user>alice</user>
+  <password>secret</password>
+</config>`)
+
+	user := "bob"
+	password := ""
+	if err := applyClickHouseClientConfigDefaultsFrom(path, &user, &password); err != nil {
+		t.Fatal(err)
+	}
+
+	if user != "bob" || password != "secret" {
+		t.Fatalf("credentials = %q/%q", user, password)
+	}
+}
+
+func TestApplyClickHouseClientConfigDefaultsDoesNotOverrideConfiguredCredentials(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.xml")
+	writeTestFile(t, path, `<config>
+  <user>alice</user>
+  <password>secret</password>
+</config>`)
+
+	user := "bob"
+	password := "configured"
+	if err := applyClickHouseClientConfigDefaultsFrom(path, &user, &password); err != nil {
+		t.Fatal(err)
+	}
+
+	if user != "bob" || password != "configured" {
+		t.Fatalf("credentials = %q/%q", user, password)
+	}
+}
+
+func TestApplyClickHouseClientConfigDefaultsUsesDefaultUserForPasswordOnlyConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.xml")
+	writeTestFile(t, path, `<config><password>secret</password></config>`)
+
+	user := ""
+	password := ""
+	if err := applyClickHouseClientConfigDefaultsFrom(path, &user, &password); err != nil {
+		t.Fatal(err)
+	}
+
+	if user != "default" || password != "secret" {
+		t.Fatalf("credentials = %q/%q", user, password)
+	}
+}
+
 func writeTestFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {

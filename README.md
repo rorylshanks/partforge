@@ -62,6 +62,8 @@ Top-level config keys apply to every command. Command-specific keys under `comma
 
 Config keys may use either flag-style names such as `aws-region` or JSON-style names such as `aws_region`.
 
+ClickHouse connection settings are resolved in order: CLI flags, JSON config, `/etc/clickhouse-client/config.xml`, then built-in defaults.
+
 ## Worker Container
 
 The worker image is a single Ubuntu-based container with ClickHouse packages, `s5cmd`, and the Go binary copied in from a builder stage. Its entrypoint is the Go worker binary, and the worker starts `clickhouse server` as a child process before claiming `READY` parts from DynamoDB. The default ClickHouse version is `26.3.10.60`.
@@ -172,5 +174,7 @@ FROM src_db.events
 `upload-freeze` discovers every ClickHouse disk from `system.disks`, scans each local disk's `shadow/<freeze>` directory, and includes the disk name in the part identity. S3-backed ClickHouse disks are rejected for now.
 
 Part state is stored in DynamoDB. Workers claim work with conditional updates from `READY` to `IN_PROGRESS`; handled processing errors are written as `FAILED`; successful rewrites become `FINISHED`; and `import-finished` transitions parts through `IMPORTING` to `IMPORTED`. If a worker process dies outside handled code, the part remains visible as `IN_PROGRESS` for manual inspection or reset.
+
+Source part artifacts keep stable S3 prefixes. Finished artifacts are written under per-attempt prefixes, and the `finished_key` in DynamoDB is updated only after a worker successfully uploads an attempt, so retries do not overwrite earlier output.
 
 `import-finished` requires the destination table to be empty by default. This is intentional: attaching the same finished artifacts twice would duplicate data, and there is no exact transaction spanning S3 and ClickHouse. Use `-require-empty=false` only when importing into a table that you have verified manually.

@@ -190,8 +190,40 @@ func (s *Store) ClaimNextReady(ctx context.Context, workerID string, now time.Ti
 	return nil, nil
 }
 
-func (s *Store) MarkFinished(ctx context.Context, part Part, workerID string, now time.Time) error {
-	return s.transitionOwned(ctx, part, workerID, StatusFinished, "finished_at", "", now)
+func (s *Store) MarkFinished(ctx context.Context, part Part, workerID, finishedKey string, now time.Time) error {
+	if strings.TrimSpace(workerID) == "" {
+		return errors.New("worker id is required")
+	}
+	if strings.TrimSpace(finishedKey) == "" {
+		return errors.New("finished key is required")
+	}
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.table),
+		Key:       part.key(),
+		ConditionExpression: aws.String(
+			"#status = :from AND #worker_id = :worker",
+		),
+		UpdateExpression: aws.String(
+			"SET #status = :to, gsi1pk = :gsi1pk, updated_at = :now, finished_at = :now, finished_key = :finished_key REMOVE #worker_id, #error",
+		),
+		ExpressionAttributeNames: map[string]string{
+			"#error":     "error",
+			"#status":    "status",
+			"#worker_id": "worker_id",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":finished_key": stringAttr(finishedKey),
+			":from":         stringAttr(string(StatusInProgress)),
+			":gsi1pk":       stringAttr(statusKey(StatusFinished)),
+			":now":          stringAttr(formatTime(now)),
+			":to":           stringAttr(string(StatusFinished)),
+			":worker":       stringAttr(workerID),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("mark part %s/%s finished: %w", part.JobID, part.PartID, err)
+	}
+	return nil
 }
 
 func (s *Store) MarkFailed(ctx context.Context, part Part, workerID string, cause error, now time.Time) error {

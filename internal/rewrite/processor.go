@@ -41,11 +41,15 @@ type ProgressSnapshot struct {
 }
 
 type WorkItem struct {
-	Bucket      string
-	SourceKey   string
+	Bucket    string
+	SourceKey string
+	JobID     string
+	PartID    string
+	Attempt   int
+}
+
+type ProcessResult struct {
 	FinishedKey string
-	JobID       string
-	PartID      string
 }
 
 type activePart struct {
@@ -54,79 +58,90 @@ type activePart struct {
 	Path        string
 }
 
-func (p Processor) ProcessPart(ctx context.Context, item WorkItem) error {
-	if item.Bucket == "" || item.SourceKey == "" || item.FinishedKey == "" || item.JobID == "" || item.PartID == "" {
-		return fmt.Errorf("work item is missing bucket, source_key, finished_key, job_id, or part_id")
+func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (ProcessResult, error) {
+	if item.Bucket == "" || item.SourceKey == "" || item.JobID == "" || item.PartID == "" {
+		return ProcessResult{}, fmt.Errorf("work item is missing bucket, source_key, job_id, or part_id")
+	}
+	if item.Attempt < 1 {
+		return ProcessResult{}, fmt.Errorf("work item attempt must be at least 1, got %d", item.Attempt)
 	}
 	if err := validateSafeSegment(item.JobID); err != nil {
-		return err
+		return ProcessResult{}, err
 	}
 	if err := validateSafeSegment(item.PartID); err != nil {
-		return err
+		return ProcessResult{}, err
 	}
 
 	root := filepath.Join(defaultWorkDir(p.WorkDir), item.JobID, item.PartID)
 	if err := os.RemoveAll(root); err != nil {
-		return err
+		return ProcessResult{}, err
 	}
 	defer os.RemoveAll(root)
 	if err := os.MkdirAll(root, 0o755); err != nil {
-		return err
+		return ProcessResult{}, err
 	}
 
 	sourceRoot := filepath.Join(root, "source")
 	if err := p.S3Copy.DownloadPrefix(ctx, item.Bucket, item.SourceKey, sourceRoot); err != nil {
-		return fmt.Errorf("download source artifact %s: %w", item.SourceKey, err)
+		return ProcessResult{}, fmt.Errorf("download source artifact %s: %w", item.SourceKey, err)
 	}
 
 	m, err := artifact.ReadManifest(sourceRoot)
 	if err != nil {
-		return fmt.Errorf("read source manifest: %w", err)
+		return ProcessResult{}, fmt.Errorf("read source manifest: %w", err)
 	}
 	if m.JobID != item.JobID || m.PartID != item.PartID {
-		return fmt.Errorf("work item references %s/%s but manifest contains %s/%s", item.JobID, item.PartID, m.JobID, m.PartID)
+		return ProcessResult{}, fmt.Errorf("work item references %s/%s but manifest contains %s/%s", item.JobID, item.PartID, m.JobID, m.PartID)
 	}
-	if m.S3.Bucket != item.Bucket || m.S3.SourceKey != item.SourceKey || m.S3.FinishedKey != item.FinishedKey {
-		return fmt.Errorf("work item S3 reference does not match manifest")
+	if m.S3.Bucket != item.Bucket || m.S3.SourceKey != item.SourceKey {
+		return ProcessResult{}, fmt.Errorf("work item S3 reference does not match manifest")
 	}
 
 	if err := artifact.RemoveManifest(sourceRoot); err != nil {
-		return err
+		return ProcessResult{}, err
 	}
 
 	recorder := p.recorder()
 	recorder.ForgeStarted(m)
 	finishedRoot := filepath.Join(root, "finished")
-	if err := p.rewritePart(ctx, m, sourceRoot, finishedRoot); err != nil {
+	output, err := p.rewritePart(ctx, m, sourceRoot, finishedRoot)
+	if err != nil {
 		recorder.ForgeFailed(m)
-		return err
+		return ProcessResult{}, err
+	}
+
+	m.Output = output
+	m.S3.FinishedKey = manifest.FinishedPartAttemptPrefix(m.S3.FinishedKey, item.Attempt, time.Now().UTC())
+	if err := artifact.WriteManifest(finishedRoot, m); err != nil {
+		recorder.ForgeFailed(m)
+		return ProcessResult{}, err
 	}
 	if err := p.S3Copy.UploadDir(ctx, finishedRoot, m.S3.Bucket, m.S3.FinishedKey); err != nil {
 		recorder.ForgeFailed(m)
-		return fmt.Errorf("upload finished artifact %s: %w", m.S3.FinishedKey, err)
+		return ProcessResult{}, fmt.Errorf("upload finished artifact %s: %w", m.S3.FinishedKey, err)
 	}
 	recorder.ForgeCompleted(m)
 	slog.Info("processed part", "job_id", m.JobID, "part_id", m.PartID, "finished_key", m.S3.FinishedKey)
-	return nil
+	return ProcessResult{FinishedKey: m.S3.FinishedKey}, nil
 }
 
-func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourcePartRoot, finishedRoot string) error {
+func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourcePartRoot, finishedRoot string) (manifest.Output, error) {
 	if m.Source.Database == m.Dest.Database && m.Source.Table == m.Dest.Table {
-		return fmt.Errorf("source and destination table names must differ inside the worker")
+		return manifest.Output{}, fmt.Errorf("source and destination table names must differ inside the worker")
 	}
 	sourceDDL, err := ddl.ForTable(m.SQL.SourceSchema, m.Source.Database, m.Source.Table)
 	if err != nil {
-		return fmt.Errorf("normalize source DDL: %w", err)
+		return manifest.Output{}, fmt.Errorf("normalize source DDL: %w", err)
 	}
 	destDDL, err := ddl.ForTable(m.SQL.DestinationSchema, m.Dest.Database, m.Dest.Table)
 	if err != nil {
-		return fmt.Errorf("normalize destination DDL: %w", err)
+		return manifest.Output{}, fmt.Errorf("normalize destination DDL: %w", err)
 	}
 
 	databases := uniqueStrings(m.Source.Database, m.Dest.Database)
 	for _, database := range databases {
 		if err := p.ClickHouse.Exec(ctx, "DROP DATABASE IF EXISTS "+chhttp.Ident(database)+" SYNC"); err != nil {
-			return fmt.Errorf("drop worker database %s: %w", database, err)
+			return manifest.Output{}, fmt.Errorf("drop worker database %s: %w", database, err)
 		}
 	}
 	defer func() {
@@ -139,75 +154,74 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 
 	for _, database := range databases {
 		if err := p.ClickHouse.Exec(ctx, "CREATE DATABASE "+chhttp.Ident(database)); err != nil {
-			return fmt.Errorf("create worker database %s: %w", database, err)
+			return manifest.Output{}, fmt.Errorf("create worker database %s: %w", database, err)
 		}
 	}
 	if err := p.ClickHouse.Exec(ctx, sourceDDL); err != nil {
-		return fmt.Errorf("create source table: %w", err)
+		return manifest.Output{}, fmt.Errorf("create source table: %w", err)
 	}
 	if err := p.ClickHouse.Exec(ctx, destDDL); err != nil {
-		return fmt.Errorf("create destination table: %w", err)
+		return manifest.Output{}, fmt.Errorf("create destination table: %w", err)
 	}
 
 	sourceDataPath, err := p.tableDataPath(ctx, m.Source.Database, m.Source.Table)
 	if err != nil {
-		return err
+		return manifest.Output{}, err
 	}
 	sourceDetached := filepath.Join(sourceDataPath, "detached")
 	if err := os.MkdirAll(sourceDetached, 0o755); err != nil {
-		return err
+		return manifest.Output{}, err
 	}
 	if err := fileutil.CopyDir(sourcePartRoot, filepath.Join(sourceDetached, m.Part.Name)); err != nil {
-		return fmt.Errorf("copy source part to detached: %w", err)
+		return manifest.Output{}, fmt.Errorf("copy source part to detached: %w", err)
 	}
 	if err := p.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(m.Source.Database, m.Source.Table)+" ATTACH PART "+chhttp.StringLiteral(m.Part.Name)); err != nil {
-		return fmt.Errorf("attach source part %s: %w", m.Part.Name, err)
+		return manifest.Output{}, fmt.Errorf("attach source part %s: %w", m.Part.Name, err)
 	}
 	sourceStats, err := p.activePartStats(ctx, m.Source.Database, m.Source.Table)
 	if err != nil {
-		return fmt.Errorf("measure source active parts: %w", err)
+		return manifest.Output{}, fmt.Errorf("measure source active parts: %w", err)
 	}
 	p.recorder().SetActivePartStats("source", m, sourceStats)
 	if err := p.reportProgress(ctx, m, ProgressSnapshot{SourceActivePartStats: &sourceStats}); err != nil {
-		return err
+		return manifest.Output{}, err
 	}
 
 	if err := p.runInsertSelectWithRetries(ctx, m, destDDL); err != nil {
-		return fmt.Errorf("run insert-select: %w", err)
+		return manifest.Output{}, fmt.Errorf("run insert-select: %w", err)
 	}
 	if err := p.waitForMerges(ctx, m.Dest.Database, m.Dest.Table); err != nil {
-		return err
+		return manifest.Output{}, err
 	}
 	destStats, err := p.activePartStats(ctx, m.Dest.Database, m.Dest.Table)
 	if err != nil {
-		return fmt.Errorf("measure destination active parts: %w", err)
+		return manifest.Output{}, fmt.Errorf("measure destination active parts: %w", err)
 	}
 	p.recorder().SetActivePartStats("destination", m, destStats)
 	if err := p.reportProgress(ctx, m, ProgressSnapshot{DestinationActivePartStats: &destStats}); err != nil {
-		return err
+		return manifest.Output{}, err
 	}
 
 	activeParts, err := p.activeParts(ctx, m.Dest.Database, m.Dest.Table)
 	if err != nil {
-		return err
+		return manifest.Output{}, err
 	}
 	outputParts := make([]manifest.OutputPart, 0, len(activeParts))
 	for _, part := range activeParts {
 		outputParts = append(outputParts, manifest.OutputPart{Name: part.Name, PartitionID: part.PartitionID})
 		if err := p.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(m.Dest.Database, m.Dest.Table)+" DETACH PART "+chhttp.StringLiteral(part.Name)); err != nil {
-			return fmt.Errorf("detach destination part %s: %w", part.Name, err)
+			return manifest.Output{}, fmt.Errorf("detach destination part %s: %w", part.Name, err)
 		}
 		detachedPath, err := detachedPartPath(part.Path, part.Name)
 		if err != nil {
-			return err
+			return manifest.Output{}, err
 		}
 		if err := fileutil.CopyDir(detachedPath, artifact.FinishedPartPath(finishedRoot, part.Name)); err != nil {
-			return fmt.Errorf("copy finished part %s: %w", part.Name, err)
+			return manifest.Output{}, fmt.Errorf("copy finished part %s: %w", part.Name, err)
 		}
 	}
 
-	m.Output.Parts = outputParts
-	return artifact.WriteManifest(finishedRoot, m)
+	return manifest.Output{Parts: outputParts}, nil
 }
 
 func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Manifest, destDDL string) error {

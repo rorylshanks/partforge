@@ -3,6 +3,7 @@ package manifest
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"path"
 	"strings"
 	"time"
@@ -93,6 +94,13 @@ func SourcePartPrefix(prefix, jobID, partID string) string {
 
 func FinishedPartPrefix(prefix, jobID, partID string) string {
 	return cleanKey(prefix, "jobs", jobID, "finished", partID)
+}
+
+func FinishedPartAttemptPrefix(finishedPartPrefix string, attempt int, finishedAt time.Time) string {
+	return cleanKey(
+		finishedPartPrefix,
+		fmt.Sprintf("attempt-%06d-%s", attempt, finishedAt.UTC().Format("20060102T150405.000000000Z")),
+	)
 }
 
 func FinishedPrefix(prefix, jobID string) string {

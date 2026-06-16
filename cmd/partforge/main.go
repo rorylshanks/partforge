@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"flag"
 	"fmt"
@@ -32,6 +33,7 @@ import (
 const defaultClickHouseURL = "http://127.0.0.1:8123"
 const defaultStateTable = "partforge"
 const defaultConfigPath = "/etc/partforge/config.json"
+const defaultClickHouseClientConfigPath = "/etc/clickhouse-client/config.xml"
 
 var version = "dev"
 
@@ -123,6 +125,9 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		return err
 	}
 	if err := applyConfigDefaults(fs, *configPath, "upload-freeze"); err != nil {
+		return err
+	}
+	if err := applyClickHouseClientConfigDefaults(clickHouseUser, clickHousePassword); err != nil {
 		return err
 	}
 
@@ -248,6 +253,9 @@ func runWorker(ctx context.Context, args []string) error {
 	if err := applyConfigDefaults(fs, *configPath, "worker"); err != nil {
 		return err
 	}
+	if err := applyClickHouseClientConfigDefaults(clickHouseUser, clickHousePassword); err != nil {
+		return err
+	}
 	stateStore, err := state.New(ctx, state.Config{
 		Region:   *region,
 		Endpoint: *dynamoEndpoint,
@@ -336,19 +344,20 @@ func runWorker(ctx context.Context, args []string) error {
 		}
 
 		workItem := rewrite.WorkItem{
-			Bucket:      part.Bucket,
-			SourceKey:   part.SourceKey,
-			FinishedKey: part.FinishedKey,
-			JobID:       part.JobID,
-			PartID:      part.PartID,
+			Bucket:    part.Bucket,
+			SourceKey: part.SourceKey,
+			JobID:     part.JobID,
+			PartID:    part.PartID,
+			Attempt:   part.Attempts,
 		}
-		if err := processor.ProcessPart(ctx, workItem); err != nil {
+		result, err := processor.ProcessPart(ctx, workItem)
+		if err != nil {
 			if markErr := stateStore.MarkFailed(ctx, *part, resolvedWorkerID, err, time.Now().UTC()); markErr != nil {
 				return fmt.Errorf("process part %s/%s: %w; additionally failed to mark failed: %v", part.JobID, part.PartID, err, markErr)
 			}
 			return err
 		}
-		if err := stateStore.MarkFinished(ctx, *part, resolvedWorkerID, time.Now().UTC()); err != nil {
+		if err := stateStore.MarkFinished(ctx, *part, resolvedWorkerID, result.FinishedKey, time.Now().UTC()); err != nil {
 			return err
 		}
 		if *once {
@@ -379,6 +388,9 @@ func runImportFinished(ctx context.Context, args []string) error {
 		return err
 	}
 	if err := applyConfigDefaults(fs, *configPath, "import-finished"); err != nil {
+		return err
+	}
+	if err := applyClickHouseClientConfigDefaults(clickHouseUser, clickHousePassword); err != nil {
 		return err
 	}
 	if *database == "" || *table == "" || *jobID == "" {
@@ -652,6 +664,61 @@ func applyConfigDefaults(fs *flag.FlagSet, path, command string) error {
 		}
 	})
 	return firstErr
+}
+
+type clickHouseClientCredentials struct {
+	User     string `xml:"user"`
+	Password string `xml:"password"`
+}
+
+func applyClickHouseClientConfigDefaults(user, password *string) error {
+	return applyClickHouseClientConfigDefaultsFrom(defaultClickHouseClientConfigPath, user, password)
+}
+
+func applyClickHouseClientConfigDefaultsFrom(path string, user, password *string) error {
+	if user == nil || password == nil {
+		return errors.New("clickhouse credential defaults require user and password targets")
+	}
+	needsUser := strings.TrimSpace(*user) == ""
+	needsPassword := *password == ""
+	if !needsUser && !needsPassword {
+		return nil
+	}
+
+	creds, err := readClickHouseClientCredentials(path)
+	if err != nil {
+		return err
+	}
+	if needsUser && creds.User != "" {
+		*user = creds.User
+	}
+	if needsPassword && creds.Password != "" {
+		*password = creds.Password
+	}
+	if strings.TrimSpace(*user) == "" && *password != "" {
+		*user = "default"
+	}
+	return nil
+}
+
+func readClickHouseClientCredentials(path string) (clickHouseClientCredentials, error) {
+	if strings.TrimSpace(path) == "" {
+		return clickHouseClientCredentials{}, nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return clickHouseClientCredentials{}, nil
+		}
+		return clickHouseClientCredentials{}, fmt.Errorf("read clickhouse client config %s: %w", path, err)
+	}
+	var creds clickHouseClientCredentials
+	if err := xml.Unmarshal(b, &creds); err != nil {
+		return clickHouseClientCredentials{}, fmt.Errorf("parse clickhouse client config %s: %w", path, err)
+	}
+	creds.User = strings.TrimSpace(creds.User)
+	creds.Password = strings.TrimSpace(creds.Password)
+	return creds, nil
 }
 
 func readConfig(path string) (map[string]any, error) {
