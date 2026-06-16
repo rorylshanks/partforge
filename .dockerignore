@@ -1,0 +1,6 @@
+.git
+.e2e
+dist
+partforge
+*.test
+tmp/

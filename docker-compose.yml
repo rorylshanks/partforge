@@ -1,0 +1,38 @@
+name: partforge
+
+services:
+  localstack:
+    image: localstack/localstack:3
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      SERVICES: s3,sqs
+    ports:
+      - "4566:4566"
+    volumes:
+      - "./localstack/init:/etc/localstack/init/ready.d:ro"
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.3.10.60
+    ports:
+      - "18123:8123"
+    volumes:
+      - "${CLICKHOUSE_DATA_DIR:-./.e2e/clickhouse-data}:/var/lib/clickhouse"
+      - "./e2e/clickhouse/users.d/default-anyhost.xml:/etc/clickhouse-server/users.d/default-anyhost.xml:ro"
+
+  worker:
+    build: .
+    depends_on:
+      - localstack
+    ports:
+      - "2112:2112"
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    command:
+      - worker
+      - -queue-url=http://localstack:4566/000000000000/partforge
+      - -s3-endpoint=http://localstack:4566
+      - -sqs-endpoint=http://localstack:4566
