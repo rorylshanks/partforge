@@ -22,12 +22,22 @@ import (
 )
 
 type Processor struct {
-	S3Copy         s3copy.Copier
-	ClickHouse     chhttp.Client
-	WorkDir        string
-	MergeTimeout   time.Duration
-	Metrics        metrics.Recorder
-	InsertSettings chhttp.QuerySettings
+	S3Copy           s3copy.Copier
+	ClickHouse       chhttp.Client
+	WorkDir          string
+	MergeTimeout     time.Duration
+	Metrics          metrics.Recorder
+	InsertSettings   chhttp.QuerySettings
+	ProgressInterval time.Duration
+	ReportProgress   ProgressReporter
+}
+
+type ProgressReporter func(context.Context, manifest.Manifest, ProgressSnapshot) error
+
+type ProgressSnapshot struct {
+	QueryProgress              *metrics.QueryProgress
+	SourceActivePartStats      *metrics.PartStats
+	DestinationActivePartStats *metrics.PartStats
 }
 
 type WorkItem struct {
@@ -158,6 +168,9 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 		return fmt.Errorf("measure source active parts: %w", err)
 	}
 	p.recorder().SetActivePartStats("source", m, sourceStats)
+	if err := p.reportProgress(ctx, m, ProgressSnapshot{SourceActivePartStats: &sourceStats}); err != nil {
+		return err
+	}
 
 	if err := p.runInsertSelectWithRetries(ctx, m, destDDL); err != nil {
 		return fmt.Errorf("run insert-select: %w", err)
@@ -170,6 +183,9 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 		return fmt.Errorf("measure destination active parts: %w", err)
 	}
 	p.recorder().SetActivePartStats("destination", m, destStats)
+	if err := p.reportProgress(ctx, m, ProgressSnapshot{DestinationActivePartStats: &destStats}); err != nil {
+		return err
+	}
 
 	activeParts, err := p.activeParts(ctx, m.Dest.Database, m.Dest.Table)
 	if err != nil {
@@ -249,6 +265,7 @@ func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, att
 	recorder := p.recorder()
 	progress := metrics.QueryProgress{}
 	defer recorder.ClearCurrentProgress(m)
+	lastProgressReport := time.Time{}
 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -264,9 +281,13 @@ func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, att
 			}
 			if found {
 				recorder.ObserveProgress(m, progress, finalProgress)
+				if err := p.reportProgress(ctx, m, ProgressSnapshot{QueryProgress: &finalProgress}); err != nil {
+					return err
+				}
 			}
 			return nil
 		case <-ticker.C:
+			now := time.Now()
 			current, found, err := p.queryProgress(ctx, queryID)
 			if err != nil {
 				cancel()
@@ -276,6 +297,14 @@ func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, att
 			if found {
 				recorder.ObserveProgress(m, progress, current)
 				progress = current
+				if shouldReportProgress(p.ProgressInterval, lastProgressReport, now) {
+					if err := p.reportProgress(ctx, m, ProgressSnapshot{QueryProgress: &current}); err != nil {
+						cancel()
+						<-errCh
+						return err
+					}
+					lastProgressReport = now
+				}
 			}
 		case <-ctx.Done():
 			cancel()
@@ -283,6 +312,20 @@ func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, att
 			return ctx.Err()
 		}
 	}
+}
+
+func (p Processor) reportProgress(ctx context.Context, m manifest.Manifest, snapshot ProgressSnapshot) error {
+	if p.ReportProgress == nil {
+		return nil
+	}
+	return p.ReportProgress(ctx, m, snapshot)
+}
+
+func shouldReportProgress(interval time.Duration, last time.Time, now time.Time) bool {
+	if interval <= 0 {
+		return false
+	}
+	return last.IsZero() || !now.Before(last.Add(interval))
 }
 
 func resetDestinationTable(ctx context.Context, ch chhttp.Client, m manifest.Manifest, destDDL string) error {

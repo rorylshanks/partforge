@@ -221,25 +221,26 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 func runWorker(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("worker", flag.ExitOnError)
 	var (
-		configPath           = fs.String("config", defaultConfigPath, "JSON config file path")
-		region               = fs.String("aws-region", "us-east-1", "AWS region")
-		s3Endpoint           = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
-		s5cmdBinary          = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
-		stateTable           = fs.String("state-table", defaultStateTable, "DynamoDB state table")
-		dynamoEndpoint       = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
-		clickHouseURL        = fs.String("clickhouse-url", defaultClickHouseURL, "local ClickHouse HTTP URL")
-		clickHouseUser       = fs.String("clickhouse-user", "", "ClickHouse HTTP user")
-		clickHousePassword   = fs.String("clickhouse-password", "", "ClickHouse HTTP password")
-		startClickHouse      = fs.Bool("start-clickhouse", true, "start clickhouse-server as a child process")
-		clickHouseBinary     = fs.String("clickhouse-binary", "clickhouse", "clickhouse binary path")
-		clickHouseConfigFile = fs.String("clickhouse-config-file", "/etc/clickhouse-server/config.xml", "clickhouse-server config file")
-		once                 = fs.Bool("once", false, "process one part and exit")
-		pollInterval         = fs.Duration("poll-interval", 10*time.Second, "how long to wait before checking for ready work again")
-		workerID             = fs.String("worker-id", "", "worker identity recorded on claimed parts")
-		workDir              = fs.String("work-dir", "/tmp/partforge", "worker scratch directory")
-		mergeTimeout         = fs.Duration("merge-timeout", 10*time.Minute, "maximum time to wait for destination merges")
-		metricsAddr          = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables metrics")
-		metricsPath          = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
+		configPath            = fs.String("config", defaultConfigPath, "JSON config file path")
+		region                = fs.String("aws-region", "us-east-1", "AWS region")
+		s3Endpoint            = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
+		s5cmdBinary           = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
+		stateTable            = fs.String("state-table", defaultStateTable, "DynamoDB state table")
+		dynamoEndpoint        = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
+		clickHouseURL         = fs.String("clickhouse-url", defaultClickHouseURL, "local ClickHouse HTTP URL")
+		clickHouseUser        = fs.String("clickhouse-user", "", "ClickHouse HTTP user")
+		clickHousePassword    = fs.String("clickhouse-password", "", "ClickHouse HTTP password")
+		startClickHouse       = fs.Bool("start-clickhouse", true, "start clickhouse-server as a child process")
+		clickHouseBinary      = fs.String("clickhouse-binary", "clickhouse", "clickhouse binary path")
+		clickHouseConfigFile  = fs.String("clickhouse-config-file", "/etc/clickhouse-server/config.xml", "clickhouse-server config file")
+		once                  = fs.Bool("once", false, "process one part and exit")
+		pollInterval          = fs.Duration("poll-interval", 10*time.Second, "how long to wait before checking for ready work again")
+		workerID              = fs.String("worker-id", "", "worker identity recorded on claimed parts")
+		workDir               = fs.String("work-dir", "/tmp/partforge", "worker scratch directory")
+		mergeTimeout          = fs.Duration("merge-timeout", 10*time.Minute, "maximum time to wait for destination merges")
+		metricsAddr           = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables metrics")
+		metricsPath           = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
+		stateProgressInterval = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress to DynamoDB; <=0 disables progress writes")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -304,12 +305,18 @@ func runWorker(ctx context.Context, args []string) error {
 
 	ch := chhttp.Client{URL: *clickHouseURL, User: *clickHouseUser, Password: *clickHousePassword}
 	processor := rewrite.Processor{
-		S3Copy:         s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
-		ClickHouse:     ch,
-		WorkDir:        *workDir,
-		MergeTimeout:   *mergeTimeout,
-		Metrics:        recorder,
-		InsertSettings: insertSettings,
+		S3Copy:           s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
+		ClickHouse:       ch,
+		WorkDir:          *workDir,
+		MergeTimeout:     *mergeTimeout,
+		Metrics:          recorder,
+		InsertSettings:   insertSettings,
+		ProgressInterval: *stateProgressInterval,
+	}
+	if *stateProgressInterval > 0 {
+		processor.ReportProgress = func(ctx context.Context, m manifest.Manifest, snapshot rewrite.ProgressSnapshot) error {
+			return stateStore.UpdateRewriteProgress(ctx, m.JobID, m.PartID, resolvedWorkerID, stateProgress(snapshot), time.Now().UTC())
+		}
 	}
 
 	for {
@@ -729,6 +736,33 @@ func sleepOrDone(ctx context.Context, d time.Duration) error {
 	}
 }
 
+func stateProgress(snapshot rewrite.ProgressSnapshot) state.RewriteProgress {
+	var progress state.RewriteProgress
+	if snapshot.QueryProgress != nil {
+		progress.QueryProgress = &state.QueryProgress{
+			ReadRows:     snapshot.QueryProgress.ReadRows,
+			ReadBytes:    snapshot.QueryProgress.ReadBytes,
+			WrittenRows:  snapshot.QueryProgress.WrittenRows,
+			WrittenBytes: snapshot.QueryProgress.WrittenBytes,
+		}
+	}
+	if snapshot.SourceActivePartStats != nil {
+		progress.SourceActivePartStats = &state.PartStats{
+			Count: snapshot.SourceActivePartStats.Count,
+			Rows:  snapshot.SourceActivePartStats.Rows,
+			Bytes: snapshot.SourceActivePartStats.Bytes,
+		}
+	}
+	if snapshot.DestinationActivePartStats != nil {
+		progress.DestinationActivePartStats = &state.PartStats{
+			Count: snapshot.DestinationActivePartStats.Count,
+			Rows:  snapshot.DestinationActivePartStats.Rows,
+			Bytes: snapshot.DestinationActivePartStats.Bytes,
+		}
+	}
+	return progress
+}
+
 type jobSummary struct {
 	JobID            string               `json:"job_id"`
 	Status           string               `json:"status"`
@@ -738,6 +772,10 @@ type jobSummary struct {
 	RewritePercent   float64              `json:"rewrite_percent"`
 	ImportCompleted  int                  `json:"import_completed"`
 	ImportPercent    float64              `json:"import_percent"`
+	ReadRows         uint64               `json:"read_rows"`
+	ReadBytes        uint64               `json:"read_bytes"`
+	WrittenRows      uint64               `json:"written_rows"`
+	WrittenBytes     uint64               `json:"written_bytes"`
 	FailedParts      []failedPart         `json:"failed_parts,omitempty"`
 }
 
@@ -773,8 +811,13 @@ func summarizeJob(jobID string, parts []state.Part) jobSummary {
 	}
 
 	var failed []failedPart
+	var readRows, readBytes, writtenRows, writtenBytes uint64
 	for _, part := range parts {
 		counts[part.Status]++
+		readRows += part.ReadRows
+		readBytes += part.ReadBytes
+		writtenRows += part.WrittenRows
+		writtenBytes += part.WrittenBytes
 		if part.Status == state.StatusFailed {
 			failed = append(failed, failedPart{
 				PartID:    part.PartID,
@@ -800,6 +843,10 @@ func summarizeJob(jobID string, parts []state.Part) jobSummary {
 		RewritePercent:   percent(rewriteCompleted, total),
 		ImportCompleted:  importCompleted,
 		ImportPercent:    percent(importCompleted, total),
+		ReadRows:         readRows,
+		ReadBytes:        readBytes,
+		WrittenRows:      writtenRows,
+		WrittenBytes:     writtenBytes,
 		FailedParts:      failed,
 	}
 }
@@ -810,6 +857,8 @@ func printJobSummary(out *os.File, summary jobSummary) {
 	fmt.Fprintf(out, "parts: %d\n", summary.Total)
 	fmt.Fprintf(out, "rewrite_complete: %d/%d %.1f%%\n", summary.RewriteCompleted, summary.Total, summary.RewritePercent)
 	fmt.Fprintf(out, "import_complete: %d/%d %.1f%%\n", summary.ImportCompleted, summary.Total, summary.ImportPercent)
+	fmt.Fprintf(out, "read: %d rows %d bytes\n", summary.ReadRows, summary.ReadBytes)
+	fmt.Fprintf(out, "written: %d rows %d bytes\n", summary.WrittenRows, summary.WrittenBytes)
 
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "\nSTATE\tCOUNT")
@@ -835,9 +884,25 @@ func printPartRows(out *os.File, parts []state.Part) {
 	}
 	fmt.Fprintln(out, "\nPARTS")
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "PART_ID\tSTATUS\tATTEMPTS\tWORKER\tUPDATED_AT\tERROR")
+	fmt.Fprintln(tw, "PART_ID\tSTATUS\tATTEMPTS\tWORKER\tREAD_ROWS\tREAD_BYTES\tWRITTEN_ROWS\tWRITTEN_BYTES\tSOURCE_ROWS\tDEST_ROWS\tPROGRESS_AT\tUPDATED_AT\tERROR")
 	for _, part := range parts {
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\n", part.PartID, part.Status, part.Attempts, part.WorkerID, part.UpdatedAt, part.Error)
+		fmt.Fprintf(
+			tw,
+			"%s\t%s\t%d\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n",
+			part.PartID,
+			part.Status,
+			part.Attempts,
+			part.WorkerID,
+			part.ReadRows,
+			part.ReadBytes,
+			part.WrittenRows,
+			part.WrittenBytes,
+			part.SourceActivePartRows,
+			part.DestinationActivePartRows,
+			part.ProgressUpdatedAt,
+			part.UpdatedAt,
+			part.Error,
+		)
 	}
 	_ = tw.Flush()
 }

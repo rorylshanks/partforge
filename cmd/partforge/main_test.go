@@ -6,13 +6,15 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/partforge/partforge/internal/metrics"
+	"github.com/partforge/partforge/internal/rewrite"
 	"github.com/partforge/partforge/internal/state"
 )
 
 func TestSummarizeJob(t *testing.T) {
 	summary := summarizeJob("job-1", []state.Part{
-		{PartID: "part-1", Status: state.StatusImported},
-		{PartID: "part-2", Status: state.StatusFinished},
+		{PartID: "part-1", Status: state.StatusImported, ReadRows: 10, ReadBytes: 100, WrittenRows: 9, WrittenBytes: 90},
+		{PartID: "part-2", Status: state.StatusFinished, ReadRows: 20, ReadBytes: 200, WrittenRows: 19, WrittenBytes: 190},
 		{PartID: "part-3", Status: state.StatusFailed, Error: "boom"},
 	})
 
@@ -27,6 +29,9 @@ func TestSummarizeJob(t *testing.T) {
 	}
 	if summary.ImportCompleted != 1 {
 		t.Fatalf("import completed = %d", summary.ImportCompleted)
+	}
+	if summary.ReadRows != 30 || summary.ReadBytes != 300 || summary.WrittenRows != 28 || summary.WrittenBytes != 280 {
+		t.Fatalf("summary progress = %+v", summary)
 	}
 	if len(summary.FailedParts) != 1 || summary.FailedParts[0].PartID != "part-3" {
 		t.Fatalf("failed parts = %+v", summary.FailedParts)
@@ -66,6 +71,28 @@ func TestSelectRetryParts(t *testing.T) {
 
 	if _, err := selectRetryParts(parts, false, false, "part-2"); err == nil {
 		t.Fatal("expected non-failed part error")
+	}
+}
+
+func TestStateProgress(t *testing.T) {
+	query := metrics.QueryProgress{ReadRows: 1, ReadBytes: 2, WrittenRows: 3, WrittenBytes: 4}
+	source := metrics.PartStats{Count: 5, Rows: 6, Bytes: 7}
+	dest := metrics.PartStats{Count: 8, Rows: 9, Bytes: 10}
+
+	progress := stateProgress(rewrite.ProgressSnapshot{
+		QueryProgress:              &query,
+		SourceActivePartStats:      &source,
+		DestinationActivePartStats: &dest,
+	})
+
+	if progress.QueryProgress == nil || progress.QueryProgress.WrittenBytes != 4 {
+		t.Fatalf("query progress = %+v", progress.QueryProgress)
+	}
+	if progress.SourceActivePartStats == nil || progress.SourceActivePartStats.Rows != 6 {
+		t.Fatalf("source stats = %+v", progress.SourceActivePartStats)
+	}
+	if progress.DestinationActivePartStats == nil || progress.DestinationActivePartStats.Bytes != 10 {
+		t.Fatalf("destination stats = %+v", progress.DestinationActivePartStats)
 	}
 }
 

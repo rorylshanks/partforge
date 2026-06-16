@@ -50,7 +50,8 @@ Top-level config keys apply to every command. Command-specific keys under `comma
   "s5cmd_binary": "s5cmd",
   "commands": {
     "worker": {
-      "metrics_addr": ":2112"
+      "metrics_addr": ":2112",
+      "state_progress_interval": "15s"
     },
     "import-finished": {
       "clickhouse_url": "http://clickhouse:8123"
@@ -93,6 +94,8 @@ Core worker metrics:
 
 The read/write counters are updated live while the `INSERT SELECT` is running by polling ClickHouse `system.processes` for the rewrite query id. Source and destination active part gauges are measured from `system.parts` while those parts are attached in the worker.
 
+Workers also persist the same per-part rewrite progress to DynamoDB every `15s` by default. Use `-state-progress-interval` to change the interval, or `-state-progress-interval=0` to disable these DynamoDB progress writes without disabling Prometheus metrics.
+
 ## Admin
 
 List job IDs from the DynamoDB state table:
@@ -108,7 +111,7 @@ partforge job-status \
   -job-id=job-123
 ```
 
-Use `-json` on either command for machine-readable output. Use `job-status -parts` to include one row per part. `list-jobs` scans the state table, so admin IAM needs `dynamodb:Scan`; normal worker/import paths do not.
+Use `-json` on either command for machine-readable output. Use `job-status -parts` to include one row per part with the latest persisted rewrite counters and active part stats. `list-jobs` scans the state table, so admin IAM needs `dynamodb:Scan`; normal worker/import paths do not.
 
 Retry one failed part:
 

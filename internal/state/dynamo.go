@@ -61,6 +61,37 @@ type Part struct {
 	WorkerID    string `dynamodbav:"worker_id,omitempty"`
 	Attempts    int    `dynamodbav:"attempts"`
 	Error       string `dynamodbav:"error,omitempty"`
+
+	ProgressUpdatedAt          string `dynamodbav:"progress_updated_at,omitempty"`
+	ReadRows                   uint64 `dynamodbav:"read_rows,omitempty"`
+	ReadBytes                  uint64 `dynamodbav:"read_bytes,omitempty"`
+	WrittenRows                uint64 `dynamodbav:"written_rows,omitempty"`
+	WrittenBytes               uint64 `dynamodbav:"written_bytes,omitempty"`
+	SourceActivePartCount      uint64 `dynamodbav:"source_active_part_count,omitempty"`
+	SourceActivePartRows       uint64 `dynamodbav:"source_active_part_rows,omitempty"`
+	SourceActivePartBytes      uint64 `dynamodbav:"source_active_part_bytes,omitempty"`
+	DestinationActivePartCount uint64 `dynamodbav:"destination_active_part_count,omitempty"`
+	DestinationActivePartRows  uint64 `dynamodbav:"destination_active_part_rows,omitempty"`
+	DestinationActivePartBytes uint64 `dynamodbav:"destination_active_part_bytes,omitempty"`
+}
+
+type QueryProgress struct {
+	ReadRows     uint64
+	ReadBytes    uint64
+	WrittenRows  uint64
+	WrittenBytes uint64
+}
+
+type PartStats struct {
+	Count uint64
+	Rows  uint64
+	Bytes uint64
+}
+
+type RewriteProgress struct {
+	QueryProgress              *QueryProgress
+	SourceActivePartStats      *PartStats
+	DestinationActivePartStats *PartStats
 }
 
 func New(ctx context.Context, cfg Config) (*Store, error) {
@@ -168,6 +199,73 @@ func (s *Store) MarkFailed(ctx context.Context, part Part, workerID string, caus
 		return errors.New("failure cause is required")
 	}
 	return s.transitionOwned(ctx, part, workerID, StatusFailed, "failed_at", cause.Error(), now)
+}
+
+func (s *Store) UpdateRewriteProgress(ctx context.Context, jobID, partID, workerID string, progress RewriteProgress, now time.Time) error {
+	if strings.TrimSpace(jobID) == "" || strings.TrimSpace(partID) == "" {
+		return errors.New("job id and part id are required")
+	}
+	if strings.TrimSpace(workerID) == "" {
+		return errors.New("worker id is required")
+	}
+
+	names := map[string]string{
+		"#status":     "status",
+		"#updated_at": "updated_at",
+		"#worker_id":  "worker_id",
+	}
+	values := map[string]types.AttributeValue{
+		":in_progress": stringAttr(string(StatusInProgress)),
+		":now":         stringAttr(formatTime(now)),
+		":worker":      stringAttr(workerID),
+	}
+	set := []string{"#updated_at = :now", "progress_updated_at = :now"}
+
+	if progress.QueryProgress != nil {
+		set = append(set,
+			"read_rows = :read_rows",
+			"read_bytes = :read_bytes",
+			"written_rows = :written_rows",
+			"written_bytes = :written_bytes",
+		)
+		values[":read_rows"] = uintAttr(progress.QueryProgress.ReadRows)
+		values[":read_bytes"] = uintAttr(progress.QueryProgress.ReadBytes)
+		values[":written_rows"] = uintAttr(progress.QueryProgress.WrittenRows)
+		values[":written_bytes"] = uintAttr(progress.QueryProgress.WrittenBytes)
+	}
+	if progress.SourceActivePartStats != nil {
+		set = append(set,
+			"source_active_part_count = :source_active_part_count",
+			"source_active_part_rows = :source_active_part_rows",
+			"source_active_part_bytes = :source_active_part_bytes",
+		)
+		values[":source_active_part_count"] = uintAttr(progress.SourceActivePartStats.Count)
+		values[":source_active_part_rows"] = uintAttr(progress.SourceActivePartStats.Rows)
+		values[":source_active_part_bytes"] = uintAttr(progress.SourceActivePartStats.Bytes)
+	}
+	if progress.DestinationActivePartStats != nil {
+		set = append(set,
+			"destination_active_part_count = :destination_active_part_count",
+			"destination_active_part_rows = :destination_active_part_rows",
+			"destination_active_part_bytes = :destination_active_part_bytes",
+		)
+		values[":destination_active_part_count"] = uintAttr(progress.DestinationActivePartStats.Count)
+		values[":destination_active_part_rows"] = uintAttr(progress.DestinationActivePartStats.Rows)
+		values[":destination_active_part_bytes"] = uintAttr(progress.DestinationActivePartStats.Bytes)
+	}
+
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 aws.String(s.table),
+		Key:                       partStateKey(jobID, partID),
+		ConditionExpression:       aws.String("#status = :in_progress AND #worker_id = :worker"),
+		UpdateExpression:          aws.String("SET " + strings.Join(set, ", ")),
+		ExpressionAttributeNames:  names,
+		ExpressionAttributeValues: values,
+	})
+	if err != nil {
+		return fmt.Errorf("update rewrite progress for %s/%s: %w", jobID, partID, err)
+	}
+	return nil
 }
 
 func (s *Store) ListJobIDs(ctx context.Context) ([]string, error) {
@@ -279,7 +377,7 @@ func (s *Store) RetryFailedPart(ctx context.Context, part Part, now time.Time) (
 		return "", fmt.Errorf("part %s/%s is %s, expected %s", part.JobID, part.PartID, part.Status, StatusFailed)
 	}
 	target := StatusReady
-	removeExpression := " REMOVE #error, failed_at, started_at, finished_at, importing_at, imported_at, worker_id"
+	removeExpression := " REMOVE #error, failed_at, started_at, finished_at, importing_at, imported_at, worker_id" + progressRemoveExpression()
 	if part.ImportingAt != "" {
 		target = StatusFinished
 		removeExpression = " REMOVE #error, failed_at, importing_at, imported_at, worker_id"
@@ -319,7 +417,7 @@ func (s *Store) ForceRetryPart(ctx context.Context, part Part, now time.Time) (S
 			"attribute_exists(pk) AND attribute_exists(sk)",
 		),
 		UpdateExpression: aws.String(
-			"SET #status = :ready, gsi1pk = :gsi1pk, updated_at = :now REMOVE #error, failed_at, started_at, finished_at, importing_at, imported_at, worker_id",
+			"SET #status = :ready, gsi1pk = :gsi1pk, updated_at = :now REMOVE #error, failed_at, started_at, finished_at, importing_at, imported_at, worker_id" + progressRemoveExpression(),
 		),
 		ExpressionAttributeNames: map[string]string{
 			"#error":  "error",
@@ -346,7 +444,7 @@ func (s *Store) claimPart(ctx context.Context, part Part, workerID string, now t
 			"#status = :ready",
 		),
 		UpdateExpression: aws.String(
-			"SET #status = :in_progress, gsi1pk = :gsi1pk, updated_at = :now, started_at = :now, worker_id = :worker, attempts = if_not_exists(attempts, :zero) + :one REMOVE #error",
+			"SET #status = :in_progress, gsi1pk = :gsi1pk, updated_at = :now, started_at = :now, worker_id = :worker, attempts = if_not_exists(attempts, :zero) + :one REMOVE #error" + progressRemoveExpression(),
 		),
 		ExpressionAttributeNames: map[string]string{
 			"#error":  "error",
@@ -475,10 +573,18 @@ func unmarshalPart(item map[string]types.AttributeValue) (*Part, error) {
 }
 
 func (p Part) key() map[string]types.AttributeValue {
+	return partStateKey(p.JobID, p.PartID)
+}
+
+func partStateKey(jobID, partID string) map[string]types.AttributeValue {
 	return map[string]types.AttributeValue{
-		"pk": stringAttr(jobKey(p.JobID)),
-		"sk": stringAttr(partKey(p.PartID)),
+		"pk": stringAttr(jobKey(jobID)),
+		"sk": stringAttr(partKey(partID)),
 	}
+}
+
+func progressRemoveExpression() string {
+	return ", progress_updated_at, read_rows, read_bytes, written_rows, written_bytes, source_active_part_count, source_active_part_rows, source_active_part_bytes, destination_active_part_count, destination_active_part_rows, destination_active_part_bytes"
 }
 
 func jobKey(jobID string) string {
@@ -507,4 +613,8 @@ func stringAttr(value string) types.AttributeValue {
 
 func numberAttr(value string) types.AttributeValue {
 	return &types.AttributeValueMemberN{Value: value}
+}
+
+func uintAttr(value uint64) types.AttributeValue {
+	return numberAttr(fmt.Sprintf("%d", value))
 }

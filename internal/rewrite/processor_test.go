@@ -69,3 +69,19 @@ func TestInsertSelectRetryBackoff(t *testing.T) {
 		t.Fatalf("attempt 10 backoff = %s", got)
 	}
 }
+
+func TestShouldReportProgress(t *testing.T) {
+	now := time.Unix(100, 0)
+	if shouldReportProgress(0, time.Time{}, now) {
+		t.Fatal("expected disabled interval to skip progress report")
+	}
+	if !shouldReportProgress(15*time.Second, time.Time{}, now) {
+		t.Fatal("expected first progress report")
+	}
+	if shouldReportProgress(15*time.Second, now.Add(-14*time.Second), now) {
+		t.Fatal("expected interval gate to skip report")
+	}
+	if !shouldReportProgress(15*time.Second, now.Add(-15*time.Second), now) {
+		t.Fatal("expected interval gate to allow report")
+	}
+}
