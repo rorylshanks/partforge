@@ -25,6 +25,10 @@ func (c Copier) UploadDir(ctx context.Context, localDir, bucket, prefix string) 
 	return c.runCopy(ctx, withTrailingSeparator(localDir), s3URI(bucket, prefix)+"/")
 }
 
+func (c Copier) UploadGlob(ctx context.Context, localGlob, bucket, prefix string) error {
+	return c.runCopy(ctx, localGlob, s3URI(bucket, prefix)+"/")
+}
+
 func (c Copier) DownloadPrefix(ctx context.Context, bucket, prefix, localDir string) error {
 	if err := os.MkdirAll(localDir, 0o755); err != nil {
 		return err

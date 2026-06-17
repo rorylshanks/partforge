@@ -86,6 +86,18 @@ func TestDownloadPrefixRetriesCopyCommand(t *testing.T) {
 	}
 }
 
+func TestUploadGlobRetriesCopyCommand(t *testing.T) {
+	binary, attemptsFile := fakeS5cmd(t, 3)
+
+	copier := Copier{Binary: binary}
+	if err := copier.UploadGlob(context.Background(), "/tmp/source/*/*/*", "bucket", "prefix"); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAttemptCount(t, attemptsFile); got != 4 {
+		t.Fatalf("attempts = %d, want 4", got)
+	}
+}
+
 func TestUploadDirFailsAfterCopyRetries(t *testing.T) {
 	binary, attemptsFile := fakeS5cmd(t, 10)
 	localDir := t.TempDir()

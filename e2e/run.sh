@@ -95,7 +95,6 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --user "$clickhouse_owne
   -database=dst \
   -table=events_new \
   -job-id="$JOB_ID" \
-  -work-dir=/var/lib/clickhouse/partforge-import-work \
   -clickhouse-url="$CH_HTTP_DOCKER" \
   -s3-endpoint=http://localstack:4566 \
   -dynamodb-endpoint=http://localstack:4566

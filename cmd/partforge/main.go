@@ -843,7 +843,7 @@ func runImportFinished(ctx context.Context, args []string) error {
 		clickHouseURL      = fs.String("clickhouse-url", defaultClickHouseURL, "destination ClickHouse HTTP URL")
 		clickHouseUser     = fs.String("clickhouse-user", "", "ClickHouse HTTP user")
 		clickHousePassword = fs.String("clickhouse-password", "", "ClickHouse HTTP password")
-		workDir            = fs.String("work-dir", "/tmp/partforge-import", "import scratch directory")
+		workDir            = fs.String("work-dir", "", "import scratch directory; empty uses the destination ClickHouse disk")
 		requireEmpty       = fs.Bool("require-empty", true, "fail if the destination table already has active parts")
 	)
 	if err := fs.Parse(args); err != nil {

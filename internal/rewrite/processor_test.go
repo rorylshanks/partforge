@@ -4,10 +4,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/partforge/partforge/internal/artifact"
 	"github.com/partforge/partforge/internal/chhttp"
 	"github.com/partforge/partforge/internal/freeze"
 	"github.com/partforge/partforge/internal/manifest"
@@ -91,66 +91,48 @@ func TestShouldReportProgress(t *testing.T) {
 	}
 }
 
-func TestCopyFrozenOutputParts(t *testing.T) {
+func TestFrozenPartUploadGlobs(t *testing.T) {
 	root := t.TempDir()
-	frozenRoot := filepath.Join(root, "shadow", "freeze-1", "store", "abc")
-	createFrozenPart(t, filepath.Join(frozenRoot, "all_1_1_0"), "one")
-	createFrozenPart(t, filepath.Join(frozenRoot, "all_2_2_0"), "two")
-	finishedRoot := filepath.Join(root, "finished")
-
-	output, err := copyFrozenOutputParts([]activePart{
-		{Name: "all_1_1_0", PartitionID: "all"},
-		{Name: "all_2_2_0", PartitionID: "all"},
-	}, []freeze.Part{
-		{Name: "all_2_2_0", Path: filepath.Join(frozenRoot, "all_2_2_0")},
-		{Name: "all_1_1_0", Path: filepath.Join(frozenRoot, "all_1_1_0")},
-	}, finishedRoot)
-	if err != nil {
+	diskPath := filepath.Join(root, "disk")
+	freezeName := "freeze_1"
+	frozenStore := filepath.Join(diskPath, "shadow", freezeName, "store")
+	if err := os.MkdirAll(frozenStore, 0o755); err != nil {
 		t.Fatal(err)
-	}
-	want := []manifest.OutputPart{
-		{Name: "all_1_1_0", PartitionID: "all"},
-		{Name: "all_2_2_0", PartitionID: "all"},
-	}
-	if len(output.Parts) != len(want) {
-		t.Fatalf("output parts = %#v, want %#v", output.Parts, want)
-	}
-	for i := range want {
-		if output.Parts[i] != want[i] {
-			t.Fatalf("output parts = %#v, want %#v", output.Parts, want)
-		}
 	}
 
-	got, err := os.ReadFile(filepath.Join(artifact.FinishedPartPath(finishedRoot, "all_1_1_0"), "data.bin"))
+	globs, err := frozenPartUploadGlobs([]freeze.Disk{{Name: "default", Path: diskPath, Type: "local"}}, freezeName)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != "one" {
-		t.Fatalf("copied data = %q, want one", got)
+	if len(globs) != 1 {
+		t.Fatalf("frozen part globs = %#v, want one glob", globs)
 	}
-	got, err = os.ReadFile(filepath.Join(artifact.FinishedPartPath(finishedRoot, "all_2_2_0"), "data.bin"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "two" {
-		t.Fatalf("copied data = %q, want two", got)
+	wantGlob := filepath.Join(frozenStore, "*", "*", "*")
+	if globs[0].Disk != "default" || globs[0].Glob != wantGlob {
+		t.Fatalf("frozen part globs = %#v, want default at %s", globs, wantGlob)
 	}
 }
 
-func TestCopyFrozenOutputPartsRequiresExactSnapshot(t *testing.T) {
+func TestFrozenPartUploadGlobsRequiresAtLeastOneStore(t *testing.T) {
 	root := t.TempDir()
-	frozenPart := filepath.Join(root, "shadow", "freeze-1", "store", "abc", "all_1_1_0")
-	createFrozenPart(t, frozenPart, "one")
 
-	if _, err := copyFrozenOutputParts([]activePart{
-		{Name: "all_1_1_0", PartitionID: "all"},
-		{Name: "all_2_2_0", PartitionID: "all"},
-	}, []freeze.Part{{Name: "all_1_1_0", Path: frozenPart}}, filepath.Join(root, "finished")); err == nil {
-		t.Fatal("expected part count mismatch error")
+	_, err := frozenPartUploadGlobs([]freeze.Disk{{Name: "default", Path: root, Type: "local"}}, "freeze_1")
+	if err == nil {
+		t.Fatal("expected missing store error")
 	}
 }
 
-func createFrozenPart(t *testing.T, path, data string) {
+func TestWorkerFreezeNameNeedsNoClickHouseEscaping(t *testing.T) {
+	name := workerFreezeName(manifest.Manifest{JobID: "job-1", PartID: "part.2"}, time.Date(2026, 6, 17, 15, 48, 15, 768144022, time.UTC))
+	if strings.ContainsAny(name, "-.") {
+		t.Fatalf("freeze name = %q, expected no ClickHouse-escaped punctuation", name)
+	}
+	if name != "partforge_job_1_part_2_20260617T154815768144022Z" {
+		t.Fatalf("freeze name = %q", name)
+	}
+}
+
+func createFrozenPart(t *testing.T, path string) {
 	t.Helper()
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		t.Fatal(err)
@@ -160,7 +142,7 @@ func createFrozenPart(t *testing.T, path, data string) {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(path, "data.bin"), []byte(data), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(path, "data.bin"), []byte("data"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }

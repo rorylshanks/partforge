@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	artifactpkg "github.com/partforge/partforge/internal/artifact"
@@ -79,7 +81,11 @@ func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 		slog.Info("skipping destination empty check", "stage", "prepare_destination", "job_id", job.JobID, "destination_table", chhttp.TableSQL(job.Database, job.Table))
 	}
 
-	root := filepath.Join(defaultImportWorkDir(i.WorkDir), job.JobID)
+	workBase, err := i.importWorkDir(ctx, dataPath)
+	if err != nil {
+		return err
+	}
+	root := filepath.Join(workBase, job.JobID)
 	if err := os.RemoveAll(root); err != nil {
 		return err
 	}
@@ -87,6 +93,10 @@ func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return err
 	}
+	if err := ensureSameFilesystem(root, detachedPath); err != nil {
+		return err
+	}
+	slog.Info("prepared import work directory", "stage", "prepare_destination", "job_id", job.JobID, "work_dir", root, "detached_path", detachedPath)
 
 	for idx, artifact := range artifacts {
 		artifactStartedAt := time.Now()
@@ -138,47 +148,65 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact Fi
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		return err
 	}
-	extractRoot := filepath.Join(workDir, "finished")
-	slog.Info("downloading finished artifact", "stage", "download_finished", "job_id", job.JobID, "part_id", artifact.PartID, "bucket", artifact.Bucket, "key", artifact.Key)
+	downloadRoot := filepath.Join(workDir, "data")
+	sourceKey := path.Join(artifact.Key, artifactpkg.FinishedDataName)
+	slog.Info("downloading finished artifact data", "stage", "download_finished", "job_id", job.JobID, "part_id", artifact.PartID, "bucket", artifact.Bucket, "key", sourceKey)
 	downloadStartedAt := time.Now()
-	if err := i.S3Copy.DownloadPrefix(ctx, artifact.Bucket, artifact.Key, extractRoot); err != nil {
-		return fmt.Errorf("download finished artifact s3://%s/%s: %w", artifact.Bucket, artifact.Key, err)
+	if err := i.S3Copy.DownloadPrefix(ctx, artifact.Bucket, sourceKey, downloadRoot); err != nil {
+		return fmt.Errorf("download finished artifact data s3://%s/%s: %w", artifact.Bucket, sourceKey, err)
 	}
-	downloadStats, err := fileutil.StatDir(extractRoot)
+	downloadStats, err := fileutil.StatDir(downloadRoot)
 	if err != nil {
 		return fmt.Errorf("stat finished artifact s3://%s/%s: %w", artifact.Bucket, artifact.Key, err)
 	}
 	downloadElapsed := time.Since(downloadStartedAt)
-	slog.Info("downloaded finished artifact", "stage", "download_finished", "job_id", job.JobID, "part_id", artifact.PartID, "files", downloadStats.Files, "bytes", downloadStats.Bytes, "elapsed", downloadElapsed, "bytes_per_second", ratePerSecond(downloadStats.Bytes, downloadElapsed))
-
-	m, err := artifactpkg.ReadManifest(extractRoot)
+	slog.Info("downloaded finished artifact data", "stage", "download_finished", "job_id", job.JobID, "part_id", artifact.PartID, "files", downloadStats.Files, "bytes", downloadStats.Bytes, "elapsed", downloadElapsed, "bytes_per_second", ratePerSecond(downloadStats.Bytes, downloadElapsed))
+	partNames, err := downloadedPartNames(downloadRoot)
 	if err != nil {
-		return fmt.Errorf("read finished manifest s3://%s/%s: %w", artifact.Bucket, artifact.Key, err)
+		return fmt.Errorf("list downloaded finished parts s3://%s/%s: %w", artifact.Bucket, sourceKey, err)
 	}
-	if m.JobID != job.JobID {
-		return fmt.Errorf("finished artifact s3://%s/%s belongs to job %s, expected %s", artifact.Bucket, artifact.Key, m.JobID, job.JobID)
-	}
-	if m.PartID != artifact.PartID {
-		return fmt.Errorf("finished artifact s3://%s/%s belongs to part %s, expected %s", artifact.Bucket, artifact.Key, m.PartID, artifact.PartID)
+	if len(partNames) == 0 {
+		return fmt.Errorf("finished artifact s3://%s/%s contains no part directories", artifact.Bucket, sourceKey)
 	}
 
-	for _, part := range m.Output.Parts {
-		src := artifactpkg.FinishedPartPath(extractRoot, part.Name)
-		dst := filepath.Join(detachedPath, part.Name)
-		partStats, err := fileutil.StatDir(src)
-		if err != nil {
-			return fmt.Errorf("stat finished part %s: %w", part.Name, err)
+	for _, partName := range partNames {
+		src := filepath.Join(downloadRoot, partName)
+		dst := filepath.Join(detachedPath, partName)
+		if _, err := os.Stat(dst); err == nil {
+			return fmt.Errorf("detached part destination already exists: %s", dst)
+		} else if !os.IsNotExist(err) {
+			return err
 		}
-		slog.Info("attaching finished part", "stage", "attach_finished_part", "job_id", job.JobID, "part_id", artifact.PartID, "part", part.Name, "partition_id", part.PartitionID, "files", partStats.Files, "bytes", partStats.Bytes)
 		if err := fileutil.MoveDir(src, dst); err != nil {
-			return fmt.Errorf("move finished part %s to detached: %w", part.Name, err)
+			return fmt.Errorf("move finished part %s into detached directory: %w", partName, err)
 		}
-		if err := i.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(job.Database, job.Table)+" ATTACH PART "+chhttp.StringLiteral(part.Name)); err != nil {
-			return fmt.Errorf("attach finished part %s: %w", part.Name, err)
+		partStats, err := fileutil.StatDir(dst)
+		if err != nil {
+			return fmt.Errorf("stat finished part %s: %w", partName, err)
+		}
+		slog.Info("attaching finished part", "stage", "attach_finished_part", "job_id", job.JobID, "part_id", artifact.PartID, "part", partName, "files", partStats.Files, "bytes", partStats.Bytes)
+		if err := i.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(job.Database, job.Table)+" ATTACH PART "+chhttp.StringLiteral(partName)); err != nil {
+			return fmt.Errorf("attach finished part %s: %w", partName, err)
 		}
 	}
-	slog.Info("attached finished artifact parts", "stage", "attach_finished_part", "job_id", job.JobID, "part_id", artifact.PartID, "key", artifact.Key, "parts", len(m.Output.Parts))
+	slog.Info("attached finished artifact parts", "stage", "attach_finished_part", "job_id", job.JobID, "part_id", artifact.PartID, "key", artifact.Key, "parts", len(partNames))
 	return nil
+}
+
+func downloadedPartNames(root string) ([]string, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			return nil, fmt.Errorf("unexpected file at finished artifact root: %s", filepath.Join(root, entry.Name()))
+		}
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 func (i Importer) tableDataPath(ctx context.Context, database, table string) (string, error) {
@@ -206,11 +234,80 @@ func (i Importer) activePartCount(ctx context.Context, database, table string) (
 	return chhttp.ParseUInt(out)
 }
 
-func defaultImportWorkDir(workDir string) string {
-	if workDir == "" {
-		return "/tmp/partforge-import"
+func (i Importer) importWorkDir(ctx context.Context, dataPath string) (string, error) {
+	if strings.TrimSpace(i.WorkDir) != "" {
+		return filepath.Abs(strings.TrimSpace(i.WorkDir))
 	}
-	return workDir
+	diskPath, err := i.diskPathForDataPath(ctx, dataPath)
+	if err != nil {
+		return "", err
+	}
+	return defaultImportWorkDir(diskPath), nil
+}
+
+func (i Importer) diskPathForDataPath(ctx context.Context, dataPath string) (string, error) {
+	query := "SELECT path, type FROM system.disks ORDER BY length(path) DESC FORMAT TSV"
+	out, err := i.ClickHouse.QueryString(ctx, query)
+	if err != nil {
+		return "", fmt.Errorf("query ClickHouse disks: %w", err)
+	}
+	rows, err := chhttp.FormatTSVStrings(out, 2)
+	if err != nil {
+		return "", err
+	}
+	for _, row := range rows {
+		diskPath := strings.TrimSpace(row[0])
+		diskType := strings.ToLower(strings.TrimSpace(row[1]))
+		if !pathContains(diskPath, dataPath) {
+			continue
+		}
+		if diskType != "local" {
+			return "", fmt.Errorf("destination table data path %s is on unsupported ClickHouse disk type %q", dataPath, row[1])
+		}
+		return diskPath, nil
+	}
+	return "", fmt.Errorf("could not match destination data path %s to a local ClickHouse disk", dataPath)
+}
+
+func defaultImportWorkDir(diskPath string) string {
+	return filepath.Join(diskPath, "partforge-import-work")
+}
+
+func pathContains(root, child string) bool {
+	root = filepath.Clean(root)
+	child = filepath.Clean(child)
+	rel, err := filepath.Rel(root, child)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+func ensureSameFilesystem(a, b string) error {
+	aDev, err := deviceID(a)
+	if err != nil {
+		return err
+	}
+	bDev, err := deviceID(b)
+	if err != nil {
+		return err
+	}
+	if aDev != bDev {
+		return fmt.Errorf("import work directory %s and ClickHouse detached directory %s are on different filesystems; set -work-dir to a path on the ClickHouse data disk", a, b)
+	}
+	return nil
+}
+
+func deviceID(path string) (uint64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, fmt.Errorf("stat %s did not return syscall.Stat_t", path)
+	}
+	return uint64(stat.Dev), nil
 }
 
 func ratePerSecond(bytes uint64, elapsed time.Duration) float64 {

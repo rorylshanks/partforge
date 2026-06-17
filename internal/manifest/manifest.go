@@ -21,7 +21,6 @@ type Manifest struct {
 	Part      SourcePart `json:"part"`
 	SQL       SQLBundle  `json:"sql"`
 	S3        S3Refs     `json:"s3"`
-	Output    Output     `json:"output,omitempty"`
 	CreatedAt time.Time  `json:"created_at"`
 }
 
@@ -46,15 +45,6 @@ type S3Refs struct {
 	Bucket      string `json:"bucket"`
 	SourceKey   string `json:"source_key"`
 	FinishedKey string `json:"finished_key"`
-}
-
-type Output struct {
-	Parts []OutputPart `json:"parts,omitempty"`
-}
-
-type OutputPart struct {
-	Name        string `json:"name"`
-	PartitionID string `json:"partition_id"`
 }
 
 func (m Manifest) Validate() error {

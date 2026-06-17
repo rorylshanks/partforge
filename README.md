@@ -6,8 +6,8 @@ The intended flow is:
 
 1. Run `ALTER TABLE db.table FREEZE WITH NAME 'name'` on a ClickHouse node.
 2. Run `partforge upload-freeze` on a host that can read the ClickHouse disk paths reported by `system.disks`. It writes a `manifest.json` into each frozen part directory, uploads the raw part directory to S3 with `s5cmd`, and registers `READY` part records in DynamoDB.
-3. Run `partforge worker` in a container that also contains `clickhouse-server` and `s5cmd`. The worker starts ClickHouse locally, downloads one raw source part directory, attaches it, runs the provided `INSERT INTO ... SELECT ...`, freezes the produced destination parts, and uploads raw finished part directories.
-4. Run `partforge import-finished` near the destination ClickHouse node. It reads `FINISHED` part records from DynamoDB, downloads finished artifacts one at a time, copies each produced part into the destination table's `detached` directory, and runs `ALTER TABLE ... ATTACH PART`. ClickHouse assigns the final active part names.
+3. Run `partforge worker` in a container that also contains `clickhouse-server` and `s5cmd`. The worker starts ClickHouse locally, downloads one raw source part directory, attaches it, runs the provided `INSERT INTO ... SELECT ...`, freezes the produced destination parts, and uploads only those raw part directories under the finished artifact's `data/` prefix.
+4. Run `partforge import-finished` near the destination ClickHouse node. It reads `FINISHED` part records from DynamoDB, downloads the finished artifact `data/` prefix one at a time, moves each downloaded part into the destination table's `detached` directory, and runs `ALTER TABLE ... ATTACH PART`.
 
 This is a part-level rewrite tool, not a generic distributed SQL engine. The insert-select must be valid when executed independently for each source part. Row-local schema migrations, casts, computed columns, filters, changed codecs, changed sort keys, and changed partitioning fit this model. Global transforms such as `GROUP BY`, `DISTINCT`, windows, and `ORDER BY ... LIMIT` do not.
 
@@ -69,7 +69,7 @@ ClickHouse connection settings are resolved in order: CLI flags, JSON config, `/
 
 The worker image is a single Ubuntu-based container with ClickHouse packages, `s5cmd`, and the Go binary copied in from a builder stage. Its entrypoint is the Go worker binary, and the worker runs as root so it can create and write the resolved worker work directory on root-owned host mounts. The worker starts `clickhouse server` as a child process before claiming `READY` parts from DynamoDB. The default ClickHouse version is `26.3.10.60`.
 
-Large worker data should live on the same local filesystem. In production, mount local NVMe at `/mnt/nvme` and set the worker `-work-dir` under that mount, for example `/mnt/nvme/partforge-work`. Each worker process creates a unique `run-*` directory under `-work-dir`; ClickHouse data, temp files, logs, and pid file live under `run-*/clickhouse`, while downloaded source and finished artifacts live under `run-*/scratch`. The run directory is removed after the worker exits and the child ClickHouse process has stopped. The worker moves source parts into ClickHouse `detached`, freezes produced destination parts, copies those frozen part directories into the finished artifact directory, and uploads that artifact.
+Large worker data should live on the same local filesystem. In production, mount local NVMe at `/mnt/nvme` and set the worker `-work-dir` under that mount, for example `/mnt/nvme/partforge-work`. Each worker process creates a unique `run-*` directory under `-work-dir`; ClickHouse data, temp files, logs, and pid file live under `run-*/clickhouse`, while downloaded source artifacts live under `run-*/scratch`. The run directory is removed after the worker exits and the child ClickHouse process has stopped. The worker moves source parts into ClickHouse `detached`, freezes produced destination parts, and uploads the frozen part directories with an `s5cmd` glob from `shadow/<freeze>/store/*/*/*`.
 
 ```sh
 docker compose build worker
@@ -195,8 +195,8 @@ Source-table `Replicated*MergeTree` engines are normalized to their non-replicat
 
 Part state is stored in DynamoDB. Workers claim work with conditional updates from `READY` to `IN_PROGRESS`; handled processing errors are written as `FAILED`; successful rewrites become `FINISHED`; and `import-finished` transitions parts through `IMPORTING` to `IMPORTED`. If a worker process dies outside handled code, the part remains visible as `IN_PROGRESS` for manual inspection or reset.
 
-Source part artifacts keep stable S3 prefixes. Finished artifacts are written under per-attempt prefixes, and the `finished_key` in DynamoDB is updated only after a worker successfully uploads an attempt, so retries do not overwrite earlier output.
+Source part artifacts keep stable S3 prefixes. Finished artifacts contain only ClickHouse part directories under their per-attempt `data/<part>/` prefixes, and the `finished_key` in DynamoDB is updated only after a worker successfully uploads an attempt, so retries do not overwrite earlier output.
 
 `import-finished` requires the destination table to be empty by default. This is intentional: attaching the same finished artifacts twice would duplicate data, and there is no exact transaction spanning S3 and ClickHouse. Use `-require-empty=false` only when importing into a table that you have verified manually.
 
-For `import-finished`, put `-work-dir` on the same filesystem as the destination ClickHouse table data path. Finished parts are moved from the downloaded artifact into the destination table's `detached` directory before `ATTACH PART`; crossing filesystems is treated as a configuration error.
+For `import-finished`, the default scratch directory is created under the destination ClickHouse disk as `partforge-import-work`, so downloaded parts are on the same filesystem as the destination table's `detached` directory. If `-work-dir` is set explicitly, PartForge checks that it is on the same filesystem as `detached` before downloading anything and fails fast if it is not.
