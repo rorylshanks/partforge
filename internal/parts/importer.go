@@ -173,8 +173,8 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact Fi
 			return fmt.Errorf("stat finished part %s: %w", part.Name, err)
 		}
 		slog.Info("attaching finished part", "stage", "attach_finished_part", "job_id", job.JobID, "part_id", artifact.PartID, "part", part.Name, "partition_id", part.PartitionID, "files", partStats.Files, "bytes", partStats.Bytes)
-		if err := fileutil.CopyDir(src, dst); err != nil {
-			return fmt.Errorf("copy finished part %s to detached: %w", part.Name, err)
+		if err := fileutil.MoveDir(src, dst); err != nil {
+			return fmt.Errorf("move finished part %s to detached: %w", part.Name, err)
 		}
 		if err := i.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(job.Database, job.Table)+" ATTACH PART "+chhttp.StringLiteral(part.Name)); err != nil {
 			return fmt.Errorf("attach finished part %s: %w", part.Name, err)

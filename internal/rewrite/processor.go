@@ -243,8 +243,8 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	if err := os.MkdirAll(sourceDetached, 0o755); err != nil {
 		return manifest.Output{}, err
 	}
-	if err := fileutil.CopyDir(sourcePartRoot, filepath.Join(sourceDetached, m.Part.Name)); err != nil {
-		return manifest.Output{}, fmt.Errorf("copy source part to detached: %w", err)
+	if err := fileutil.MoveDir(sourcePartRoot, filepath.Join(sourceDetached, m.Part.Name)); err != nil {
+		return manifest.Output{}, fmt.Errorf("move source part to detached: %w", err)
 	}
 	slog.Info("attaching source part", "stage", "attach_source_part", "job_id", m.JobID, "part_id", m.PartID, "part", m.Part.Name, "source_table", chhttp.TableSQL(m.Source.Database, m.Source.Table))
 	if err := p.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(m.Source.Database, m.Source.Table)+" ATTACH PART "+chhttp.StringLiteral(m.Part.Name)); err != nil {
@@ -297,8 +297,8 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 		if err != nil {
 			return manifest.Output{}, err
 		}
-		if err := fileutil.CopyDir(detachedPath, artifact.FinishedPartPath(finishedRoot, part.Name)); err != nil {
-			return manifest.Output{}, fmt.Errorf("copy finished part %s: %w", part.Name, err)
+		if err := fileutil.MoveDir(detachedPath, artifact.FinishedPartPath(finishedRoot, part.Name)); err != nil {
+			return manifest.Output{}, fmt.Errorf("move finished part %s: %w", part.Name, err)
 		}
 	}
 

@@ -69,6 +69,8 @@ ClickHouse connection settings are resolved in order: CLI flags, JSON config, `/
 
 The worker image is a single Ubuntu-based container with ClickHouse packages, `s5cmd`, and the Go binary copied in from a builder stage. Its entrypoint is the Go worker binary, and the worker starts `clickhouse server` as a child process before claiming `READY` parts from DynamoDB. The default ClickHouse version is `26.3.10.60`.
 
+Large worker data should live on the same local filesystem. In production, mount local NVMe at `/mnt/nvme` and set the worker `-work-dir` under that mount, for example `/mnt/nvme/partforge-work`. When the worker starts ClickHouse, PartForge automatically derives ClickHouse's data-heavy paths from that work directory under `/mnt/nvme/partforge-work/clickhouse`; no custom ClickHouse config file is needed for the normal worker case. The worker moves source parts into ClickHouse `detached` and moves produced destination parts into the finished artifact directory; it intentionally fails if those moves cross filesystems. This avoids slow cross-partition copies and reduces peak disk usage.
+
 ```sh
 docker compose build worker
 docker compose up worker
@@ -181,3 +183,5 @@ Part state is stored in DynamoDB. Workers claim work with conditional updates fr
 Source part artifacts keep stable S3 prefixes. Finished artifacts are written under per-attempt prefixes, and the `finished_key` in DynamoDB is updated only after a worker successfully uploads an attempt, so retries do not overwrite earlier output.
 
 `import-finished` requires the destination table to be empty by default. This is intentional: attaching the same finished artifacts twice would duplicate data, and there is no exact transaction spanning S3 and ClickHouse. Use `-require-empty=false` only when importing into a table that you have verified manually.
+
+For `import-finished`, put `-work-dir` on the same filesystem as the destination ClickHouse table data path. Finished parts are moved from the downloaded artifact into the destination table's `detached` directory before `ATTACH PART`; crossing filesystems is treated as a configuration error.

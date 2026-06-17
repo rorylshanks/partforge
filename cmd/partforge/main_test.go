@@ -186,6 +186,17 @@ func TestResolveS5cmdNumWorkers(t *testing.T) {
 	}
 }
 
+func TestWorkerClickHouseDataDir(t *testing.T) {
+	got, err := workerClickHouseDataDir("/mnt/nvme/partforge-work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "/mnt/nvme/partforge-work/clickhouse"
+	if got != want {
+		t.Fatalf("data dir = %q, want %q", got, want)
+	}
+}
+
 func TestUploadConcurrencyFromCPUs(t *testing.T) {
 	got, err := uploadConcurrencyFromCPUs(12)
 	if err != nil {

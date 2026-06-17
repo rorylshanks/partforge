@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -679,10 +680,15 @@ func runWorker(ctx context.Context, args []string) error {
 
 	var server *chproc.Server
 	if *startClickHouse {
-		slog.Info("starting local ClickHouse server", "stage", "start_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile)
+		clickHouseDataDir, err := workerClickHouseDataDir(*workDir)
+		if err != nil {
+			return err
+		}
+		slog.Info("starting local ClickHouse server", "stage", "start_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", clickHouseDataDir)
 		server, err = chproc.Start(ctx, chproc.Config{
 			Binary:     *clickHouseBinary,
 			ConfigFile: *clickHouseConfigFile,
+			DataDir:    clickHouseDataDir,
 			URL:        *clickHouseURL,
 			User:       *clickHouseUser,
 			Password:   *clickHousePassword,
@@ -770,6 +776,18 @@ func runWorker(ctx context.Context, args []string) error {
 			return nil
 		}
 	}
+}
+
+func workerClickHouseDataDir(workDir string) (string, error) {
+	root := strings.TrimSpace(workDir)
+	if root == "" {
+		root = "/tmp/partforge"
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve worker work-dir %s: %w", workDir, err)
+	}
+	return filepath.Join(abs, "clickhouse"), nil
 }
 
 func runImportFinished(ctx context.Context, args []string) error {
