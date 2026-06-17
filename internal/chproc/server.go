@@ -81,7 +81,6 @@ func (cfg Config) args() ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		args = append(args, "--")
 		args = append(args, storageArgs...)
 	}
 	return args, nil
@@ -93,6 +92,10 @@ func storageConfigArgs(dataDir string) ([]string, error) {
 		return nil, fmt.Errorf("resolve clickhouse data dir %s: %w", dataDir, err)
 	}
 	root = filepath.Clean(root)
+	logDir := filepath.Join(root, "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create clickhouse path %s: %w", logDir, err)
+	}
 	paths := []struct {
 		arg  string
 		path string
@@ -112,7 +115,12 @@ func storageConfigArgs(dataDir string) ([]string, error) {
 		}
 	}
 
-	args := make([]string, 0, len(paths))
+	args := []string{
+		"--log-file=" + filepath.Join(logDir, "clickhouse-server.log"),
+		"--errorlog-file=" + filepath.Join(logDir, "clickhouse-server.err.log"),
+		"--pid-file=" + filepath.Join(root, "clickhouse-server.pid"),
+		"--",
+	}
 	for _, p := range paths {
 		args = append(args, p.arg+withTrailingSeparator(p.path))
 	}

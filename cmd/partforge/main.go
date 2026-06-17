@@ -40,6 +40,12 @@ const defaultClickHouseClientConfigPath = "/etc/clickhouse-client/config.xml"
 
 var version = "dev"
 
+type workerRunDirs struct {
+	Root       string
+	ClickHouse string
+	Scratch    string
+}
+
 func main() {
 	configureLogger()
 	if err := run(); err != nil {
@@ -678,17 +684,31 @@ func runWorker(ctx context.Context, args []string) error {
 		"max_memory_usage", insertSettings["max_memory_usage"],
 	)
 
+	runDirs, err := createWorkerRunDirs(*workDir)
+	if err != nil {
+		return err
+	}
+	slog.Info(
+		"created worker run directory",
+		"stage", "prepare_work_dir",
+		"work_dir", *workDir,
+		"run_dir", runDirs.Root,
+		"clickhouse_data_dir", runDirs.ClickHouse,
+		"scratch_dir", runDirs.Scratch,
+	)
+	defer func() {
+		if err := os.RemoveAll(runDirs.Root); err != nil {
+			slog.Warn("failed to remove worker run directory", "run_dir", runDirs.Root, "error", err)
+		}
+	}()
+
 	var server *chproc.Server
 	if *startClickHouse {
-		clickHouseDataDir, err := workerClickHouseDataDir(*workDir)
-		if err != nil {
-			return err
-		}
-		slog.Info("starting local ClickHouse server", "stage", "start_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", clickHouseDataDir)
+		slog.Info("starting local ClickHouse server", "stage", "start_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse)
 		server, err = chproc.Start(ctx, chproc.Config{
 			Binary:     *clickHouseBinary,
 			ConfigFile: *clickHouseConfigFile,
-			DataDir:    clickHouseDataDir,
+			DataDir:    runDirs.ClickHouse,
 			URL:        *clickHouseURL,
 			User:       *clickHouseUser,
 			Password:   *clickHousePassword,
@@ -714,7 +734,7 @@ func runWorker(ctx context.Context, args []string) error {
 	processor := rewrite.Processor{
 		S3Copy:           s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
 		ClickHouse:       ch,
-		WorkDir:          *workDir,
+		WorkDir:          runDirs.Scratch,
 		MergeTimeout:     *mergeTimeout,
 		Metrics:          recorder,
 		InsertSettings:   insertSettings,
@@ -778,16 +798,34 @@ func runWorker(ctx context.Context, args []string) error {
 	}
 }
 
-func workerClickHouseDataDir(workDir string) (string, error) {
+func createWorkerRunDirs(workDir string) (workerRunDirs, error) {
 	root := strings.TrimSpace(workDir)
 	if root == "" {
 		root = "/tmp/partforge"
 	}
 	abs, err := filepath.Abs(root)
 	if err != nil {
-		return "", fmt.Errorf("resolve worker work-dir %s: %w", workDir, err)
+		return workerRunDirs{}, fmt.Errorf("resolve worker work-dir %s: %w", workDir, err)
 	}
-	return filepath.Join(abs, "clickhouse"), nil
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		return workerRunDirs{}, fmt.Errorf("create worker work-dir %s: %w", abs, err)
+	}
+	runRoot, err := os.MkdirTemp(abs, "run-")
+	if err != nil {
+		return workerRunDirs{}, fmt.Errorf("create worker run directory under %s: %w", abs, err)
+	}
+	dirs := workerRunDirs{
+		Root:       runRoot,
+		ClickHouse: filepath.Join(runRoot, "clickhouse"),
+		Scratch:    filepath.Join(runRoot, "scratch"),
+	}
+	for _, dir := range []string{dirs.ClickHouse, dirs.Scratch} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			_ = os.RemoveAll(runRoot)
+			return workerRunDirs{}, fmt.Errorf("create worker run subdirectory %s: %w", dir, err)
+		}
+	}
+	return dirs, nil
 }
 
 func runImportFinished(ctx context.Context, args []string) error {

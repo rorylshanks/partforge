@@ -229,14 +229,27 @@ func TestResolveS5cmdNumWorkers(t *testing.T) {
 	}
 }
 
-func TestWorkerClickHouseDataDir(t *testing.T) {
-	got, err := workerClickHouseDataDir("/mnt/nvme/partforge-work")
+func TestCreateWorkerRunDirs(t *testing.T) {
+	workDir := t.TempDir()
+	dirs, err := createWorkerRunDirs(workDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "/mnt/nvme/partforge-work/clickhouse"
-	if got != want {
-		t.Fatalf("data dir = %q, want %q", got, want)
+	if filepath.Dir(dirs.Root) != workDir {
+		t.Fatalf("run dir parent = %q, want %q", filepath.Dir(dirs.Root), workDir)
+	}
+	if filepath.Base(dirs.ClickHouse) != "clickhouse" || filepath.Dir(dirs.ClickHouse) != dirs.Root {
+		t.Fatalf("clickhouse dir = %q, want child of %q", dirs.ClickHouse, dirs.Root)
+	}
+	if filepath.Base(dirs.Scratch) != "scratch" || filepath.Dir(dirs.Scratch) != dirs.Root {
+		t.Fatalf("scratch dir = %q, want child of %q", dirs.Scratch, dirs.Root)
+	}
+	for _, dir := range []string{dirs.Root, dirs.ClickHouse, dirs.Scratch} {
+		if info, err := os.Stat(dir); err != nil {
+			t.Fatalf("stat %s: %v", dir, err)
+		} else if !info.IsDir() {
+			t.Fatalf("%s is not a directory", dir)
+		}
 	}
 }
 

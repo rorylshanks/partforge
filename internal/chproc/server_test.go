@@ -26,6 +26,9 @@ func TestArgsIncludeGeneratedStorageConfig(t *testing.T) {
 	want := []string{
 		"server",
 		"--config-file=/etc/clickhouse-server/config.xml",
+		"--log-file=" + filepath.Join(root, "logs", "clickhouse-server.log"),
+		"--errorlog-file=" + filepath.Join(root, "logs", "clickhouse-server.err.log"),
+		"--pid-file=" + filepath.Join(root, "clickhouse-server.pid"),
 		"--",
 		"--path=" + withTrailingSeparator(filepath.Join(root, "data")),
 		"--tmp_path=" + withTrailingSeparator(filepath.Join(root, "tmp")),
@@ -39,7 +42,7 @@ func TestArgsIncludeGeneratedStorageConfig(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("args = %#v, want %#v", got, want)
 	}
-	for _, path := range []string{"data", "tmp", "user_files", "format_schemas", "caches", "filesystem_caches", "disks", "access"} {
+	for _, path := range []string{"data", "tmp", "user_files", "format_schemas", "caches", "filesystem_caches", "disks", "access", "logs"} {
 		if info, err := os.Stat(filepath.Join(root, path)); err != nil {
 			t.Fatalf("stat generated path %s: %v", path, err)
 		} else if !info.IsDir() {
