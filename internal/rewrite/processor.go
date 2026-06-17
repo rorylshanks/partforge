@@ -16,6 +16,7 @@ import (
 	"github.com/partforge/partforge/internal/chhttp"
 	"github.com/partforge/partforge/internal/ddl"
 	"github.com/partforge/partforge/internal/fileutil"
+	"github.com/partforge/partforge/internal/freeze"
 	"github.com/partforge/partforge/internal/manifest"
 	"github.com/partforge/partforge/internal/metrics"
 	"github.com/partforge/partforge/internal/s3copy"
@@ -55,7 +56,11 @@ type ProcessResult struct {
 type activePart struct {
 	Name        string
 	PartitionID string
-	Path        string
+}
+
+type rewriteResult struct {
+	Output  manifest.Output
+	Cleanup func()
 }
 
 type workerTableInfo struct {
@@ -149,14 +154,15 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (ProcessResul
 	finishedRoot := filepath.Join(root, "finished")
 	slog.Info("rewriting source part", "stage", "rewrite_part", "job_id", m.JobID, "part_id", m.PartID)
 	rewriteStartedAt := time.Now()
-	output, err := p.rewritePart(ctx, m, sourceRoot, finishedRoot)
+	rewriteResult, err := p.rewritePart(ctx, m, sourceRoot, finishedRoot)
 	if err != nil {
 		recorder.ForgeFailed(m)
 		return ProcessResult{}, err
 	}
-	slog.Info("rewrote source part", "stage", "rewrite_part", "job_id", m.JobID, "part_id", m.PartID, "output_parts", len(output.Parts), "elapsed", time.Since(rewriteStartedAt))
+	defer rewriteResult.Cleanup()
+	slog.Info("rewrote source part", "stage", "rewrite_part", "job_id", m.JobID, "part_id", m.PartID, "output_parts", len(rewriteResult.Output.Parts), "elapsed", time.Since(rewriteStartedAt))
 
-	m.Output = output
+	m.Output = rewriteResult.Output
 	m.S3.FinishedKey = manifest.FinishedPartAttemptPrefix(m.S3.FinishedKey, item.Attempt, time.Now().UTC())
 	if err := artifact.WriteManifest(finishedRoot, m); err != nil {
 		recorder.ForgeFailed(m)
@@ -194,123 +200,143 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (ProcessResul
 		"bytes_per_second", ratePerSecond(finishedStats.Bytes, uploadElapsed),
 	)
 	recorder.ForgeCompleted(m)
-	slog.Info("processed part", "stage", "complete_part", "job_id", m.JobID, "part_id", m.PartID, "finished_key", m.S3.FinishedKey, "output_parts", len(output.Parts), "elapsed", time.Since(startedAt))
+	slog.Info("processed part", "stage", "complete_part", "job_id", m.JobID, "part_id", m.PartID, "finished_key", m.S3.FinishedKey, "output_parts", len(rewriteResult.Output.Parts), "elapsed", time.Since(startedAt))
 	return ProcessResult{FinishedKey: m.S3.FinishedKey}, nil
 }
 
-func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourcePartRoot, finishedRoot string) (out manifest.Output, err error) {
+func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourcePartRoot, finishedRoot string) (result rewriteResult, err error) {
 	if m.Source.Database == m.Dest.Database && m.Source.Table == m.Dest.Table {
-		return manifest.Output{}, fmt.Errorf("source and destination table names must differ inside the worker")
+		return rewriteResult{}, fmt.Errorf("source and destination table names must differ inside the worker")
 	}
 	sourceDDL, err := ddl.ForTable(m.SQL.SourceSchema, m.Source.Database, m.Source.Table)
 	if err != nil {
-		return manifest.Output{}, fmt.Errorf("normalize source DDL: %w", err)
+		return rewriteResult{}, fmt.Errorf("normalize source DDL: %w", err)
 	}
 	destDDL := strings.TrimSpace(m.SQL.DestinationSchema)
+	var freezeName string
+
+	cleanup := func() {
+		cleanupCtx := context.Background()
+		if freezeName != "" {
+			if err := p.ClickHouse.Exec(cleanupCtx, "ALTER TABLE "+chhttp.TableSQL(m.Dest.Database, m.Dest.Table)+" UNFREEZE WITH NAME "+chhttp.StringLiteral(freezeName)); err != nil {
+				slog.Warn("failed to remove frozen destination backup", "freeze", freezeName, "error", err)
+			}
+		}
+		for _, database := range uniqueStrings(m.Source.Database, m.Dest.Database) {
+			if err := p.ClickHouse.Exec(cleanupCtx, "DROP DATABASE IF EXISTS "+chhttp.Ident(database)+" SYNC"); err != nil {
+				slog.Warn("failed to drop worker database", "database", database, "error", err)
+			}
+		}
+	}
+	result.Cleanup = cleanup
+	defer func() {
+		if result.Cleanup == nil {
+			result.Cleanup = func() {}
+		}
+		if err != nil {
+			p.logWorkerDiagnostics("rewrite_part_failed", m, err)
+			cleanup()
+		}
+	}()
 
 	slog.Info("preparing worker databases", "stage", "prepare_worker_tables", "job_id", m.JobID, "part_id", m.PartID)
 	databases := uniqueStrings(m.Source.Database, m.Dest.Database)
 	for _, database := range databases {
 		if err := p.ClickHouse.Exec(ctx, "DROP DATABASE IF EXISTS "+chhttp.Ident(database)+" SYNC"); err != nil {
-			return manifest.Output{}, fmt.Errorf("drop worker database %s: %w", database, err)
+			return rewriteResult{}, fmt.Errorf("drop worker database %s: %w", database, err)
 		}
 	}
-	defer func() {
-		for _, database := range databases {
-			if err := p.ClickHouse.Exec(context.Background(), "DROP DATABASE IF EXISTS "+chhttp.Ident(database)+" SYNC"); err != nil {
-				slog.Warn("failed to drop worker database", "database", database, "error", err)
-			}
-		}
-	}()
-	defer func() {
-		if err != nil {
-			p.logWorkerDiagnostics("rewrite_part_failed", m, err)
-		}
-	}()
 
 	for _, database := range databases {
 		if err := p.ClickHouse.Exec(ctx, "CREATE DATABASE "+chhttp.Ident(database)); err != nil {
-			return manifest.Output{}, fmt.Errorf("create worker database %s: %w", database, err)
+			return rewriteResult{}, fmt.Errorf("create worker database %s: %w", database, err)
 		}
 	}
 	slog.Info("creating worker source table", "stage", "prepare_worker_tables", "job_id", m.JobID, "part_id", m.PartID, "source_table", chhttp.TableSQL(m.Source.Database, m.Source.Table))
 	if err := p.ClickHouse.Exec(ctx, sourceDDL); err != nil {
-		return manifest.Output{}, fmt.Errorf("create source table: %w", err)
+		return rewriteResult{}, fmt.Errorf("create source table: %w", err)
 	}
 	slog.Info("creating worker destination table", "stage", "prepare_worker_tables", "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table))
 	if err := p.ClickHouse.Exec(ctx, destDDL); err != nil {
-		return manifest.Output{}, fmt.Errorf("create destination table: %w", err)
+		return rewriteResult{}, fmt.Errorf("create destination table: %w", err)
 	}
 	slog.Info("created worker tables", "stage", "prepare_worker_tables", "job_id", m.JobID, "part_id", m.PartID)
 
 	sourceDataPath, err := p.tableDataPath(ctx, m.Source.Database, m.Source.Table)
 	if err != nil {
-		return manifest.Output{}, err
+		return rewriteResult{}, err
 	}
 	sourceDetached := filepath.Join(sourceDataPath, "detached")
 	if err := os.MkdirAll(sourceDetached, 0o755); err != nil {
-		return manifest.Output{}, err
+		return rewriteResult{}, err
 	}
 	if err := fileutil.MoveDir(sourcePartRoot, filepath.Join(sourceDetached, m.Part.Name)); err != nil {
-		return manifest.Output{}, fmt.Errorf("move source part to detached: %w", err)
+		return rewriteResult{}, fmt.Errorf("move source part to detached: %w", err)
 	}
 	slog.Info("attaching source part", "stage", "attach_source_part", "job_id", m.JobID, "part_id", m.PartID, "part", m.Part.Name, "source_table", chhttp.TableSQL(m.Source.Database, m.Source.Table))
 	if err := p.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(m.Source.Database, m.Source.Table)+" ATTACH PART "+chhttp.StringLiteral(m.Part.Name)); err != nil {
-		return manifest.Output{}, fmt.Errorf("attach source part %s: %w", m.Part.Name, err)
+		return rewriteResult{}, fmt.Errorf("attach source part %s: %w", m.Part.Name, err)
 	}
 	sourceStats, err := p.activePartStats(ctx, m.Source.Database, m.Source.Table)
 	if err != nil {
-		return manifest.Output{}, fmt.Errorf("measure source active parts: %w", err)
+		return rewriteResult{}, fmt.Errorf("measure source active parts: %w", err)
 	}
 	p.recorder().SetActivePartStats("source", m, sourceStats)
 	if err := p.reportProgress(ctx, m, ProgressSnapshot{SourceActivePartStats: &sourceStats}); err != nil {
-		return manifest.Output{}, err
+		return rewriteResult{}, err
 	}
 	slog.Info("attached source part", "stage", "attach_source_part", "job_id", m.JobID, "part_id", m.PartID, "active_parts", sourceStats.Count, "active_rows", sourceStats.Rows, "active_bytes", sourceStats.Bytes)
 
 	slog.Info("running insert-select", "stage", "insert_select", "job_id", m.JobID, "part_id", m.PartID)
 	insertStartedAt := time.Now()
 	if err := p.runInsertSelectWithRetries(ctx, m, destDDL); err != nil {
-		return manifest.Output{}, fmt.Errorf("run insert-select: %w", err)
+		return rewriteResult{}, fmt.Errorf("run insert-select: %w", err)
 	}
 	slog.Info("insert-select complete", "stage", "insert_select", "job_id", m.JobID, "part_id", m.PartID, "elapsed", time.Since(insertStartedAt))
 	slog.Info("waiting for destination merges", "stage", "wait_merges", "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table))
 	if err := p.waitForMerges(ctx, m.Dest.Database, m.Dest.Table); err != nil {
-		return manifest.Output{}, err
+		return rewriteResult{}, err
 	}
 	slog.Info("destination merges complete", "stage", "wait_merges", "job_id", m.JobID, "part_id", m.PartID)
 	destStats, err := p.activePartStats(ctx, m.Dest.Database, m.Dest.Table)
 	if err != nil {
-		return manifest.Output{}, fmt.Errorf("measure destination active parts: %w", err)
+		return rewriteResult{}, fmt.Errorf("measure destination active parts: %w", err)
 	}
 	p.recorder().SetActivePartStats("destination", m, destStats)
 	if err := p.reportProgress(ctx, m, ProgressSnapshot{DestinationActivePartStats: &destStats}); err != nil {
-		return manifest.Output{}, err
+		return rewriteResult{}, err
 	}
 	slog.Info("measured destination parts", "stage", "measure_destination_parts", "job_id", m.JobID, "part_id", m.PartID, "active_parts", destStats.Count, "active_rows", destStats.Rows, "active_bytes", destStats.Bytes)
 
 	activeParts, err := p.activeParts(ctx, m.Dest.Database, m.Dest.Table)
 	if err != nil {
-		return manifest.Output{}, err
+		return rewriteResult{}, err
 	}
-	slog.Info("detaching produced destination parts", "stage", "detach_destination_parts", "job_id", m.JobID, "part_id", m.PartID, "parts", len(activeParts))
-	outputParts := make([]manifest.OutputPart, 0, len(activeParts))
-	for _, part := range activeParts {
-		outputParts = append(outputParts, manifest.OutputPart{Name: part.Name, PartitionID: part.PartitionID})
-		slog.Info("detaching produced destination part", "stage", "detach_destination_parts", "job_id", m.JobID, "part_id", m.PartID, "part", part.Name, "partition_id", part.PartitionID)
-		if err := p.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(m.Dest.Database, m.Dest.Table)+" DETACH PART "+chhttp.StringLiteral(part.Name)); err != nil {
-			return manifest.Output{}, fmt.Errorf("detach destination part %s: %w", part.Name, err)
-		}
-		detachedPath, err := detachedPartPath(part.Path, part.Name)
-		if err != nil {
-			return manifest.Output{}, err
-		}
-		if err := fileutil.MoveDir(detachedPath, artifact.FinishedPartPath(finishedRoot, part.Name)); err != nil {
-			return manifest.Output{}, fmt.Errorf("move finished part %s: %w", part.Name, err)
-		}
+	if len(activeParts) == 0 {
+		result.Output = manifest.Output{}
+		return result, nil
 	}
+	slog.Info("freezing produced destination parts", "stage", "freeze_destination_parts", "job_id", m.JobID, "part_id", m.PartID, "parts", len(activeParts))
+	freezeName = workerFreezeName(m, time.Now().UTC())
+	if err := p.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(m.Dest.Database, m.Dest.Table)+" FREEZE WITH NAME "+chhttp.StringLiteral(freezeName)); err != nil {
+		return rewriteResult{}, fmt.Errorf("freeze destination table %s: %w", chhttp.TableSQL(m.Dest.Database, m.Dest.Table), err)
+	}
+	disks, err := freeze.LocalDisks(ctx, p.ClickHouse)
+	if err != nil {
+		return rewriteResult{}, err
+	}
+	frozenParts, err := freeze.ScanDisks(disks, freezeName)
+	if err != nil {
+		return rewriteResult{}, err
+	}
+	output, err := copyFrozenOutputParts(activeParts, frozenParts, finishedRoot)
+	if err != nil {
+		return rewriteResult{}, err
+	}
+	result.Output = output
+	slog.Info("froze produced destination parts", "stage", "freeze_destination_parts", "job_id", m.JobID, "part_id", m.PartID, "freeze", freezeName, "parts", len(output.Parts))
 
-	return manifest.Output{Parts: outputParts}, nil
+	return result, nil
 }
 
 func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Manifest, destDDL string) error {
@@ -646,20 +672,20 @@ func (p Processor) tableDataPath(ctx context.Context, database, table string) (s
 }
 
 func (p Processor) activeParts(ctx context.Context, database, table string) ([]activePart, error) {
-	query := "SELECT name, partition_id, path FROM system.parts WHERE database = " +
+	query := "SELECT name, partition_id FROM system.parts WHERE database = " +
 		chhttp.StringLiteral(database) + " AND table = " + chhttp.StringLiteral(table) +
 		" AND active ORDER BY name FORMAT TSV"
 	out, err := p.ClickHouse.QueryString(ctx, query)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := chhttp.FormatTSVStrings(out, 3)
+	rows, err := chhttp.FormatTSVStrings(out, 2)
 	if err != nil {
 		return nil, err
 	}
 	parts := make([]activePart, 0, len(rows))
 	for _, row := range rows {
-		parts = append(parts, activePart{Name: row[0], PartitionID: row[1], Path: row[2]})
+		parts = append(parts, activePart{Name: row[0], PartitionID: row[1]})
 	}
 	return parts, nil
 }
@@ -790,12 +816,35 @@ func defaultWorkDir(workDir string) string {
 	return workDir
 }
 
-func detachedPartPath(activePath, partName string) (string, error) {
-	clean := filepath.Clean(activePath)
-	if filepath.Base(clean) != partName {
-		return "", fmt.Errorf("active part path %s does not end with part name %s", activePath, partName)
+func workerFreezeName(m manifest.Manifest, frozenAt time.Time) string {
+	return fmt.Sprintf("partforge-%s-%s-%s", m.JobID, m.PartID, frozenAt.UTC().Format("20060102T150405.000000000Z"))
+}
+
+func copyFrozenOutputParts(activeParts []activePart, frozenParts []freeze.Part, finishedRoot string) (manifest.Output, error) {
+	if len(activeParts) != len(frozenParts) {
+		return manifest.Output{}, fmt.Errorf("frozen part count %d does not match active part count %d", len(frozenParts), len(activeParts))
 	}
-	return filepath.Join(filepath.Dir(clean), "detached", partName), nil
+
+	frozenByName := make(map[string]freeze.Part, len(frozenParts))
+	for _, part := range frozenParts {
+		if _, exists := frozenByName[part.Name]; exists {
+			return manifest.Output{}, fmt.Errorf("frozen snapshot contains duplicate part name %s", part.Name)
+		}
+		frozenByName[part.Name] = part
+	}
+
+	outputParts := make([]manifest.OutputPart, 0, len(activeParts))
+	for _, part := range activeParts {
+		frozenPart, ok := frozenByName[part.Name]
+		if !ok {
+			return manifest.Output{}, fmt.Errorf("frozen snapshot is missing active part %s", part.Name)
+		}
+		if err := fileutil.CopyDir(frozenPart.Path, artifact.FinishedPartPath(finishedRoot, part.Name)); err != nil {
+			return manifest.Output{}, fmt.Errorf("copy frozen part %s from %s: %w", part.Name, frozenPart.Path, err)
+		}
+		outputParts = append(outputParts, manifest.OutputPart{Name: part.Name, PartitionID: part.PartitionID})
+	}
+	return manifest.Output{Parts: outputParts}, nil
 }
 
 func (p Processor) recorder() metrics.Recorder {
