@@ -58,6 +58,12 @@ type activePart struct {
 	Path        string
 }
 
+type workerTableInfo struct {
+	Database string
+	Name     string
+	Engine   string
+}
+
 func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (ProcessResult, error) {
 	if item.Bucket == "" || item.SourceKey == "" || item.JobID == "" || item.PartID == "" {
 		return ProcessResult{}, fmt.Errorf("work item is missing bucket, source_key, job_id, or part_id")
@@ -192,7 +198,7 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (ProcessResul
 	return ProcessResult{FinishedKey: m.S3.FinishedKey}, nil
 }
 
-func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourcePartRoot, finishedRoot string) (manifest.Output, error) {
+func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourcePartRoot, finishedRoot string) (out manifest.Output, err error) {
 	if m.Source.Database == m.Dest.Database && m.Source.Table == m.Dest.Table {
 		return manifest.Output{}, fmt.Errorf("source and destination table names must differ inside the worker")
 	}
@@ -200,10 +206,7 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	if err != nil {
 		return manifest.Output{}, fmt.Errorf("normalize source DDL: %w", err)
 	}
-	destDDL, err := ddl.ForTable(m.SQL.DestinationSchema, m.Dest.Database, m.Dest.Table)
-	if err != nil {
-		return manifest.Output{}, fmt.Errorf("normalize destination DDL: %w", err)
-	}
+	destDDL := strings.TrimSpace(m.SQL.DestinationSchema)
 
 	slog.Info("preparing worker databases", "stage", "prepare_worker_tables", "job_id", m.JobID, "part_id", m.PartID)
 	databases := uniqueStrings(m.Source.Database, m.Dest.Database)
@@ -217,6 +220,11 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 			if err := p.ClickHouse.Exec(context.Background(), "DROP DATABASE IF EXISTS "+chhttp.Ident(database)+" SYNC"); err != nil {
 				slog.Warn("failed to drop worker database", "database", database, "error", err)
 			}
+		}
+	}()
+	defer func() {
+		if err != nil {
+			p.logWorkerDiagnostics("rewrite_part_failed", m, err)
 		}
 	}()
 
@@ -432,6 +440,89 @@ func resetDestinationTable(ctx context.Context, ch chhttp.Client, m manifest.Man
 		return fmt.Errorf("recreate destination table before retry: %w", err)
 	}
 	return nil
+}
+
+func (p Processor) logWorkerDiagnostics(stage string, m manifest.Manifest, cause error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	databases, dbErr := p.workerDatabases(ctx)
+	tables, tableErr := p.workerTables(ctx)
+	diagnosticAttrs := []any{
+		"stage", stage,
+		"job_id", m.JobID,
+		"part_id", m.PartID,
+		"source_table", chhttp.TableSQL(m.Source.Database, m.Source.Table),
+		"destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table),
+		"insert_select_bytes", len(m.SQL.InsertSelect),
+		"insert_select_preview", previewSQL(m.SQL.InsertSelect),
+		"error", cause,
+	}
+	if dbErr != nil {
+		diagnosticAttrs = append(diagnosticAttrs, "database_list_error", dbErr)
+	} else {
+		diagnosticAttrs = append(diagnosticAttrs, "databases", strings.Join(databases, ","))
+	}
+	if tableErr != nil {
+		diagnosticAttrs = append(diagnosticAttrs, "table_list_error", tableErr)
+	} else {
+		diagnosticAttrs = append(diagnosticAttrs, "tables", formatWorkerTables(tables))
+	}
+	slog.Error("worker ClickHouse diagnostics", diagnosticAttrs...)
+}
+
+func (p Processor) workerDatabases(ctx context.Context) ([]string, error) {
+	out, err := p.ClickHouse.QueryString(ctx, "SELECT name FROM system.databases ORDER BY name FORMAT TSV")
+	if err != nil {
+		return nil, err
+	}
+	rows, err := chhttp.FormatTSVStrings(out, 1)
+	if err != nil {
+		return nil, err
+	}
+	databases := make([]string, 0, len(rows))
+	for _, row := range rows {
+		databases = append(databases, row[0])
+	}
+	return databases, nil
+}
+
+func (p Processor) workerTables(ctx context.Context) ([]workerTableInfo, error) {
+	query := "SELECT database, name, engine FROM system.tables " +
+		"WHERE database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema') " +
+		"ORDER BY database, name FORMAT TSV"
+	out, err := p.ClickHouse.QueryString(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := chhttp.FormatTSVStrings(out, 3)
+	if err != nil {
+		return nil, err
+	}
+	tables := make([]workerTableInfo, 0, len(rows))
+	for _, row := range rows {
+		tables = append(tables, workerTableInfo{Database: row[0], Name: row[1], Engine: row[2]})
+	}
+	return tables, nil
+}
+
+func formatWorkerTables(tables []workerTableInfo) string {
+	if len(tables) == 0 {
+		return "<none>"
+	}
+	parts := make([]string, 0, len(tables))
+	for _, table := range tables {
+		parts = append(parts, fmt.Sprintf("%s(%s)", chhttp.TableSQL(table.Database, table.Name), table.Engine))
+	}
+	return strings.Join(parts, ",")
+}
+
+func previewSQL(query string) string {
+	preview := strings.Join(strings.Fields(query), " ")
+	if len(preview) <= 1000 {
+		return preview
+	}
+	return preview[:1000] + "...<truncated>"
 }
 
 func cloneQuerySettings(settings chhttp.QuerySettings) chhttp.QuerySettings {

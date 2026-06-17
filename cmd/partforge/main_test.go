@@ -80,6 +80,49 @@ func TestSelectRetryParts(t *testing.T) {
 	}
 }
 
+func TestJobS3Prefixes(t *testing.T) {
+	prefixes, err := jobS3Prefixes("job-1", []state.Part{
+		{
+			JobID:       "job-1",
+			PartID:      "part-1",
+			Bucket:      "bucket",
+			SourceKey:   "partforge/jobs/job-1/source/part-1",
+			FinishedKey: "partforge/jobs/job-1/finished/part-1/attempt-000001",
+		},
+		{
+			JobID:       "job-1",
+			PartID:      "part-2",
+			Bucket:      "bucket",
+			SourceKey:   "partforge/jobs/job-1/source/part-2",
+			FinishedKey: "partforge/jobs/job-1/finished/part-2",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prefixes) != 1 {
+		t.Fatalf("prefixes = %+v", prefixes)
+	}
+	if prefixes[0].Bucket != "bucket" || prefixes[0].Prefix != "partforge/jobs/job-1" {
+		t.Fatalf("prefix = %+v", prefixes[0])
+	}
+}
+
+func TestJobS3PrefixesRejectsWrongJobKey(t *testing.T) {
+	_, err := jobS3Prefixes("job-1", []state.Part{
+		{
+			JobID:       "job-1",
+			PartID:      "part-1",
+			Bucket:      "bucket",
+			SourceKey:   "partforge/jobs/job-10/source/part-1",
+			FinishedKey: "partforge/jobs/job-10/finished/part-1",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected wrong job key error")
+	}
+}
+
 func TestStateProgress(t *testing.T) {
 	query := metrics.QueryProgress{ReadRows: 1, ReadBytes: 2, WrittenRows: 3, WrittenBytes: 4}
 	source := metrics.PartStats{Count: 5, Rows: 6, Bytes: 7}
@@ -261,6 +304,27 @@ func TestApplyConfigDefaultsDoesNotOverrideCLI(t *testing.T) {
 
 	if *bucket != "cli-bucket" {
 		t.Fatalf("bucket = %q", *bucket)
+	}
+}
+
+func TestDestinationTableRefFromSchema(t *testing.T) {
+	got, err := destinationTableRefFromSchema(
+		"CREATE TABLE posthog.query_log_archive_temp (x UInt64) ENGINE = MergeTree ORDER BY x",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Database != "posthog" || got.Table != "query_log_archive_temp" {
+		t.Fatalf("destination = %+v", got)
+	}
+}
+
+func TestDestinationTableRefFromSchemaRequiresDatabase(t *testing.T) {
+	_, err := destinationTableRefFromSchema(
+		"CREATE TABLE query_log_archive_temp (x UInt64) ENGINE = MergeTree ORDER BY x",
+	)
+	if err == nil {
+		t.Fatal("expected unqualified table error")
 	}
 }
 

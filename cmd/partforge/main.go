@@ -76,6 +76,8 @@ func run() error {
 		return runJobStatus(ctx, os.Args[2:])
 	case "retry-failed":
 		return runRetryFailed(ctx, os.Args[2:])
+	case "delete-job":
+		return runDeleteJob(ctx, os.Args[2:])
 	case "version":
 		fmt.Println(version)
 		return nil
@@ -96,6 +98,7 @@ func usage() {
   partforge list-jobs       [flags]
   partforge job-status      [flags]
   partforge retry-failed    [flags]
+  partforge delete-job      [flags]
 
 Commands:
   upload-freeze     Upload frozen source part directories to S3 and register DynamoDB work.
@@ -104,6 +107,7 @@ Commands:
   list-jobs         List job IDs found in the DynamoDB state table.
   job-status        Show part state counts, progress, and failed part errors for one job.
   retry-failed      Move failed parts back to their retryable state.
+  delete-job        Delete one job's DynamoDB state rows, optionally including S3 artifacts.
   version           Print the build version.
 `)
 }
@@ -115,8 +119,6 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		database              = fs.String("database", "", "source database")
 		table                 = fs.String("table", "", "source table")
 		freezeName            = fs.String("freeze", "", "ALTER TABLE ... FREEZE WITH NAME value")
-		destinationDatabase   = fs.String("destination-database", "", "destination database referenced by the insert-select")
-		destinationTable      = fs.String("destination-table", "", "destination table referenced by the insert-select")
 		destinationSchemaFile = fs.String("destination-schema-file", "", "file containing full CREATE TABLE for destination")
 		insertSelectFile      = fs.String("insert-select-file", "", "file containing INSERT INTO destination SELECT ... FROM source")
 		clickHouseURL         = fs.String("clickhouse-url", defaultClickHouseURL, "source ClickHouse HTTP URL for SHOW CREATE TABLE")
@@ -143,9 +145,8 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		return err
 	}
 
-	if *database == "" || *table == "" || *freezeName == "" || *destinationDatabase == "" || *destinationTable == "" ||
-		*destinationSchemaFile == "" || *insertSelectFile == "" || *bucket == "" {
-		return errors.New("database, table, freeze, destination-database, destination-table, destination-schema-file, insert-select-file, and bucket are required")
+	if *database == "" || *table == "" || *freezeName == "" || *destinationSchemaFile == "" || *insertSelectFile == "" || *bucket == "" {
+		return errors.New("database, table, freeze, destination-schema-file, insert-select-file, and bucket are required")
 	}
 	resolvedUploadConcurrency, err := resolveUploadConcurrency(*uploadConcurrency)
 	if err != nil {
@@ -154,12 +155,10 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 
 	startedAt := time.Now()
 	sourceTable := chhttp.TableSQL(*database, *table)
-	destinationTableRef := chhttp.TableSQL(*destinationDatabase, *destinationTable)
 	slog.Info(
 		"upload-freeze started",
 		"stage", "start",
 		"source_table", sourceTable,
-		"destination_table", destinationTableRef,
 		"freeze", *freezeName,
 		"bucket", *bucket,
 		"prefix", *prefix,
@@ -189,14 +188,15 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 	sourceSchema = strings.TrimSpace(sourceSchema)
 	slog.Info("loaded source table schema", "stage", "load_source_schema", "source_table", sourceTable, "source_schema_bytes", len(sourceSchema))
 
-	slog.Info("validating source and destination schemas", "stage", "validate_schemas")
+	slog.Info("validating source schema and destination table", "stage", "validate_schemas")
 	if _, err := ddl.NormalizeCreateTable(sourceSchema); err != nil {
 		return fmt.Errorf("source schema is not supported by worker: %w", err)
 	}
-	if _, err := ddl.NormalizeCreateTable(destinationSchema); err != nil {
-		return fmt.Errorf("destination schema is not supported by worker: %w", err)
+	destinationTableRef, err := destinationTableRefFromSchema(destinationSchema)
+	if err != nil {
+		return err
 	}
-	slog.Info("validated source and destination schemas", "stage", "validate_schemas")
+	slog.Info("validated source schema and destination table", "stage", "validate_schemas", "destination_schema_table", chhttp.TableSQL(destinationTableRef.Database, destinationTableRef.Table))
 
 	slog.Info("discovering local ClickHouse disks", "stage", "discover_disks")
 	disks, err := freeze.LocalDisks(ctx, ch)
@@ -251,7 +251,7 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		JobID:             resolvedJobID,
 		FreezeName:        *freezeName,
 		Source:            manifest.TableRef{Database: *database, Table: *table},
-		Dest:              manifest.TableRef{Database: *destinationDatabase, Table: *destinationTable},
+		Dest:              destinationTableRef,
 		SourceSchema:      sourceSchema,
 		DestinationSchema: destinationSchema,
 		InsertSelect:      insertSelect,
@@ -1052,6 +1052,85 @@ func runRetryFailed(ctx context.Context, args []string) error {
 	return nil
 }
 
+func runDeleteJob(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("delete-job", flag.ExitOnError)
+	var (
+		configPath     = fs.String("config", defaultConfigPath, "JSON config file path")
+		jobID          = fs.String("job-id", "", "job id to delete")
+		deleteS3       = fs.Bool("delete-s3", false, "also delete this job's S3 artifacts")
+		stateTable     = fs.String("state-table", defaultStateTable, "DynamoDB state table")
+		region         = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
+		s3Endpoint     = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
+		s5cmdBinary    = fs.String("s5cmd-binary", "s5cmd", "s5cmd binary path")
+		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
+		jsonOutput     = fs.Bool("json", false, "print JSON output")
+	)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := applyConfigDefaults(fs, *configPath, "delete-job"); err != nil {
+		return err
+	}
+	if *jobID == "" {
+		return errors.New("job-id is required")
+	}
+
+	slog.Info("delete-job started", "stage", "start", "job_id", *jobID, "delete_s3", *deleteS3)
+	slog.Info("initializing DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
+	stateStore, err := state.New(ctx, state.Config{
+		Region:   *region,
+		Endpoint: *dynamoEndpoint,
+		Table:    *stateTable,
+	})
+	if err != nil {
+		return err
+	}
+	slog.Info("initialized DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
+	slog.Info("listing job parts", "stage", "list_job_parts", "job_id", *jobID)
+	jobParts, err := stateStore.ListJobParts(ctx, *jobID)
+	if err != nil {
+		return err
+	}
+	if len(jobParts) == 0 {
+		return fmt.Errorf("job %s has no state rows", *jobID)
+	}
+	slog.Info("listed job parts", "stage", "list_job_parts", "job_id", *jobID, "parts", len(jobParts))
+
+	var deletedPrefixes []jobS3Prefix
+	if *deleteS3 {
+		deletedPrefixes, err = jobS3Prefixes(*jobID, jobParts)
+		if err != nil {
+			return err
+		}
+		copier := s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint}
+		for _, prefix := range deletedPrefixes {
+			slog.Info("deleting job S3 prefix", "stage", "delete_s3", "job_id", *jobID, "bucket", prefix.Bucket, "prefix", prefix.Prefix)
+			if err := copier.DeletePrefix(ctx, prefix.Bucket, prefix.Prefix); err != nil {
+				return fmt.Errorf("delete s3://%s/%s: %w", prefix.Bucket, prefix.Prefix, err)
+			}
+			slog.Info("deleted job S3 prefix", "stage", "delete_s3", "job_id", *jobID, "bucket", prefix.Bucket, "prefix", prefix.Prefix)
+		}
+	}
+
+	slog.Info("deleting job state rows", "stage", "delete_state", "job_id", *jobID, "parts", len(jobParts))
+	if err := stateStore.DeleteJobParts(ctx, jobParts); err != nil {
+		return err
+	}
+	slog.Info("deleted job state rows", "stage", "delete_state", "job_id", *jobID, "parts", len(jobParts))
+
+	out := deleteJobOutput{
+		JobID:             *jobID,
+		StatePartsDeleted: len(jobParts),
+		DeleteS3:          *deleteS3,
+		S3PrefixesDeleted: deletedPrefixes,
+	}
+	if *jsonOutput {
+		return writeJSON(os.Stdout, out)
+	}
+	printDeleteJobResult(os.Stdout, out)
+	return nil
+}
+
 func readRequiredFile(path string) (string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -1061,6 +1140,17 @@ func readRequiredFile(path string) (string, error) {
 		return "", fmt.Errorf("%s is empty", path)
 	}
 	return string(b), nil
+}
+
+func destinationTableRefFromSchema(schema string) (manifest.TableRef, error) {
+	schemaDatabase, schemaTable, hasDatabase, err := ddl.TableName(schema)
+	if err != nil {
+		return manifest.TableRef{}, fmt.Errorf("parse destination schema table name: %w", err)
+	}
+	if !hasDatabase {
+		return manifest.TableRef{}, fmt.Errorf("destination schema CREATE TABLE must include a database-qualified table name")
+	}
+	return manifest.TableRef{Database: schemaDatabase, Table: schemaTable}, nil
 }
 
 func applyConfigDefaults(fs *flag.FlagSet, path, command string) error {
@@ -1307,6 +1397,18 @@ type retryResult struct {
 	To     string `json:"to"`
 }
 
+type deleteJobOutput struct {
+	JobID             string        `json:"job_id"`
+	StatePartsDeleted int           `json:"state_parts_deleted"`
+	DeleteS3          bool          `json:"delete_s3"`
+	S3PrefixesDeleted []jobS3Prefix `json:"s3_prefixes_deleted,omitempty"`
+}
+
+type jobS3Prefix struct {
+	Bucket string `json:"bucket"`
+	Prefix string `json:"prefix"`
+}
+
 func summarizeJob(jobID string, parts []state.Part) jobSummary {
 	counts := make(map[state.Status]int, len(statusOrder()))
 	for _, status := range statusOrder() {
@@ -1434,6 +1536,58 @@ func selectRetryParts(parts []state.Part, all, force bool, partID string) ([]sta
 	return nil, fmt.Errorf("part %s was not found in job", partID)
 }
 
+func jobS3Prefixes(jobID string, parts []state.Part) ([]jobS3Prefix, error) {
+	if strings.TrimSpace(jobID) == "" {
+		return nil, errors.New("job id is required")
+	}
+	if strings.Contains(jobID, "/") || strings.ContainsAny(jobID, "*?[]{}") {
+		return nil, fmt.Errorf("job id %q is not safe for S3 prefix deletion", jobID)
+	}
+
+	seen := map[jobS3Prefix]struct{}{}
+	for _, part := range parts {
+		if part.JobID != jobID {
+			return nil, fmt.Errorf("part %s belongs to job %q, expected %q", part.PartID, part.JobID, jobID)
+		}
+		for _, key := range []string{part.SourceKey, part.FinishedKey} {
+			prefix, err := jobPrefixFromKey(jobID, key)
+			if err != nil {
+				return nil, err
+			}
+			seen[jobS3Prefix{Bucket: part.Bucket, Prefix: prefix}] = struct{}{}
+		}
+	}
+
+	prefixes := make([]jobS3Prefix, 0, len(seen))
+	for prefix := range seen {
+		prefixes = append(prefixes, prefix)
+	}
+	sort.Slice(prefixes, func(i, j int) bool {
+		if prefixes[i].Bucket == prefixes[j].Bucket {
+			return prefixes[i].Prefix < prefixes[j].Prefix
+		}
+		return prefixes[i].Bucket < prefixes[j].Bucket
+	})
+	return prefixes, nil
+}
+
+func jobPrefixFromKey(jobID, key string) (string, error) {
+	cleanKey := strings.Trim(key, "/")
+	if cleanKey == "" {
+		return "", errors.New("S3 key is required")
+	}
+	segments := strings.Split(cleanKey, "/")
+	for i := 0; i+1 < len(segments); i++ {
+		if segments[i] == "jobs" && segments[i+1] == jobID {
+			if i+2 >= len(segments) {
+				return "", fmt.Errorf("S3 key %q does not include data below job %q", key, jobID)
+			}
+			return strings.Join(segments[:i+2], "/"), nil
+		}
+	}
+	return "", fmt.Errorf("S3 key %q does not contain job segment %q", key, jobID)
+}
+
 func printRetryResults(out *os.File, result retryFailedOutput) {
 	fmt.Fprintf(out, "job_id: %s\n", result.JobID)
 	fmt.Fprintf(out, "forced: %t\n", result.Forced)
@@ -1445,6 +1599,22 @@ func printRetryResults(out *os.File, result retryFailedOutput) {
 	fmt.Fprintln(tw, "\nPART_ID\tFROM\tTO")
 	for _, part := range result.Parts {
 		fmt.Fprintf(tw, "%s\t%s\t%s\n", part.PartID, part.From, part.To)
+	}
+	_ = tw.Flush()
+}
+
+func printDeleteJobResult(out *os.File, result deleteJobOutput) {
+	fmt.Fprintf(out, "job_id: %s\n", result.JobID)
+	fmt.Fprintf(out, "state_parts_deleted: %d\n", result.StatePartsDeleted)
+	fmt.Fprintf(out, "delete_s3: %t\n", result.DeleteS3)
+	if len(result.S3PrefixesDeleted) == 0 {
+		return
+	}
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "\nS3_PREFIXES_DELETED")
+	fmt.Fprintln(tw, "BUCKET\tPREFIX")
+	for _, prefix := range result.S3PrefixesDeleted {
+		fmt.Fprintf(tw, "%s\t%s\n", prefix.Bucket, prefix.Prefix)
 	}
 	_ = tw.Flush()
 }

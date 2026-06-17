@@ -34,3 +34,20 @@ func TestArgsOmitsNumWorkersWhenUnset(t *testing.T) {
 		t.Fatalf("args = %#v, want %#v", got, want)
 	}
 }
+
+func TestDeletePrefixTarget(t *testing.T) {
+	got, err := deletePrefixTarget("bucket", "partforge/jobs/job-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "s3://bucket/partforge/jobs/job-123/*"
+	if got != want {
+		t.Fatalf("target = %q, want %q", got, want)
+	}
+}
+
+func TestDeletePrefixTargetRejectsGlobMeta(t *testing.T) {
+	if _, err := deletePrefixTarget("bucket", "partforge/jobs/job-*"); err == nil {
+		t.Fatal("expected glob metacharacter error")
+	}
+}

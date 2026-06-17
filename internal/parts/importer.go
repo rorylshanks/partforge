@@ -161,9 +161,6 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact Fi
 	if m.PartID != artifact.PartID {
 		return fmt.Errorf("finished artifact s3://%s/%s belongs to part %s, expected %s", artifact.Bucket, artifact.Key, m.PartID, artifact.PartID)
 	}
-	if m.Dest.Database != job.Database || m.Dest.Table != job.Table {
-		return fmt.Errorf("finished artifact s3://%s/%s targets %s, expected %s", artifact.Bucket, artifact.Key, chhttp.TableSQL(m.Dest.Database, m.Dest.Table), chhttp.TableSQL(job.Database, job.Table))
-	}
 
 	for _, part := range m.Output.Parts {
 		src := artifactpkg.FinishedPartPath(extractRoot, part.Name)

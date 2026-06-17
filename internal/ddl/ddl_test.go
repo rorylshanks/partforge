@@ -37,3 +37,23 @@ func TestForTable(t *testing.T) {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
+
+func TestTableName(t *testing.T) {
+	database, table, hasDatabase, err := TableName("CREATE TABLE `db``name`.`tab``le` (x UInt64) ENGINE = MergeTree ORDER BY x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasDatabase || database != "db`name" || table != "tab`le" {
+		t.Fatalf("database=%q table=%q hasDatabase=%t", database, table, hasDatabase)
+	}
+}
+
+func TestTableNameWithoutDatabase(t *testing.T) {
+	database, table, hasDatabase, err := TableName("CREATE TABLE events (x UInt64) ENGINE = MergeTree ORDER BY x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasDatabase || database != "" || table != "events" {
+		t.Fatalf("database=%q table=%q hasDatabase=%t", database, table, hasDatabase)
+	}
+}

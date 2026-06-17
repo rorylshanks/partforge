@@ -427,6 +427,43 @@ func (s *Store) ListFinishedParts(ctx context.Context, jobID string) ([]Part, er
 	return parts, nil
 }
 
+func (s *Store) DeleteJobParts(ctx context.Context, parts []Part) error {
+	if len(parts) == 0 {
+		return errors.New("job has no parts to delete")
+	}
+	jobID := parts[0].JobID
+	if strings.TrimSpace(jobID) == "" {
+		return errors.New("job id is required")
+	}
+	for _, part := range parts {
+		if err := validatePart(part); err != nil {
+			return err
+		}
+		if part.JobID != jobID {
+			return fmt.Errorf("delete job parts got mixed job ids %q and %q", jobID, part.JobID)
+		}
+		_, err := s.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+			TableName: aws.String(s.table),
+			Key:       part.key(),
+			ConditionExpression: aws.String(
+				"#job_id = :job_id AND #part_id = :part_id",
+			),
+			ExpressionAttributeNames: map[string]string{
+				"#job_id":  "job_id",
+				"#part_id": "part_id",
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":job_id":  stringAttr(part.JobID),
+				":part_id": stringAttr(part.PartID),
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("delete state item for %s/%s: %w", part.JobID, part.PartID, err)
+		}
+	}
+	return nil
+}
+
 func (s *Store) MarkImporting(ctx context.Context, part Part, now time.Time) error {
 	return s.transition(ctx, part, StatusFinished, StatusImporting, "importing_at", "", now)
 }

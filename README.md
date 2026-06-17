@@ -147,6 +147,23 @@ partforge retry-failed \
 
 Use `-all -force` only when the whole job should be rewritten from the worker stage.
 
+Delete one job's DynamoDB state rows:
+
+```sh
+partforge delete-job \
+  -job-id=job-123
+```
+
+Also delete that job's S3 artifacts:
+
+```sh
+partforge delete-job \
+  -job-id=job-123 \
+  -delete-s3
+```
+
+`delete-job -delete-s3` derives the exact `s3://bucket/<prefix>/jobs/<job-id>/*` target from the job's recorded state rows, rejects S5CMD glob metacharacters in the generated bucket or prefix, deletes S3 before deleting DynamoDB state, and fails if the job has no state rows. It requires `dynamodb:Query` and `dynamodb:DeleteItem`; with `-delete-s3`, it also requires S3 list/delete permissions for the recorded job prefix.
+
 ## Example
 
 ```sh
@@ -154,8 +171,6 @@ partforge upload-freeze \
   -database=src_db \
   -table=events \
   -freeze=migration_001 \
-  -destination-database=dst_db \
-  -destination-table=events_new \
   -destination-schema-file=dest.sql \
   -insert-select-file=insert.sql \
   -bucket=partforge \
@@ -163,7 +178,7 @@ partforge upload-freeze \
   -dynamodb-endpoint=http://localhost:4566
 ```
 
-The destination schema file should contain a full `CREATE TABLE` statement. The insert file should contain a full statement such as:
+The destination schema file should contain the full `CREATE TABLE` statement used inside the worker, including the database-qualified table name. The insert file should contain a full statement that writes to that table, such as:
 
 ```sql
 INSERT INTO dst_db.events_new
@@ -172,7 +187,7 @@ SELECT
 FROM src_db.events
 ```
 
-`Replicated*MergeTree` engines are normalized to their non-replicated `*MergeTree` equivalents inside the worker.
+Source-table `Replicated*MergeTree` engines are normalized to their non-replicated `*MergeTree` equivalents inside the worker. The destination schema is executed as provided.
 
 `upload-freeze` discovers every ClickHouse disk from `system.disks`, scans each local disk's `shadow/<freeze>` directory, and includes the disk name in the part identity. S3-backed ClickHouse disks are rejected for now.
 

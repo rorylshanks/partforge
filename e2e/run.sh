@@ -71,8 +71,6 @@ CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --user "$clickhouse_owne
   -database=src \
   -table=events \
   -freeze=e2e_freeze \
-  -destination-database=dst \
-  -destination-table=events_new \
   -destination-schema-file=e2e/sql/destination.sql \
   -insert-select-file=e2e/sql/insert.sql \
   -clickhouse-url="$CH_HTTP_DOCKER" \
@@ -107,4 +105,12 @@ docker compose exec -T clickhouse clickhouse-client --query \
   > "$ROOT/.e2e/actual.tsv"
 
 diff -u e2e/expected.tsv "$ROOT/.e2e/actual.tsv"
+
+CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+  delete-job \
+  -job-id="$JOB_ID" \
+  -delete-s3 \
+  -s3-endpoint=http://localstack:4566 \
+  -dynamodb-endpoint=http://localstack:4566
+
 echo "e2e passed with $part_count frozen parts"

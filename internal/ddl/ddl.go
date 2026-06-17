@@ -39,6 +39,39 @@ func ForTable(query, database, table string) (string, error) {
 	return q[:start] + chhttp.TableSQL(database, table) + q[end:], nil
 }
 
+func TableName(query string) (database string, table string, hasDatabase bool, err error) {
+	q := strings.TrimSpace(query)
+	if q == "" {
+		return "", "", false, fmt.Errorf("empty CREATE TABLE")
+	}
+	pos := skipSpaces(q, 0)
+	if !consumeKeyword(q, &pos, "CREATE") || !consumeKeyword(q, &pos, "TABLE") {
+		return "", "", false, fmt.Errorf("query is not CREATE TABLE")
+	}
+	_ = consumeKeyword(q, &pos, "IF")
+	if strings.EqualFold(nextWord(q, pos), "NOT") {
+		_ = consumeKeyword(q, &pos, "NOT")
+		if !consumeKeyword(q, &pos, "EXISTS") {
+			return "", "", false, fmt.Errorf("malformed IF NOT EXISTS clause")
+		}
+	}
+
+	first, err := readIdentifier(q, &pos)
+	if err != nil {
+		return "", "", false, err
+	}
+	pos = skipSpaces(q, pos)
+	if pos >= len(q) || q[pos] != '.' {
+		return "", first, false, nil
+	}
+	pos++
+	second, err := readIdentifier(q, &pos)
+	if err != nil {
+		return "", "", false, err
+	}
+	return first, second, true, nil
+}
+
 func normalizeEngine(engine string, args string, hasArgs bool) (string, error) {
 	if strings.HasPrefix(engine, "Replicated") && strings.HasSuffix(engine, "MergeTree") {
 		baseEngine := strings.TrimPrefix(engine, "Replicated")
@@ -141,23 +174,32 @@ func tableNameSpan(q string) (int, int, error) {
 }
 
 func consumeIdentifier(q string, pos *int) error {
+	_, err := readIdentifier(q, pos)
+	return err
+}
+
+func readIdentifier(q string, pos *int) (string, error) {
+	*pos = skipSpaces(q, *pos)
 	if *pos >= len(q) {
-		return fmt.Errorf("expected identifier")
+		return "", fmt.Errorf("expected identifier")
 	}
 	if q[*pos] == '`' {
 		*pos += 1
+		var b strings.Builder
 		for *pos < len(q) {
 			if q[*pos] == '`' {
 				if *pos+1 < len(q) && q[*pos+1] == '`' {
+					b.WriteByte('`')
 					*pos += 2
 					continue
 				}
 				*pos += 1
-				return nil
+				return b.String(), nil
 			}
+			b.WriteByte(q[*pos])
 			*pos += 1
 		}
-		return fmt.Errorf("unterminated quoted identifier")
+		return "", fmt.Errorf("unterminated quoted identifier")
 	}
 	start := *pos
 	for *pos < len(q) {
@@ -168,9 +210,9 @@ func consumeIdentifier(q string, pos *int) error {
 		*pos++
 	}
 	if *pos == start {
-		return fmt.Errorf("expected identifier")
+		return "", fmt.Errorf("expected identifier")
 	}
-	return nil
+	return q[start:*pos], nil
 }
 
 func splitTopLevelArgs(s string) ([]string, error) {

@@ -29,6 +29,14 @@ func (c Copier) DownloadPrefix(ctx context.Context, bucket, prefix, localDir str
 	return c.run(ctx, "cp", s3URI(bucket, prefix)+"/*", withTrailingSeparator(localDir))
 }
 
+func (c Copier) DeletePrefix(ctx context.Context, bucket, prefix string) error {
+	target, err := deletePrefixTarget(bucket, prefix)
+	if err != nil {
+		return err
+	}
+	return c.run(ctx, "rm", target)
+}
+
 func (c Copier) run(ctx context.Context, command string, args ...string) error {
 	binary := c.Binary
 	if strings.TrimSpace(binary) == "" {
@@ -69,6 +77,28 @@ func requireDir(path string) error {
 
 func s3URI(bucket, prefix string) string {
 	return "s3://" + strings.Trim(bucket, "/") + "/" + strings.Trim(prefix, "/")
+}
+
+func deletePrefixTarget(bucket, prefix string) (string, error) {
+	bucket = strings.Trim(bucket, "/")
+	prefix = strings.Trim(prefix, "/")
+	if bucket == "" {
+		return "", fmt.Errorf("s3 bucket is required")
+	}
+	if prefix == "" {
+		return "", fmt.Errorf("s3 prefix is required")
+	}
+	if containsS5cmdGlobMeta(bucket) {
+		return "", fmt.Errorf("s3 bucket %q contains s5cmd glob metacharacters", bucket)
+	}
+	if containsS5cmdGlobMeta(prefix) {
+		return "", fmt.Errorf("s3 prefix %q contains s5cmd glob metacharacters", prefix)
+	}
+	return s3URI(bucket, prefix) + "/*", nil
+}
+
+func containsS5cmdGlobMeta(value string) bool {
+	return strings.ContainsAny(value, "*?[]{}")
 }
 
 func withTrailingSeparator(path string) string {
