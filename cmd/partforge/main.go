@@ -688,44 +688,6 @@ func runWorker(ctx context.Context, args []string) error {
 		"max_memory_usage", insertSettings["max_memory_usage"],
 	)
 
-	runDirs, err := createWorkerRunDirs(*workDir)
-	if err != nil {
-		return err
-	}
-	slog.Info(
-		"created worker run directory",
-		"stage", "prepare_work_dir",
-		"work_dir", *workDir,
-		"run_dir", runDirs.Root,
-		"clickhouse_data_dir", runDirs.ClickHouse,
-		"scratch_dir", runDirs.Scratch,
-	)
-	defer func() {
-		if err := os.RemoveAll(runDirs.Root); err != nil {
-			slog.Warn("failed to remove worker run directory", "run_dir", runDirs.Root, "error", err)
-		}
-	}()
-
-	var server *chproc.Server
-	if *startClickHouse {
-		slog.Info("starting local ClickHouse server", "stage", "start_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse)
-		server, err = chproc.Start(ctx, chproc.Config{
-			Binary:     *clickHouseBinary,
-			ConfigFile: *clickHouseConfigFile,
-			DataDir:    runDirs.ClickHouse,
-			URL:        *clickHouseURL,
-			User:       *clickHouseUser,
-			Password:   *clickHousePassword,
-			Timeout:    90 * time.Second,
-		})
-		if err != nil {
-			return err
-		}
-		defer func() {
-			server.Stop()
-		}()
-	}
-
 	var recorder metrics.Recorder = metrics.Noop{}
 	if *metricsAddr != "" {
 		slog.Info("starting metrics server", "stage", "start_metrics", "addr", *metricsAddr, "path", *metricsPath)
@@ -734,22 +696,6 @@ func runWorker(ctx context.Context, args []string) error {
 			return fmt.Errorf("start metrics server: %w", err)
 		}
 		recorder = prom
-	}
-
-	ch := chhttp.Client{URL: *clickHouseURL, User: *clickHouseUser, Password: *clickHousePassword}
-	processor := rewrite.Processor{
-		S3Copy:           s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
-		ClickHouse:       ch,
-		WorkDir:          runDirs.Scratch,
-		MergeTimeout:     *mergeTimeout,
-		Metrics:          recorder,
-		InsertSettings:   insertSettings,
-		ProgressInterval: *stateProgressInterval,
-	}
-	if *stateProgressInterval > 0 {
-		processor.ReportProgress = func(ctx context.Context, m manifest.Manifest, snapshot rewrite.ProgressSnapshot) error {
-			return stateStore.UpdateRewriteProgress(ctx, m.JobID, m.PartID, resolvedWorkerID, stateProgress(snapshot), time.Now().UTC())
-		}
 	}
 
 	for {
@@ -798,18 +744,72 @@ func runWorker(ctx context.Context, args []string) error {
 			Attempt:   part.Attempts,
 		}
 		processCtx, partShutdown := workerProcessContext(ctx, *shutdownGracePeriod, part.JobID, part.PartID)
-		result, err := processor.ProcessPart(processCtx, workItem)
+		result, err := func() (rewrite.ProcessResult, error) {
+			runDirs, err := createWorkerRunDirs(*workDir)
+			if err != nil {
+				return rewrite.ProcessResult{}, err
+			}
+			slog.Info(
+				"created worker run directory",
+				"stage", "prepare_work_dir",
+				"work_dir", *workDir,
+				"run_dir", runDirs.Root,
+				"clickhouse_data_dir", runDirs.ClickHouse,
+				"scratch_dir", runDirs.Scratch,
+				"job_id", part.JobID,
+				"part_id", part.PartID,
+			)
+
+			var server *chproc.Server
+			defer func() {
+				if server != nil {
+					slog.Info("stopping local ClickHouse server", "stage", "stop_clickhouse", "job_id", part.JobID, "part_id", part.PartID)
+					server.Stop()
+				}
+				if err := os.RemoveAll(runDirs.Root); err != nil {
+					slog.Warn("failed to remove worker run directory", "run_dir", runDirs.Root, "job_id", part.JobID, "part_id", part.PartID, "error", err)
+				}
+			}()
+
+			if *startClickHouse {
+				slog.Info("starting local ClickHouse server", "stage", "start_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", part.JobID, "part_id", part.PartID)
+				server, err = chproc.Start(processCtx, chproc.Config{
+					Binary:     *clickHouseBinary,
+					ConfigFile: *clickHouseConfigFile,
+					DataDir:    runDirs.ClickHouse,
+					URL:        *clickHouseURL,
+					User:       *clickHouseUser,
+					Password:   *clickHousePassword,
+					Timeout:    90 * time.Second,
+				})
+				if err != nil {
+					return rewrite.ProcessResult{}, err
+				}
+			}
+
+			ch := chhttp.Client{URL: *clickHouseURL, User: *clickHouseUser, Password: *clickHousePassword}
+			processor := rewrite.Processor{
+				S3Copy:           s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
+				ClickHouse:       ch,
+				WorkDir:          runDirs.Scratch,
+				MergeTimeout:     *mergeTimeout,
+				Metrics:          recorder,
+				InsertSettings:   insertSettings,
+				ProgressInterval: *stateProgressInterval,
+			}
+			if *stateProgressInterval > 0 {
+				processor.ReportProgress = func(ctx context.Context, m manifest.Manifest, snapshot rewrite.ProgressSnapshot) error {
+					return stateStore.UpdateRewriteProgress(ctx, m.JobID, m.PartID, resolvedWorkerID, stateProgress(snapshot), time.Now().UTC())
+				}
+			}
+			return processor.ProcessPart(processCtx, workItem)
+		}()
 		shutdownRequested := partShutdown.Requested()
 		shutdownForced := partShutdown.Forced()
 		partShutdown.Stop()
 		if err != nil {
 			if shutdownForced {
 				slog.Warn("part processing exceeded shutdown grace period; releasing part back to ready", "stage", "shutdown", "job_id", part.JobID, "part_id", part.PartID, "error", err)
-				if server != nil {
-					slog.Info("stopping local ClickHouse after shutdown grace period", "stage", "shutdown", "job_id", part.JobID, "part_id", part.PartID)
-					server.Stop()
-					server = nil
-				}
 				stateCtx, cancel := workerStateUpdateContext()
 				releaseErr := stateStore.ReleaseInProgress(stateCtx, *part, resolvedWorkerID, time.Now().UTC())
 				cancel()

@@ -139,9 +139,7 @@ func (s *Server) Stop() {
 	if s == nil || s.cmd == nil || s.cmd.Process == nil {
 		return
 	}
-	if err := s.cmd.Process.Signal(os.Interrupt); err != nil {
-		_ = s.cmd.Process.Kill()
-	}
+	_ = s.cmd.Process.Kill()
 	done := make(chan struct{})
 	go func() {
 		_ = s.cmd.Wait()
@@ -150,7 +148,6 @@ func (s *Server) Stop() {
 	select {
 	case <-done:
 	case <-time.After(30 * time.Second):
-		_ = s.cmd.Process.Kill()
-		<-done
+		slog.Warn("timed out waiting for killed clickhouse process")
 	}
 }

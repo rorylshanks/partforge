@@ -61,7 +61,6 @@ type frozenPartGlob struct {
 
 type rewriteResult struct {
 	FrozenPartGlobs []frozenPartGlob
-	Cleanup         func()
 }
 
 type workerTableInfo struct {
@@ -159,7 +158,6 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (ProcessResul
 		recorder.ForgeFailed(m)
 		return ProcessResult{}, err
 	}
-	defer rewriteResult.Cleanup()
 	slog.Info("rewrote source part", "stage", "rewrite_part", "job_id", m.JobID, "part_id", m.PartID, "frozen_part_globs", len(rewriteResult.FrozenPartGlobs), "elapsed", time.Since(rewriteStartedAt))
 
 	m.S3.FinishedKey = manifest.FinishedPartAttemptPrefix(m.S3.FinishedKey, item.Attempt, time.Now().UTC())
@@ -200,41 +198,14 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 		return rewriteResult{}, fmt.Errorf("normalize source DDL: %w", err)
 	}
 	destDDL := strings.TrimSpace(m.SQL.DestinationSchema)
-	var freezeName string
-
-	cleanup := func() {
-		if freezeName != "" {
-			if err := p.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(m.Dest.Database, m.Dest.Table)+" UNFREEZE WITH NAME "+chhttp.StringLiteral(freezeName)); err != nil {
-				slog.Warn("failed to remove frozen destination backup", "freeze", freezeName, "error", err)
-			}
-		}
-		for _, database := range uniqueStrings(m.Source.Database, m.Dest.Database) {
-			if err := p.ClickHouse.Exec(ctx, "DROP DATABASE IF EXISTS "+chhttp.Ident(database)+" SYNC"); err != nil {
-				slog.Warn("failed to drop worker database", "database", database, "error", err)
-			}
-		}
-	}
-	result.Cleanup = cleanup
 	defer func() {
-		if result.Cleanup == nil {
-			result.Cleanup = func() {}
-		}
-		if err != nil {
-			if ctx.Err() == nil {
-				p.logWorkerDiagnostics("rewrite_part_failed", m, err)
-			}
-			cleanup()
+		if err != nil && ctx.Err() == nil {
+			p.logWorkerDiagnostics("rewrite_part_failed", m, err)
 		}
 	}()
 
 	slog.Info("preparing worker databases", "stage", "prepare_worker_tables", "job_id", m.JobID, "part_id", m.PartID)
 	databases := uniqueStrings(m.Source.Database, m.Dest.Database)
-	for _, database := range databases {
-		if err := p.ClickHouse.Exec(ctx, "DROP DATABASE IF EXISTS "+chhttp.Ident(database)+" SYNC"); err != nil {
-			return rewriteResult{}, fmt.Errorf("drop worker database %s: %w", database, err)
-		}
-	}
-
 	for _, database := range databases {
 		if err := p.ClickHouse.Exec(ctx, "CREATE DATABASE "+chhttp.Ident(database)); err != nil {
 			return rewriteResult{}, fmt.Errorf("create worker database %s: %w", database, err)
@@ -300,7 +271,7 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 		return result, nil
 	}
 	slog.Info("freezing produced destination parts", "stage", "freeze_destination_parts", "job_id", m.JobID, "part_id", m.PartID, "active_parts", destStats.Count)
-	freezeName = workerFreezeName(m, time.Now().UTC())
+	freezeName := workerFreezeName(m, time.Now().UTC())
 	if err := p.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(m.Dest.Database, m.Dest.Table)+" FREEZE WITH NAME "+chhttp.StringLiteral(freezeName)); err != nil {
 		return rewriteResult{}, fmt.Errorf("freeze destination table %s: %w", chhttp.TableSQL(m.Dest.Database, m.Dest.Table), err)
 	}
