@@ -2,6 +2,7 @@ package s3copy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -16,6 +17,21 @@ type Copier struct {
 	Binary     string
 	Endpoint   string
 	NumWorkers int
+}
+
+type CommandError struct {
+	Binary string
+	Args   []string
+	Err    error
+	Output string
+}
+
+func (e *CommandError) Error() string {
+	return fmt.Sprintf("%s %s failed: %v: %s", e.Binary, strings.Join(e.Args, " "), e.Err, strings.TrimSpace(e.Output))
+}
+
+func (e *CommandError) Unwrap() error {
+	return e.Err
 }
 
 func (c Copier) UploadDir(ctx context.Context, localDir, bucket, prefix string) error {
@@ -42,6 +58,14 @@ func (c Copier) DeletePrefix(ctx context.Context, bucket, prefix string) error {
 		return err
 	}
 	return c.run(ctx, "rm", target)
+}
+
+func (c Copier) DeletePrefixIfExists(ctx context.Context, bucket, prefix string) error {
+	err := c.DeletePrefix(ctx, bucket, prefix)
+	if err == nil || isNoObjectFound(err) {
+		return nil
+	}
+	return err
 }
 
 func (c Copier) runCopy(ctx context.Context, args ...string) error {
@@ -82,9 +106,14 @@ func (c Copier) runArgs(ctx context.Context, fullArgs []string) error {
 	cmd := exec.CommandContext(ctx, binary, fullArgs...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%s %s failed: %w: %s", binary, strings.Join(fullArgs, " "), err, strings.TrimSpace(string(out)))
+		return &CommandError{Binary: binary, Args: fullArgs, Err: err, Output: string(out)}
 	}
 	return nil
+}
+
+func isNoObjectFound(err error) bool {
+	var commandErr *CommandError
+	return errors.As(err, &commandErr) && strings.Contains(commandErr.Output, "no object found")
 }
 
 func (c Copier) args(command string, args ...string) []string {

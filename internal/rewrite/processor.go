@@ -820,7 +820,7 @@ func (p Processor) uploadFinishedArtifact(ctx context.Context, bucket, finishedK
 		return fmt.Errorf("no frozen part globs to upload for finished artifact s3://%s/%s", bucket, finishedKey)
 	}
 	slog.Info("removing existing finished artifact prefix", "stage", "upload_finished", "bucket", bucket, "finished_key", finishedKey)
-	if err := p.S3Copy.DeletePrefix(ctx, bucket, finishedKey); err != nil {
+	if err := p.S3Copy.DeletePrefixIfExists(ctx, bucket, finishedKey); err != nil {
 		return fmt.Errorf("delete existing finished artifact s3://%s/%s: %w", bucket, finishedKey, err)
 	}
 	for _, source := range frozenPartGlobs {

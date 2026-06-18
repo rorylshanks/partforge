@@ -128,6 +128,28 @@ func TestDeletePrefixDoesNotUseDirectoryCopyRetries(t *testing.T) {
 	}
 }
 
+func TestDeletePrefixIfExistsIgnoresNoObjectFound(t *testing.T) {
+	binary := fakeS5cmdOutput(t, `ERROR "rm s3://bucket/prefix/*": no object found`, 1)
+
+	copier := Copier{Binary: binary}
+	if err := copier.DeletePrefixIfExists(context.Background(), "bucket", "prefix"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeletePrefixIfExistsFailsOtherDeleteErrors(t *testing.T) {
+	binary := fakeS5cmdOutput(t, "access denied", 1)
+
+	copier := Copier{Binary: binary}
+	err := copier.DeletePrefixIfExists(context.Background(), "bucket", "prefix")
+	if err == nil {
+		t.Fatal("expected delete error")
+	}
+	if !strings.Contains(err.Error(), "access denied") {
+		t.Fatalf("error = %q, want access denied", err)
+	}
+}
+
 func TestDeletePrefixTarget(t *testing.T) {
 	got, err := deletePrefixTarget("bucket", "partforge/jobs/job-123")
 	if err != nil {
@@ -168,6 +190,20 @@ exit 0
 		t.Fatal(err)
 	}
 	return binary, attemptsFile
+}
+
+func fakeS5cmdOutput(t *testing.T, output string, exitCode int) string {
+	t.Helper()
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "s5cmd")
+	script := fmt.Sprintf(`#!/bin/sh
+echo %s >&2
+exit %d
+`, shellQuote(output), exitCode)
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return binary
 }
 
 func readAttemptCount(t *testing.T, path string) int {
