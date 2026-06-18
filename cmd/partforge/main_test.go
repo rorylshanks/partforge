@@ -53,7 +53,7 @@ func TestSelectRetryParts(t *testing.T) {
 		{PartID: "part-5", Status: state.StatusFinished},
 	}
 
-	all, err := selectRetryParts(parts, true, false, false, "")
+	all, err := selectRetryParts(parts, retryPartSelection{All: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestSelectRetryParts(t *testing.T) {
 		t.Fatalf("all len = %d", len(all))
 	}
 
-	allWithInProgress, err := selectRetryParts(parts, true, false, true, "")
+	allWithInProgress, err := selectRetryParts(parts, retryPartSelection{All: true, IncludeInProgress: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestSelectRetryParts(t *testing.T) {
 		t.Fatalf("all with in-progress = %+v", allWithInProgress)
 	}
 
-	forced, err := selectRetryParts(parts, true, true, false, "")
+	forced, err := selectRetryParts(parts, retryPartSelection{All: true, Force: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestSelectRetryParts(t *testing.T) {
 		t.Fatalf("forced len = %d", len(forced))
 	}
 
-	forcedOne, err := selectRetryParts(parts, false, true, false, "part-2")
+	forcedOne, err := selectRetryParts(parts, retryPartSelection{Force: true, PartID: "part-2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestSelectRetryParts(t *testing.T) {
 		t.Fatalf("forced one = %+v", forcedOne)
 	}
 
-	one, err := selectRetryParts(parts, false, false, false, "part-1")
+	one, err := selectRetryParts(parts, retryPartSelection{PartID: "part-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestSelectRetryParts(t *testing.T) {
 		t.Fatalf("one = %+v", one)
 	}
 
-	inProgress, err := selectRetryParts(parts, false, false, true, "part-4")
+	inProgress, err := selectRetryParts(parts, retryPartSelection{IncludeInProgress: true, PartID: "part-4"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,12 +101,48 @@ func TestSelectRetryParts(t *testing.T) {
 		t.Fatalf("in-progress = %+v", inProgress)
 	}
 
-	if _, err := selectRetryParts(parts, false, false, false, "part-2"); err == nil {
+	if _, err := selectRetryParts(parts, retryPartSelection{PartID: "part-2"}); err == nil {
 		t.Fatal("expected non-failed part error")
 	}
 
-	if _, err := selectRetryParts(parts, false, false, true, "part-5"); err == nil {
+	if _, err := selectRetryParts(parts, retryPartSelection{IncludeInProgress: true, PartID: "part-5"}); err == nil {
 		t.Fatal("expected completed part error")
+	}
+}
+
+func TestSelectRetryPartsStale(t *testing.T) {
+	now := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
+	parts := []state.Part{
+		{PartID: "part-failed", Status: state.StatusFailed},
+		{PartID: "part-fresh", Status: state.StatusInProgress, ProgressUpdatedAt: now.Add(-2 * time.Minute).Format(time.RFC3339Nano)},
+		{PartID: "part-stale", Status: state.StatusInProgress, ProgressUpdatedAt: now.Add(-6 * time.Minute).Format(time.RFC3339Nano)},
+		{PartID: "part-empty", Status: state.StatusInProgress},
+		{PartID: "part-exact", Status: state.StatusInProgress, ProgressUpdatedAt: now.Add(-5 * time.Minute).Format(time.RFC3339Nano)},
+	}
+
+	selected, err := selectRetryParts(parts, retryPartSelection{
+		Stale:      true,
+		StaleAfter: 5 * time.Minute,
+		Now:        now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 1 || selected[0].PartID != "part-stale" {
+		t.Fatalf("stale selected = %+v", selected)
+	}
+}
+
+func TestSelectRetryPartsStaleRejectsMalformedProgressTime(t *testing.T) {
+	_, err := selectRetryParts([]state.Part{
+		{PartID: "part-bad", Status: state.StatusInProgress, ProgressUpdatedAt: "not-time"},
+	}, retryPartSelection{
+		Stale:      true,
+		StaleAfter: 5 * time.Minute,
+		Now:        time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC),
+	})
+	if err == nil {
+		t.Fatal("expected malformed progress_updated_at error")
 	}
 }
 

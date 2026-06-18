@@ -578,6 +578,40 @@ func (s *Store) RetryInProgressPart(ctx context.Context, part Part, now time.Tim
 	return StatusReady, nil
 }
 
+func (s *Store) RetryStaleInProgressPart(ctx context.Context, part Part, now time.Time) (Status, error) {
+	if part.Status != StatusInProgress {
+		return "", fmt.Errorf("part %s/%s is %s, expected %s", part.JobID, part.PartID, part.Status, StatusInProgress)
+	}
+	if strings.TrimSpace(part.ProgressUpdatedAt) == "" {
+		return "", fmt.Errorf("part %s/%s has no progress_updated_at", part.JobID, part.PartID)
+	}
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.table),
+		Key:       part.key(),
+		ConditionExpression: aws.String(
+			"#status = :in_progress AND progress_updated_at = :progress_updated_at",
+		),
+		UpdateExpression: aws.String(
+			"SET #status = :ready, gsi1pk = :gsi1pk, updated_at = :now REMOVE #error, started_at, worker_id" + progressRemoveExpression(),
+		),
+		ExpressionAttributeNames: map[string]string{
+			"#error":  "error",
+			"#status": "status",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":gsi1pk":              stringAttr(statusKey(StatusReady)),
+			":in_progress":         stringAttr(string(StatusInProgress)),
+			":now":                 stringAttr(formatTime(now)),
+			":progress_updated_at": stringAttr(part.ProgressUpdatedAt),
+			":ready":               stringAttr(string(StatusReady)),
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("retry stale in-progress state item for %s/%s as %s: %w", part.JobID, part.PartID, StatusReady, err)
+	}
+	return StatusReady, nil
+}
+
 func (s *Store) ForceRetryPart(ctx context.Context, part Part, now time.Time) (Status, error) {
 	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(s.table),

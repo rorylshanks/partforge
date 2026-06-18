@@ -38,6 +38,7 @@ const defaultStateTable = "partforge"
 const defaultConfigPath = "/etc/partforge/config.json"
 const defaultClickHouseClientConfigPath = "/etc/clickhouse-client/config.xml"
 const defaultWorkerShutdownGracePeriod = 2 * time.Minute
+const defaultRetryStaleAfter = 5 * time.Minute
 const workerStateUpdateTimeout = 30 * time.Second
 
 var version = "dev"
@@ -1068,6 +1069,8 @@ func runRetryFailed(ctx context.Context, args []string) error {
 		jobID             = fs.String("job-id", "", "job id containing failed parts")
 		partID            = fs.String("part-id", "", "specific part id to retry")
 		all               = fs.Bool("all", false, "retry all failed parts in the job")
+		stale             = fs.Bool("stale", false, "retry IN_PROGRESS parts with stale persisted progress")
+		staleAfter        = fs.Duration("stale-after", defaultRetryStaleAfter, "minimum age of progress_updated_at for -stale")
 		includeInProgress = fs.Bool("include-in-progress", false, "also retry IN_PROGRESS parts by returning them to READY")
 		force             = fs.Bool("force", false, "retry selected parts regardless of current state")
 		stateTable        = fs.String("state-table", defaultStateTable, "DynamoDB state table")
@@ -1084,11 +1087,27 @@ func runRetryFailed(ctx context.Context, args []string) error {
 	if *jobID == "" {
 		return errors.New("job-id is required")
 	}
-	if (*all && *partID != "") || (!*all && *partID == "") {
-		return errors.New("exactly one of -all or -part-id is required")
+	selectors := 0
+	if *all {
+		selectors++
 	}
-	if *force && *includeInProgress {
-		return errors.New("include-in-progress cannot be combined with force")
+	if *partID != "" {
+		selectors++
+	}
+	if *stale {
+		selectors++
+	}
+	if selectors != 1 {
+		return errors.New("exactly one of -all, -part-id, or -stale is required")
+	}
+	if *stale && *staleAfter <= 0 {
+		return errors.New("stale-after must be greater than zero")
+	}
+	if *force && (*includeInProgress || *stale) {
+		return errors.New("force cannot be combined with include-in-progress or stale")
+	}
+	if *stale && *includeInProgress {
+		return errors.New("stale cannot be combined with include-in-progress")
 	}
 
 	stateStore, err := state.New(ctx, state.Config{
@@ -1103,7 +1122,15 @@ func runRetryFailed(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	retryParts, err := selectRetryParts(jobParts, *all, *force, *includeInProgress, *partID)
+	retryParts, err := selectRetryParts(jobParts, retryPartSelection{
+		All:               *all,
+		Force:             *force,
+		IncludeInProgress: *includeInProgress,
+		Stale:             *stale,
+		StaleAfter:        *staleAfter,
+		Now:               time.Now().UTC(),
+		PartID:            *partID,
+	})
 	if err != nil {
 		return err
 	}
@@ -1113,6 +1140,8 @@ func runRetryFailed(ctx context.Context, args []string) error {
 		var target state.Status
 		if *force {
 			target, err = stateStore.ForceRetryPart(ctx, part, time.Now().UTC())
+		} else if *stale {
+			target, err = stateStore.RetryStaleInProgressPart(ctx, part, time.Now().UTC())
 		} else if part.Status == state.StatusInProgress {
 			target, err = stateStore.RetryInProgressPart(ctx, part, time.Now().UTC())
 		} else {
@@ -1129,10 +1158,12 @@ func runRetryFailed(ctx context.Context, args []string) error {
 	}
 
 	out := retryFailedOutput{
-		JobID:   *jobID,
-		Forced:  *force,
-		Retried: len(results),
-		Parts:   results,
+		JobID:      *jobID,
+		Forced:     *force,
+		Stale:      *stale,
+		StaleAfter: staleAfterString(*stale, *staleAfter),
+		Retried:    len(results),
+		Parts:      results,
 	}
 	if *jsonOutput {
 		return writeJSON(os.Stdout, out)
@@ -1555,10 +1586,12 @@ type jobStatusOutput struct {
 }
 
 type retryFailedOutput struct {
-	JobID   string        `json:"job_id"`
-	Forced  bool          `json:"forced"`
-	Retried int           `json:"retried"`
-	Parts   []retryResult `json:"parts"`
+	JobID      string        `json:"job_id"`
+	Forced     bool          `json:"forced"`
+	Stale      bool          `json:"stale,omitempty"`
+	StaleAfter string        `json:"stale_after,omitempty"`
+	Retried    int           `json:"retried"`
+	Parts      []retryResult `json:"parts"`
 }
 
 type retryResult struct {
@@ -1682,34 +1715,78 @@ func printPartRows(out *os.File, parts []state.Part) {
 	_ = tw.Flush()
 }
 
-func selectRetryParts(parts []state.Part, all, force, includeInProgress bool, partID string) ([]state.Part, error) {
-	if all {
-		if force {
+type retryPartSelection struct {
+	All               bool
+	Force             bool
+	IncludeInProgress bool
+	Stale             bool
+	StaleAfter        time.Duration
+	Now               time.Time
+	PartID            string
+}
+
+func selectRetryParts(parts []state.Part, selection retryPartSelection) ([]state.Part, error) {
+	if selection.Stale {
+		return selectStaleRetryParts(parts, selection.Now, selection.StaleAfter)
+	}
+	if selection.All {
+		if selection.Force {
 			return append([]state.Part(nil), parts...), nil
 		}
 		var selected []state.Part
 		for _, part := range parts {
-			if part.Status == state.StatusFailed || (includeInProgress && part.Status == state.StatusInProgress) {
+			if part.Status == state.StatusFailed || (selection.IncludeInProgress && part.Status == state.StatusInProgress) {
 				selected = append(selected, part)
 			}
 		}
 		return selected, nil
 	}
 	for _, part := range parts {
-		if part.PartID == partID {
-			if force {
+		if part.PartID == selection.PartID {
+			if selection.Force {
 				return []state.Part{part}, nil
 			}
-			if part.Status == state.StatusFailed || (includeInProgress && part.Status == state.StatusInProgress) {
+			if part.Status == state.StatusFailed || (selection.IncludeInProgress && part.Status == state.StatusInProgress) {
 				return []state.Part{part}, nil
 			}
-			if includeInProgress {
-				return nil, fmt.Errorf("part %s is %s, expected %s or %s", partID, part.Status, state.StatusFailed, state.StatusInProgress)
+			if selection.IncludeInProgress {
+				return nil, fmt.Errorf("part %s is %s, expected %s or %s", selection.PartID, part.Status, state.StatusFailed, state.StatusInProgress)
 			}
-			return nil, fmt.Errorf("part %s is %s, expected %s", partID, part.Status, state.StatusFailed)
+			return nil, fmt.Errorf("part %s is %s, expected %s", selection.PartID, part.Status, state.StatusFailed)
 		}
 	}
-	return nil, fmt.Errorf("part %s was not found in job", partID)
+	return nil, fmt.Errorf("part %s was not found in job", selection.PartID)
+}
+
+func selectStaleRetryParts(parts []state.Part, now time.Time, staleAfter time.Duration) ([]state.Part, error) {
+	if now.IsZero() {
+		return nil, errors.New("current time is required for stale retry selection")
+	}
+	if staleAfter <= 0 {
+		return nil, errors.New("stale-after must be greater than zero")
+	}
+	cutoff := now.Add(-staleAfter)
+	selected := make([]state.Part, 0)
+	for _, part := range parts {
+		if part.Status != state.StatusInProgress || strings.TrimSpace(part.ProgressUpdatedAt) == "" {
+			continue
+		}
+		progressAt, err := time.Parse(time.RFC3339Nano, part.ProgressUpdatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse progress_updated_at for part %s: %w", part.PartID, err)
+		}
+		if progressAt.Before(cutoff) {
+			selected = append(selected, part)
+		}
+	}
+	return selected, nil
+}
+
+func staleAfterString(stale bool, staleAfter time.Duration) string {
+	if !stale {
+		return ""
+	}
+	return staleAfter.String()
 }
 
 func jobS3Prefixes(jobID string, parts []state.Part) ([]jobS3Prefix, error) {
@@ -1767,6 +1844,9 @@ func jobPrefixFromKey(jobID, key string) (string, error) {
 func printRetryResults(out *os.File, result retryFailedOutput) {
 	fmt.Fprintf(out, "job_id: %s\n", result.JobID)
 	fmt.Fprintf(out, "forced: %t\n", result.Forced)
+	if result.Stale {
+		fmt.Fprintf(out, "stale_after: %s\n", result.StaleAfter)
+	}
 	fmt.Fprintf(out, "retried: %d\n", result.Retried)
 	if len(result.Parts) == 0 {
 		return

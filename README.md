@@ -144,7 +144,17 @@ partforge retry-failed \
   -include-in-progress
 ```
 
-Failed rewrite parts are moved back to `READY`. Failed import parts are moved back to `FINISHED`, so `import-finished` retries the import stage instead of re-running the worker. With `-include-in-progress`, `IN_PROGRESS` rewrite parts are also moved back to `READY`. `retry-failed` uses conditional updates and requires `dynamodb:UpdateItem`.
+Retry only stale in-progress rewrite parts whose persisted progress has not changed for at least five minutes:
+
+```sh
+partforge retry-failed \
+  -job-id=job-123 \
+  -stale
+```
+
+Use `-stale-after=10m` to change the stale threshold. Parts with no persisted progress are ignored by `-stale`.
+
+Failed rewrite parts are moved back to `READY`. Failed import parts are moved back to `FINISHED`, so `import-finished` retries the import stage instead of re-running the worker. With `-include-in-progress`, `IN_PROGRESS` rewrite parts are also moved back to `READY`. With `-stale`, only `IN_PROGRESS` rewrite parts whose `progress_updated_at` is older than the stale threshold are moved back to `READY`. `retry-failed` uses conditional updates and requires `dynamodb:UpdateItem`.
 
 Force every part in a job back to `READY`, including parts that already succeeded:
 
