@@ -49,9 +49,11 @@ func TestSelectRetryParts(t *testing.T) {
 		{PartID: "part-1", Status: state.StatusFailed},
 		{PartID: "part-2", Status: state.StatusImported},
 		{PartID: "part-3", Status: state.StatusFailed},
+		{PartID: "part-4", Status: state.StatusInProgress},
+		{PartID: "part-5", Status: state.StatusFinished},
 	}
 
-	all, err := selectRetryParts(parts, true, false, "")
+	all, err := selectRetryParts(parts, true, false, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,15 +61,23 @@ func TestSelectRetryParts(t *testing.T) {
 		t.Fatalf("all len = %d", len(all))
 	}
 
-	forced, err := selectRetryParts(parts, true, true, "")
+	allWithInProgress, err := selectRetryParts(parts, true, false, true, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(forced) != 3 {
+	if len(allWithInProgress) != 3 || allWithInProgress[2].PartID != "part-4" {
+		t.Fatalf("all with in-progress = %+v", allWithInProgress)
+	}
+
+	forced, err := selectRetryParts(parts, true, true, false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(forced) != 5 {
 		t.Fatalf("forced len = %d", len(forced))
 	}
 
-	one, err := selectRetryParts(parts, false, false, "part-1")
+	one, err := selectRetryParts(parts, false, false, false, "part-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,8 +85,20 @@ func TestSelectRetryParts(t *testing.T) {
 		t.Fatalf("one = %+v", one)
 	}
 
-	if _, err := selectRetryParts(parts, false, false, "part-2"); err == nil {
+	inProgress, err := selectRetryParts(parts, false, false, true, "part-4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inProgress) != 1 || inProgress[0].PartID != "part-4" {
+		t.Fatalf("in-progress = %+v", inProgress)
+	}
+
+	if _, err := selectRetryParts(parts, false, false, false, "part-2"); err == nil {
 		t.Fatal("expected non-failed part error")
+	}
+
+	if _, err := selectRetryParts(parts, false, false, true, "part-5"); err == nil {
+		t.Fatal("expected completed part error")
 	}
 }
 
@@ -251,6 +273,80 @@ func TestCreateWorkerRunDirs(t *testing.T) {
 			t.Fatalf("%s is not a directory", dir)
 		}
 	}
+}
+
+func TestWorkerProcessContextWaitsUntilGracePeriodExpires(t *testing.T) {
+	shutdownCtx, cancelShutdown := context.WithCancel(context.Background())
+	processCtx, shutdown := workerProcessContext(shutdownCtx, 50*time.Millisecond, "job-1", "part-1")
+	defer shutdown.Stop()
+
+	cancelShutdown()
+	waitForShutdownRequested(t, shutdown)
+
+	select {
+	case <-processCtx.Done():
+		t.Fatal("process context canceled before grace period expired")
+	case <-time.After(10 * time.Millisecond):
+	}
+	if shutdown.Forced() {
+		t.Fatal("shutdown forced before grace period expired")
+	}
+
+	select {
+	case <-processCtx.Done():
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("process context was not canceled after grace period expired")
+	}
+	if !shutdown.Forced() {
+		t.Fatal("shutdown was not marked forced after grace period expired")
+	}
+}
+
+func TestWorkerProcessContextStopBeforeGracePeriodExpires(t *testing.T) {
+	shutdownCtx, cancelShutdown := context.WithCancel(context.Background())
+	processCtx, shutdown := workerProcessContext(shutdownCtx, time.Second, "job-1", "part-1")
+
+	cancelShutdown()
+	waitForShutdownRequested(t, shutdown)
+	shutdown.Stop()
+
+	select {
+	case <-processCtx.Done():
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("process context was not canceled after stop")
+	}
+	if shutdown.Forced() {
+		t.Fatal("shutdown marked forced after worker stopped during grace period")
+	}
+}
+
+func TestWorkerProcessContextCancelsImmediatelyWithoutGracePeriod(t *testing.T) {
+	shutdownCtx, cancelShutdown := context.WithCancel(context.Background())
+	processCtx, shutdown := workerProcessContext(shutdownCtx, 0, "job-1", "part-1")
+	defer shutdown.Stop()
+
+	cancelShutdown()
+
+	select {
+	case <-processCtx.Done():
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("process context was not canceled")
+	}
+	if !shutdown.Forced() {
+		t.Fatal("shutdown was not marked forced")
+	}
+}
+
+func waitForShutdownRequested(t *testing.T, shutdown workerPartShutdown) {
+	t.Helper()
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if shutdown.Requested() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("shutdown was not requested")
 }
 
 func TestUploadConcurrencyFromCPUs(t *testing.T) {

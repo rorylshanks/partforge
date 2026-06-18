@@ -37,6 +37,8 @@ const defaultClickHouseURL = "http://127.0.0.1:8123"
 const defaultStateTable = "partforge"
 const defaultConfigPath = "/etc/partforge/config.json"
 const defaultClickHouseClientConfigPath = "/etc/clickhouse-client/config.xml"
+const defaultWorkerShutdownGracePeriod = 2 * time.Minute
+const workerStateUpdateTimeout = 30 * time.Second
 
 var version = "dev"
 
@@ -631,6 +633,7 @@ func runWorker(ctx context.Context, args []string) error {
 		metricsAddr           = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables metrics")
 		metricsPath           = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
 		stateProgressInterval = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress to DynamoDB; <=0 disables progress writes")
+		shutdownGracePeriod   = fs.Duration("shutdown-grace-period", defaultWorkerShutdownGracePeriod, "how long to let an active part finish after shutdown is requested before canceling it and returning it to READY; <=0 cancels immediately")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -649,6 +652,7 @@ func runWorker(ctx context.Context, args []string) error {
 		"work_dir", *workDir,
 		"start_clickhouse", *startClickHouse,
 		"clickhouse_url", *clickHouseURL,
+		"shutdown_grace_period", *shutdownGracePeriod,
 	)
 	slog.Info("initializing DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
 	stateStore, err := state.New(ctx, state.Config{
@@ -717,7 +721,9 @@ func runWorker(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		defer server.Stop()
+		defer func() {
+			server.Stop()
+		}()
 	}
 
 	var recorder metrics.Recorder = metrics.Noop{}
@@ -747,9 +753,17 @@ func runWorker(ctx context.Context, args []string) error {
 	}
 
 	for {
+		if ctx.Err() != nil {
+			slog.Info("worker shutdown requested; stopping before claiming more work", "stage", "shutdown")
+			return nil
+		}
 		slog.Info("claiming next ready part", "stage", "claim_work", "worker_id", resolvedWorkerID)
 		part, err := stateStore.ClaimNextReady(ctx, resolvedWorkerID, time.Now().UTC())
 		if err != nil {
+			if ctx.Err() != nil {
+				slog.Info("worker shutdown requested while claiming work", "stage", "shutdown")
+				return nil
+			}
 			return err
 		}
 		if part == nil {
@@ -759,6 +773,10 @@ func runWorker(ctx context.Context, args []string) error {
 			}
 			slog.Info("no ready part available; sleeping", "stage", "claim_work", "poll_interval", *pollInterval)
 			if err := sleepOrDone(ctx, *pollInterval); err != nil {
+				if ctx.Err() != nil {
+					slog.Info("worker shutdown requested while idle", "stage", "shutdown")
+					return nil
+				}
 				return err
 			}
 			continue
@@ -779,19 +797,49 @@ func runWorker(ctx context.Context, args []string) error {
 			PartID:    part.PartID,
 			Attempt:   part.Attempts,
 		}
-		result, err := processor.ProcessPart(ctx, workItem)
+		processCtx, partShutdown := workerProcessContext(ctx, *shutdownGracePeriod, part.JobID, part.PartID)
+		result, err := processor.ProcessPart(processCtx, workItem)
+		shutdownRequested := partShutdown.Requested()
+		shutdownForced := partShutdown.Forced()
+		partShutdown.Stop()
 		if err != nil {
+			if shutdownForced {
+				slog.Warn("part processing exceeded shutdown grace period; releasing part back to ready", "stage", "shutdown", "job_id", part.JobID, "part_id", part.PartID, "error", err)
+				if server != nil {
+					slog.Info("stopping local ClickHouse after shutdown grace period", "stage", "shutdown", "job_id", part.JobID, "part_id", part.PartID)
+					server.Stop()
+					server = nil
+				}
+				stateCtx, cancel := workerStateUpdateContext()
+				releaseErr := stateStore.ReleaseInProgress(stateCtx, *part, resolvedWorkerID, time.Now().UTC())
+				cancel()
+				if releaseErr != nil {
+					return fmt.Errorf("shutdown release part %s/%s: %w", part.JobID, part.PartID, releaseErr)
+				}
+				slog.Info("released part back to ready after shutdown grace period", "stage", "shutdown", "job_id", part.JobID, "part_id", part.PartID)
+				return nil
+			}
 			slog.Info("part processing failed; marking failed", "stage", "mark_failed", "job_id", part.JobID, "part_id", part.PartID, "error", err)
-			if markErr := stateStore.MarkFailed(ctx, *part, resolvedWorkerID, err, time.Now().UTC()); markErr != nil {
+			stateCtx, cancel := workerStateUpdateContext()
+			markErr := stateStore.MarkFailed(stateCtx, *part, resolvedWorkerID, err, time.Now().UTC())
+			cancel()
+			if markErr != nil {
 				return fmt.Errorf("process part %s/%s: %w; additionally failed to mark failed: %v", part.JobID, part.PartID, err, markErr)
 			}
 			return err
 		}
 		slog.Info("marking part finished", "stage", "mark_finished", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey)
-		if err := stateStore.MarkFinished(ctx, *part, resolvedWorkerID, result.FinishedKey, time.Now().UTC()); err != nil {
+		stateCtx, cancel := workerStateUpdateContext()
+		err = stateStore.MarkFinished(stateCtx, *part, resolvedWorkerID, result.FinishedKey, time.Now().UTC())
+		cancel()
+		if err != nil {
 			return err
 		}
 		slog.Info("part marked finished", "stage", "mark_finished", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey)
+		if shutdownRequested {
+			slog.Info("worker shutdown requested; stopping after completed part", "stage", "shutdown", "job_id", part.JobID, "part_id", part.PartID)
+			return nil
+		}
 		if *once {
 			return nil
 		}
@@ -1016,15 +1064,16 @@ func runJobStatus(ctx context.Context, args []string) error {
 func runRetryFailed(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("retry-failed", flag.ExitOnError)
 	var (
-		configPath     = fs.String("config", defaultConfigPath, "JSON config file path")
-		jobID          = fs.String("job-id", "", "job id containing failed parts")
-		partID         = fs.String("part-id", "", "specific failed part id to retry")
-		all            = fs.Bool("all", false, "retry all failed parts in the job")
-		force          = fs.Bool("force", false, "with -all, retry every part in the job, including parts that succeeded")
-		stateTable     = fs.String("state-table", defaultStateTable, "DynamoDB state table")
-		region         = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
-		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
-		jsonOutput     = fs.Bool("json", false, "print JSON output")
+		configPath        = fs.String("config", defaultConfigPath, "JSON config file path")
+		jobID             = fs.String("job-id", "", "job id containing failed parts")
+		partID            = fs.String("part-id", "", "specific failed part id to retry")
+		all               = fs.Bool("all", false, "retry all failed parts in the job")
+		includeInProgress = fs.Bool("include-in-progress", false, "also retry IN_PROGRESS parts by returning them to READY")
+		force             = fs.Bool("force", false, "with -all, retry every part in the job, including parts that succeeded")
+		stateTable        = fs.String("state-table", defaultStateTable, "DynamoDB state table")
+		region            = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
+		dynamoEndpoint    = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
+		jsonOutput        = fs.Bool("json", false, "print JSON output")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1041,6 +1090,9 @@ func runRetryFailed(ctx context.Context, args []string) error {
 	if *force && !*all {
 		return errors.New("force requires -all")
 	}
+	if *force && *includeInProgress {
+		return errors.New("include-in-progress cannot be combined with force")
+	}
 
 	stateStore, err := state.New(ctx, state.Config{
 		Region:   *region,
@@ -1054,7 +1106,7 @@ func runRetryFailed(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	retryParts, err := selectRetryParts(jobParts, *all, *force, *partID)
+	retryParts, err := selectRetryParts(jobParts, *all, *force, *includeInProgress, *partID)
 	if err != nil {
 		return err
 	}
@@ -1064,6 +1116,8 @@ func runRetryFailed(ctx context.Context, args []string) error {
 		var target state.Status
 		if *force {
 			target, err = stateStore.ForceRetryPart(ctx, part, time.Now().UTC())
+		} else if part.Status == state.StatusInProgress {
+			target, err = stateStore.RetryInProgressPart(ctx, part, time.Now().UTC())
 		} else {
 			target, err = stateStore.RetryFailedPart(ctx, part, time.Now().UTC())
 		}
@@ -1367,6 +1421,87 @@ func sleepOrDone(ctx context.Context, d time.Duration) error {
 	}
 }
 
+type workerPartShutdown struct {
+	requested <-chan struct{}
+	forced    <-chan struct{}
+	stop      func()
+}
+
+func (s workerPartShutdown) Requested() bool {
+	select {
+	case <-s.requested:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s workerPartShutdown) Forced() bool {
+	select {
+	case <-s.forced:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s workerPartShutdown) Stop() {
+	if s.stop != nil {
+		s.stop()
+	}
+}
+
+func workerProcessContext(shutdownCtx context.Context, gracePeriod time.Duration, jobID, partID string) (context.Context, workerPartShutdown) {
+	processCtx, cancel := context.WithCancel(context.Background())
+	requested := make(chan struct{})
+	forced := make(chan struct{})
+	done := make(chan struct{})
+	var doneOnce sync.Once
+
+	stop := func() {
+		doneOnce.Do(func() {
+			close(done)
+			cancel()
+		})
+	}
+
+	go func() {
+		select {
+		case <-shutdownCtx.Done():
+			close(requested)
+			slog.Info(
+				"worker shutdown requested; waiting for current part",
+				"stage", "shutdown",
+				"job_id", jobID,
+				"part_id", partID,
+				"shutdown_grace_period", gracePeriod,
+			)
+			if gracePeriod <= 0 {
+				close(forced)
+				slog.Warn("worker shutdown grace period expired; canceling current part", "stage", "shutdown", "job_id", jobID, "part_id", partID)
+				cancel()
+				return
+			}
+			timer := time.NewTimer(gracePeriod)
+			defer timer.Stop()
+			select {
+			case <-done:
+			case <-timer.C:
+				close(forced)
+				slog.Warn("worker shutdown grace period expired; canceling current part", "stage", "shutdown", "job_id", jobID, "part_id", partID)
+				cancel()
+			}
+		case <-done:
+		}
+	}()
+
+	return processCtx, workerPartShutdown{requested: requested, forced: forced, stop: stop}
+}
+
+func workerStateUpdateContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), workerStateUpdateTimeout)
+}
+
 func stateProgress(snapshot rewrite.ProgressSnapshot) state.RewriteProgress {
 	var progress state.RewriteProgress
 	if snapshot.QueryProgress != nil {
@@ -1550,25 +1685,28 @@ func printPartRows(out *os.File, parts []state.Part) {
 	_ = tw.Flush()
 }
 
-func selectRetryParts(parts []state.Part, all, force bool, partID string) ([]state.Part, error) {
+func selectRetryParts(parts []state.Part, all, force, includeInProgress bool, partID string) ([]state.Part, error) {
 	if all {
 		if force {
 			return append([]state.Part(nil), parts...), nil
 		}
-		var failed []state.Part
+		var selected []state.Part
 		for _, part := range parts {
-			if part.Status == state.StatusFailed {
-				failed = append(failed, part)
+			if part.Status == state.StatusFailed || (includeInProgress && part.Status == state.StatusInProgress) {
+				selected = append(selected, part)
 			}
 		}
-		return failed, nil
+		return selected, nil
 	}
 	for _, part := range parts {
 		if part.PartID == partID {
-			if part.Status != state.StatusFailed {
-				return nil, fmt.Errorf("part %s is %s, expected %s", partID, part.Status, state.StatusFailed)
+			if part.Status == state.StatusFailed || (includeInProgress && part.Status == state.StatusInProgress) {
+				return []state.Part{part}, nil
 			}
-			return []state.Part{part}, nil
+			if includeInProgress {
+				return nil, fmt.Errorf("part %s is %s, expected %s or %s", partID, part.Status, state.StatusFailed, state.StatusInProgress)
+			}
+			return nil, fmt.Errorf("part %s is %s, expected %s", partID, part.Status, state.StatusFailed)
 		}
 	}
 	return nil, fmt.Errorf("part %s was not found in job", partID)

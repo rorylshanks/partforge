@@ -36,7 +36,7 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		return nil, err
 	}
 
-	cmd := exec.CommandContext(ctx, cfg.Binary, args...)
+	cmd := exec.Command(cfg.Binary, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {

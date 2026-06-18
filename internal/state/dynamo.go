@@ -271,6 +271,38 @@ func (s *Store) MarkFailed(ctx context.Context, part Part, workerID string, caus
 	return s.transitionOwned(ctx, part, workerID, StatusFailed, "failed_at", cause.Error(), now)
 }
 
+func (s *Store) ReleaseInProgress(ctx context.Context, part Part, workerID string, now time.Time) error {
+	if strings.TrimSpace(workerID) == "" {
+		return errors.New("worker id is required")
+	}
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.table),
+		Key:       part.key(),
+		ConditionExpression: aws.String(
+			"#status = :in_progress AND #worker_id = :worker",
+		),
+		UpdateExpression: aws.String(
+			"SET #status = :ready, gsi1pk = :gsi1pk, updated_at = :now REMOVE #worker_id, started_at, #error" + progressRemoveExpression(),
+		),
+		ExpressionAttributeNames: map[string]string{
+			"#error":     "error",
+			"#status":    "status",
+			"#worker_id": "worker_id",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":gsi1pk":      stringAttr(statusKey(StatusReady)),
+			":in_progress": stringAttr(string(StatusInProgress)),
+			":now":         stringAttr(formatTime(now)),
+			":ready":       stringAttr(string(StatusReady)),
+			":worker":      stringAttr(workerID),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("release state item for %s/%s back to %s: %w", part.JobID, part.PartID, StatusReady, err)
+	}
+	return nil
+}
+
 func (s *Store) UpdateRewriteProgress(ctx context.Context, jobID, partID, workerID string, progress RewriteProgress, now time.Time) error {
 	if strings.TrimSpace(jobID) == "" || strings.TrimSpace(partID) == "" {
 		return errors.New("job id and part id are required")
@@ -514,6 +546,36 @@ func (s *Store) RetryFailedPart(ctx context.Context, part Part, now time.Time) (
 		return "", fmt.Errorf("retry failed state item for %s/%s as %s: %w", part.JobID, part.PartID, target, err)
 	}
 	return target, nil
+}
+
+func (s *Store) RetryInProgressPart(ctx context.Context, part Part, now time.Time) (Status, error) {
+	if part.Status != StatusInProgress {
+		return "", fmt.Errorf("part %s/%s is %s, expected %s", part.JobID, part.PartID, part.Status, StatusInProgress)
+	}
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.table),
+		Key:       part.key(),
+		ConditionExpression: aws.String(
+			"#status = :in_progress",
+		),
+		UpdateExpression: aws.String(
+			"SET #status = :ready, gsi1pk = :gsi1pk, updated_at = :now REMOVE #error, started_at, worker_id" + progressRemoveExpression(),
+		),
+		ExpressionAttributeNames: map[string]string{
+			"#error":  "error",
+			"#status": "status",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":gsi1pk":      stringAttr(statusKey(StatusReady)),
+			":in_progress": stringAttr(string(StatusInProgress)),
+			":now":         stringAttr(formatTime(now)),
+			":ready":       stringAttr(string(StatusReady)),
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("retry in-progress state item for %s/%s as %s: %w", part.JobID, part.PartID, StatusReady, err)
+	}
+	return StatusReady, nil
 }
 
 func (s *Store) ForceRetryPart(ctx context.Context, part Part, now time.Time) (Status, error) {

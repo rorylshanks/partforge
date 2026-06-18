@@ -203,14 +203,13 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	var freezeName string
 
 	cleanup := func() {
-		cleanupCtx := context.Background()
 		if freezeName != "" {
-			if err := p.ClickHouse.Exec(cleanupCtx, "ALTER TABLE "+chhttp.TableSQL(m.Dest.Database, m.Dest.Table)+" UNFREEZE WITH NAME "+chhttp.StringLiteral(freezeName)); err != nil {
+			if err := p.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(m.Dest.Database, m.Dest.Table)+" UNFREEZE WITH NAME "+chhttp.StringLiteral(freezeName)); err != nil {
 				slog.Warn("failed to remove frozen destination backup", "freeze", freezeName, "error", err)
 			}
 		}
 		for _, database := range uniqueStrings(m.Source.Database, m.Dest.Database) {
-			if err := p.ClickHouse.Exec(cleanupCtx, "DROP DATABASE IF EXISTS "+chhttp.Ident(database)+" SYNC"); err != nil {
+			if err := p.ClickHouse.Exec(ctx, "DROP DATABASE IF EXISTS "+chhttp.Ident(database)+" SYNC"); err != nil {
 				slog.Warn("failed to drop worker database", "database", database, "error", err)
 			}
 		}
@@ -221,7 +220,9 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 			result.Cleanup = func() {}
 		}
 		if err != nil {
-			p.logWorkerDiagnostics("rewrite_part_failed", m, err)
+			if ctx.Err() == nil {
+				p.logWorkerDiagnostics("rewrite_part_failed", m, err)
+			}
 			cleanup()
 		}
 	}()
