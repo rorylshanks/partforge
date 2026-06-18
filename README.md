@@ -100,7 +100,7 @@ Core worker metrics:
 
 The read/write counters are updated live while the `INSERT SELECT` is running by polling ClickHouse `system.processes` for the rewrite query id. Source and destination active part gauges are measured from `system.parts` while those parts are attached in the worker.
 
-Workers also persist the same per-part rewrite progress to DynamoDB every `15s` by default. Use `-state-progress-interval` to change the interval, or `-state-progress-interval=0` to disable these DynamoDB progress writes without disabling Prometheus metrics.
+Workers also persist a per-part progress heartbeat to DynamoDB every `15s` by default while a part is being processed, including stages such as S3 download and upload where rewrite counters may not change. Use `-state-progress-interval` to change the interval, or `-state-progress-interval=0` to disable these DynamoDB progress writes without disabling Prometheus metrics.
 
 ## Admin
 

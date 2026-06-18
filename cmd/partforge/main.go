@@ -633,7 +633,7 @@ func runWorker(ctx context.Context, args []string) error {
 		mergeTimeout          = fs.Duration("merge-timeout", rewrite.DefaultMergeTimeout, "maximum time to wait for destination merges")
 		metricsAddr           = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables metrics")
 		metricsPath           = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
-		stateProgressInterval = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress to DynamoDB; <=0 disables progress writes")
+		stateProgressInterval = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress heartbeats to DynamoDB; <=0 disables progress writes")
 		shutdownGracePeriod   = fs.Duration("shutdown-grace-period", defaultWorkerShutdownGracePeriod, "how long to let an active part finish after shutdown is requested before canceling it and returning it to READY; <=0 cancels immediately")
 	)
 	if err := fs.Parse(args); err != nil {

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/partforge/partforge/internal/artifact"
@@ -70,7 +71,7 @@ type workerTableInfo struct {
 	Engine   string
 }
 
-func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (ProcessResult, error) {
+func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result ProcessResult, err error) {
 	if item.Bucket == "" || item.SourceKey == "" || item.JobID == "" || item.PartID == "" {
 		return ProcessResult{}, fmt.Errorf("work item is missing bucket, source_key, job_id, or part_id")
 	}
@@ -93,6 +94,17 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (ProcessResul
 		"attempt", item.Attempt,
 		"source_key", item.SourceKey,
 	)
+
+	heartbeat, err := p.startProgressHeartbeat(ctx, manifest.Manifest{JobID: item.JobID, PartID: item.PartID})
+	if err != nil {
+		return ProcessResult{}, err
+	}
+	ctx = heartbeat.Context()
+	defer func() {
+		if heartbeatErr := heartbeat.Stop(); heartbeatErr != nil {
+			err = errors.Join(err, heartbeatErr)
+		}
+	}()
 
 	root := filepath.Join(defaultWorkDir(p.WorkDir), item.JobID, item.PartID)
 	if err := os.RemoveAll(root); err != nil {
@@ -410,6 +422,75 @@ func (p Processor) reportProgress(ctx context.Context, m manifest.Manifest, snap
 		return nil
 	}
 	return p.ReportProgress(ctx, m, snapshot)
+}
+
+type progressHeartbeat struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
+
+	mu  sync.Mutex
+	err error
+}
+
+func (p Processor) startProgressHeartbeat(ctx context.Context, m manifest.Manifest) (*progressHeartbeat, error) {
+	heartbeat := &progressHeartbeat{ctx: ctx}
+	if p.ReportProgress == nil || p.ProgressInterval <= 0 {
+		return heartbeat, nil
+	}
+
+	heartbeat.ctx, heartbeat.cancel = context.WithCancel(ctx)
+	heartbeat.done = make(chan struct{})
+	if err := p.reportProgress(heartbeat.ctx, m, ProgressSnapshot{}); err != nil {
+		heartbeat.cancel()
+		return heartbeat, err
+	}
+
+	go func() {
+		defer close(heartbeat.done)
+		ticker := time.NewTicker(p.ProgressInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := p.reportProgress(heartbeat.ctx, m, ProgressSnapshot{}); err != nil {
+					heartbeat.setErr(err)
+					return
+				}
+			case <-heartbeat.ctx.Done():
+				return
+			}
+		}
+	}()
+	return heartbeat, nil
+}
+
+func (h *progressHeartbeat) Context() context.Context {
+	return h.ctx
+}
+
+func (h *progressHeartbeat) Stop() error {
+	if h.cancel == nil {
+		return nil
+	}
+	h.cancel()
+	<-h.done
+	return h.Err()
+}
+
+func (h *progressHeartbeat) Err() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.err
+}
+
+func (h *progressHeartbeat) setErr(err error) {
+	h.mu.Lock()
+	if h.err == nil {
+		h.err = err
+		h.cancel()
+	}
+	h.mu.Unlock()
 }
 
 func shouldReportProgress(interval time.Duration, last time.Time, now time.Time) bool {

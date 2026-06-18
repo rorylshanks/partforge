@@ -206,6 +206,95 @@ func TestShouldReportProgress(t *testing.T) {
 	}
 }
 
+func TestProgressHeartbeatReportsImmediatelyAndOnInterval(t *testing.T) {
+	reports := make(chan manifest.Manifest, 4)
+	processor := Processor{
+		ProgressInterval: time.Millisecond,
+		ReportProgress: func(ctx context.Context, m manifest.Manifest, snapshot ProgressSnapshot) error {
+			if snapshot.QueryProgress != nil || snapshot.SourceActivePartStats != nil || snapshot.DestinationActivePartStats != nil {
+				t.Errorf("heartbeat snapshot = %+v, want empty", snapshot)
+			}
+			select {
+			case reports <- m:
+			default:
+			}
+			return nil
+		},
+	}
+
+	heartbeat, err := processor.startProgressHeartbeat(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := heartbeat.Stop(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	for i := 0; i < 2; i++ {
+		select {
+		case got := <-reports:
+			if got.JobID != "job-1" || got.PartID != "part-1" {
+				t.Fatalf("heartbeat manifest = %+v", got)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for heartbeat report")
+		}
+	}
+}
+
+func TestProgressHeartbeatDisabled(t *testing.T) {
+	called := false
+	processor := Processor{
+		ProgressInterval: 0,
+		ReportProgress: func(ctx context.Context, m manifest.Manifest, snapshot ProgressSnapshot) error {
+			called = true
+			return nil
+		},
+	}
+
+	heartbeat, err := processor.startProgressHeartbeat(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := heartbeat.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Fatal("expected disabled heartbeat not to report progress")
+	}
+}
+
+func TestProgressHeartbeatReportFailureCancelsContext(t *testing.T) {
+	reportErr := errors.New("progress update failed")
+	reports := 0
+	processor := Processor{
+		ProgressInterval: time.Millisecond,
+		ReportProgress: func(ctx context.Context, m manifest.Manifest, snapshot ProgressSnapshot) error {
+			reports++
+			if reports > 1 {
+				return reportErr
+			}
+			return nil
+		},
+	}
+
+	heartbeat, err := processor.startProgressHeartbeat(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-heartbeat.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for heartbeat context cancellation")
+	}
+	if err := heartbeat.Stop(); !errors.Is(err, reportErr) {
+		t.Fatalf("heartbeat stop error = %v, want %v", err, reportErr)
+	}
+}
+
 func TestFrozenPartUploadGlobs(t *testing.T) {
 	root := t.TempDir()
 	diskPath := filepath.Join(root, "disk")
