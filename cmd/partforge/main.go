@@ -1066,10 +1066,10 @@ func runRetryFailed(ctx context.Context, args []string) error {
 	var (
 		configPath        = fs.String("config", defaultConfigPath, "JSON config file path")
 		jobID             = fs.String("job-id", "", "job id containing failed parts")
-		partID            = fs.String("part-id", "", "specific failed part id to retry")
+		partID            = fs.String("part-id", "", "specific part id to retry")
 		all               = fs.Bool("all", false, "retry all failed parts in the job")
 		includeInProgress = fs.Bool("include-in-progress", false, "also retry IN_PROGRESS parts by returning them to READY")
-		force             = fs.Bool("force", false, "with -all, retry every part in the job, including parts that succeeded")
+		force             = fs.Bool("force", false, "retry selected parts regardless of current state")
 		stateTable        = fs.String("state-table", defaultStateTable, "DynamoDB state table")
 		region            = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
 		dynamoEndpoint    = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
@@ -1086,9 +1086,6 @@ func runRetryFailed(ctx context.Context, args []string) error {
 	}
 	if (*all && *partID != "") || (!*all && *partID == "") {
 		return errors.New("exactly one of -all or -part-id is required")
-	}
-	if *force && !*all {
-		return errors.New("force requires -all")
 	}
 	if *force && *includeInProgress {
 		return errors.New("include-in-progress cannot be combined with force")
@@ -1700,6 +1697,9 @@ func selectRetryParts(parts []state.Part, all, force, includeInProgress bool, pa
 	}
 	for _, part := range parts {
 		if part.PartID == partID {
+			if force {
+				return []state.Part{part}, nil
+			}
 			if part.Status == state.StatusFailed || (includeInProgress && part.Status == state.StatusInProgress) {
 				return []state.Part{part}, nil
 			}

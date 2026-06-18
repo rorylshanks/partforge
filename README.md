@@ -155,7 +155,16 @@ partforge retry-failed \
   -force
 ```
 
-Use `-all -force` only when the whole job should be rewritten from the worker stage.
+Force one specific part back to `READY`, regardless of its current state:
+
+```sh
+partforge retry-failed \
+  -job-id=job-123 \
+  -part-id=part-abc \
+  -force
+```
+
+Use `-force` only when the selected part or whole job should be rewritten from the worker stage.
 
 Delete one job's DynamoDB state rows:
 

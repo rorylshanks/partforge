@@ -77,6 +77,14 @@ func TestSelectRetryParts(t *testing.T) {
 		t.Fatalf("forced len = %d", len(forced))
 	}
 
+	forcedOne, err := selectRetryParts(parts, false, true, false, "part-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(forcedOne) != 1 || forcedOne[0].PartID != "part-2" {
+		t.Fatalf("forced one = %+v", forcedOne)
+	}
+
 	one, err := selectRetryParts(parts, false, false, false, "part-1")
 	if err != nil {
 		t.Fatal(err)
