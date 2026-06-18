@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -182,7 +183,8 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 		"frozen_part_globs", len(rewriteResult.FrozenPartGlobs),
 	)
 	uploadStartedAt := time.Now()
-	if err := p.uploadFinishedArtifact(ctx, m.S3.Bucket, m.S3.FinishedKey, rewriteResult.FrozenPartGlobs); err != nil {
+	finishedTarDir := filepath.Join(root, "finished-tars")
+	if err := p.uploadFinishedArtifact(ctx, m.S3.Bucket, m.S3.FinishedKey, finishedTarDir, rewriteResult.FrozenPartGlobs); err != nil {
 		recorder.ForgeFailed(m)
 		return ProcessResult{}, fmt.Errorf("upload finished artifact %s: %w", m.S3.FinishedKey, err)
 	}
@@ -896,20 +898,140 @@ func frozenPartUploadGlobs(disks []freeze.Disk, freezeName string) ([]frozenPart
 	return globs, nil
 }
 
-func (p Processor) uploadFinishedArtifact(ctx context.Context, bucket, finishedKey string, frozenPartGlobs []frozenPartGlob) error {
+func (p Processor) uploadFinishedArtifact(ctx context.Context, bucket, finishedKey, tarDir string, frozenPartGlobs []frozenPartGlob) error {
 	if len(frozenPartGlobs) == 0 {
 		return fmt.Errorf("no frozen part globs to upload for finished artifact s3://%s/%s", bucket, finishedKey)
+	}
+	partDirs, err := frozenPartDirs(frozenPartGlobs)
+	if err != nil {
+		return err
+	}
+	slog.Info("creating finished artifact tarballs", "stage", "upload_finished", "bucket", bucket, "finished_key", finishedKey, "tar_dir", tarDir, "parts", len(partDirs))
+	tarFiles, err := createFinishedPartTars(ctx, tarDir, partDirs)
+	if err != nil {
+		return fmt.Errorf("create finished artifact tarballs in %s: %w", tarDir, err)
 	}
 	slog.Info("removing existing finished artifact prefix", "stage", "upload_finished", "bucket", bucket, "finished_key", finishedKey)
 	if err := p.S3Copy.DeletePrefixIfExists(ctx, bucket, finishedKey); err != nil {
 		return fmt.Errorf("delete existing finished artifact s3://%s/%s: %w", bucket, finishedKey, err)
 	}
-	for _, source := range frozenPartGlobs {
-		if err := p.S3Copy.UploadGlob(ctx, source.Glob, bucket, finishedKey); err != nil {
-			return fmt.Errorf("upload frozen parts matching %s to s3://%s/%s: %w", source.Glob, bucket, finishedKey, err)
-		}
+	slog.Info("uploading finished artifact tarballs", "stage", "upload_finished", "bucket", bucket, "finished_key", finishedKey, "tar_dir", tarDir, "tarballs", len(tarFiles))
+	if err := p.S3Copy.UploadDir(ctx, tarDir, bucket, finishedKey); err != nil {
+		return fmt.Errorf("upload finished artifact tarballs from %s to s3://%s/%s: %w", tarDir, bucket, finishedKey, err)
 	}
 	return nil
+}
+
+func frozenPartDirs(frozenPartGlobs []frozenPartGlob) ([]string, error) {
+	var partDirs []string
+	for _, source := range frozenPartGlobs {
+		matches, err := filepath.Glob(source.Glob)
+		if err != nil {
+			return nil, fmt.Errorf("expand frozen part glob %s: %w", source.Glob, err)
+		}
+		sort.Strings(matches)
+		for _, match := range matches {
+			info, err := os.Stat(match)
+			if err != nil {
+				return nil, fmt.Errorf("stat frozen part %s: %w", match, err)
+			}
+			if !info.IsDir() {
+				return nil, fmt.Errorf("frozen part match %s is not a directory", match)
+			}
+			partDirs = append(partDirs, match)
+		}
+	}
+	if len(partDirs) == 0 {
+		return nil, fmt.Errorf("no frozen part directories matched for finished artifact")
+	}
+	return partDirs, nil
+}
+
+func createFinishedPartTars(ctx context.Context, tarDir string, partDirs []string) ([]string, error) {
+	if len(partDirs) == 0 {
+		return nil, fmt.Errorf("no finished part directories to archive")
+	}
+	if err := os.RemoveAll(tarDir); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(tarDir, 0o755); err != nil {
+		return nil, err
+	}
+
+	tarFiles := make([]string, len(partDirs))
+	seen := map[string]struct{}{}
+	for i, partDir := range partDirs {
+		partName := filepath.Base(filepath.Clean(partDir))
+		if partName == "." || partName == string(filepath.Separator) {
+			return nil, fmt.Errorf("invalid finished part directory %q", partDir)
+		}
+		tarName := partName + manifest.FinishedTarSuffix
+		if _, ok := seen[tarName]; ok {
+			return nil, fmt.Errorf("duplicate finished part tarball name %q", tarName)
+		}
+		seen[tarName] = struct{}{}
+		tarFiles[i] = filepath.Join(tarDir, tarName)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(partDirs) {
+		workers = len(partDirs)
+	}
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+	setErr := func(err error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		mu.Unlock()
+	}
+
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				if err := artifact.WriteFinishedTar(tarFiles[idx], []string{partDirs[idx]}); err != nil {
+					setErr(fmt.Errorf("create finished part tarball %s: %w", tarFiles[idx], err))
+					return
+				}
+			}
+		}()
+	}
+
+sendJobs:
+	for idx := range partDirs {
+		select {
+		case <-ctx.Done():
+			break sendJobs
+		case jobs <- idx:
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return tarFiles, nil
 }
 
 func (p Processor) recorder() metrics.Recorder {

@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-const Version = 1
+const (
+	Version           = 1
+	FinishedTarSuffix = ".tar"
+)
 
 type Manifest struct {
 	Version   int        `json:"version"`

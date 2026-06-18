@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/partforge/partforge/internal/artifact"
 	"github.com/partforge/partforge/internal/chhttp"
 	"github.com/partforge/partforge/internal/freeze"
 	"github.com/partforge/partforge/internal/manifest"
@@ -326,14 +327,18 @@ func TestFrozenPartUploadGlobsRequiresAtLeastOneStore(t *testing.T) {
 	}
 }
 
-func TestUploadFinishedArtifactReplacesStablePartPrefix(t *testing.T) {
+func TestUploadFinishedArtifactReplacesStablePartPrefixWithTarballs(t *testing.T) {
 	binary, logFile := fakeS5cmdRecorder(t)
-	frozenGlob := filepath.Join(t.TempDir(), "shadow", "freeze", "store", "*", "*", "*")
+	frozenStore := filepath.Join(t.TempDir(), "shadow", "freeze", "store")
+	createFrozenPart(t, filepath.Join(frozenStore, "abc", "def", "all_1_1_0"))
+	createFrozenPart(t, filepath.Join(frozenStore, "abc", "def", "all_2_2_0"))
+	frozenGlob := filepath.Join(frozenStore, "*", "*", "*")
 	finishedKey := "partforge/jobs/job-1/finished/part-1"
+	tarDir := filepath.Join(t.TempDir(), "finished-tars")
 
 	err := (Processor{
 		S3Copy: s3copy.Copier{Binary: binary},
-	}).uploadFinishedArtifact(context.Background(), "bucket", finishedKey, []frozenPartGlob{
+	}).uploadFinishedArtifact(context.Background(), "bucket", finishedKey, tarDir, []frozenPartGlob{
 		{Disk: "default", Glob: frozenGlob},
 	})
 	if err != nil {
@@ -351,18 +356,34 @@ func TestUploadFinishedArtifactReplacesStablePartPrefix(t *testing.T) {
 	if !strings.Contains(lines[0], " rm s3://bucket/"+finishedKey+"/*") {
 		t.Fatalf("delete call = %q, want finished part prefix delete", lines[0])
 	}
-	if !strings.Contains(lines[1], " cp "+frozenGlob+" s3://bucket/"+finishedKey+"/") {
-		t.Fatalf("upload call = %q, want direct finished part prefix upload", lines[1])
+	if !strings.Contains(lines[1], " cp "+tarDir+string(filepath.Separator)+" s3://bucket/"+finishedKey+"/") {
+		t.Fatalf("upload call = %q, want finished tarball directory upload", lines[1])
 	}
 	for _, line := range lines {
 		if strings.Contains(line, "/data/") || strings.Contains(line, "/attempt-") {
 			t.Fatalf("s5cmd call uses old finished layout: %q", line)
 		}
 	}
+
+	tarEntries, err := os.ReadDir(tarDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tarEntries) != 2 {
+		t.Fatalf("tarball count = %d, want 2", len(tarEntries))
+	}
+	extractRoot := filepath.Join(t.TempDir(), "extract")
+	parts, err := artifact.ExtractFinishedTar(filepath.Join(tarDir, "all_1_1_0.tar"), extractRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 1 || parts[0] != "all_1_1_0" {
+		t.Fatalf("extracted parts = %#v, want all_1_1_0", parts)
+	}
 }
 
 func TestUploadFinishedArtifactRequiresFrozenPartGlobs(t *testing.T) {
-	err := (Processor{}).uploadFinishedArtifact(context.Background(), "bucket", "partforge/jobs/job-1/finished/part-1", nil)
+	err := (Processor{}).uploadFinishedArtifact(context.Background(), "bucket", "partforge/jobs/job-1/finished/part-1", filepath.Join(t.TempDir(), "finished-tars"), nil)
 	if err == nil {
 		t.Fatal("expected missing frozen part globs error")
 	}

@@ -11,8 +11,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/partforge/partforge/internal/artifact"
 	"github.com/partforge/partforge/internal/chhttp"
 	"github.com/partforge/partforge/internal/fileutil"
+	"github.com/partforge/partforge/internal/manifest"
 	"github.com/partforge/partforge/internal/s3copy"
 )
 
@@ -147,6 +149,7 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact Fi
 		return err
 	}
 	downloadRoot := filepath.Join(workDir, "data")
+	extractRoot := filepath.Join(workDir, "extracted")
 	sourceKey := artifact.Key
 	slog.Info("downloading finished artifact", "stage", "download_finished", "job_id", job.JobID, "part_id", artifact.PartID, "bucket", artifact.Bucket, "key", sourceKey)
 	downloadStartedAt := time.Now()
@@ -159,16 +162,16 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact Fi
 	}
 	downloadElapsed := time.Since(downloadStartedAt)
 	slog.Info("downloaded finished artifact", "stage", "download_finished", "job_id", job.JobID, "part_id", artifact.PartID, "files", downloadStats.Files, "bytes", downloadStats.Bytes, "elapsed", downloadElapsed, "bytes_per_second", ratePerSecond(downloadStats.Bytes, downloadElapsed))
-	partNames, err := downloadedPartNames(downloadRoot)
+	partNames, err := extractDownloadedFinishedTarballs(downloadRoot, extractRoot)
 	if err != nil {
-		return fmt.Errorf("list downloaded finished parts s3://%s/%s: %w", artifact.Bucket, sourceKey, err)
+		return fmt.Errorf("extract downloaded finished parts s3://%s/%s: %w", artifact.Bucket, sourceKey, err)
 	}
 	if len(partNames) == 0 {
-		return fmt.Errorf("finished artifact s3://%s/%s contains no part directories", artifact.Bucket, sourceKey)
+		return fmt.Errorf("finished artifact s3://%s/%s contains no part tarballs", artifact.Bucket, sourceKey)
 	}
 
 	for _, partName := range partNames {
-		src := filepath.Join(downloadRoot, partName)
+		src := filepath.Join(extractRoot, partName)
 		dst := filepath.Join(detachedPath, partName)
 		if _, err := os.Stat(dst); err == nil {
 			return fmt.Errorf("detached part destination already exists: %s", dst)
@@ -191,15 +194,49 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact Fi
 	return nil
 }
 
-func downloadedPartNames(root string) ([]string, error) {
+func extractDownloadedFinishedTarballs(root, extractRoot string) ([]string, error) {
+	tarballs, err := downloadedFinishedTarballs(root)
+	if err != nil {
+		return nil, err
+	}
+	partSeen := map[string]struct{}{}
+	var partNames []string
+	for _, tarball := range tarballs {
+		extracted, err := artifact.ExtractFinishedTar(filepath.Join(root, tarball), extractRoot)
+		if err != nil {
+			return nil, fmt.Errorf("extract %s: %w", tarball, err)
+		}
+		for _, partName := range extracted {
+			if _, ok := partSeen[partName]; ok {
+				return nil, fmt.Errorf("duplicate finished part %q in downloaded tarballs", partName)
+			}
+			partSeen[partName] = struct{}{}
+			partNames = append(partNames, partName)
+		}
+	}
+	sort.Strings(partNames)
+	return partNames, nil
+}
+
+func downloadedFinishedTarballs(root string) ([]string, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil, err
 	}
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		if !entry.IsDir() {
-			return nil, fmt.Errorf("unexpected file at finished artifact root: %s", filepath.Join(root, entry.Name()))
+		if entry.IsDir() {
+			return nil, fmt.Errorf("unexpected directory at finished artifact root: %s", filepath.Join(root, entry.Name()))
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("unexpected non-regular file at finished artifact root: %s", filepath.Join(root, entry.Name()))
+		}
+		if !strings.HasSuffix(entry.Name(), manifest.FinishedTarSuffix) {
+			return nil, fmt.Errorf("unexpected non-tar file at finished artifact root: %s", filepath.Join(root, entry.Name()))
 		}
 		names = append(names, entry.Name())
 	}

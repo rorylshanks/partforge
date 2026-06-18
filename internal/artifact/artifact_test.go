@@ -3,6 +3,7 @@ package artifact
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -37,5 +38,59 @@ func TestManifestRoundTrip(t *testing.T) {
 	}
 	if got.JobID != m.JobID || got.Part.Name != m.Part.Name || got.Part.Disk != m.Part.Disk {
 		t.Fatalf("unexpected manifest: %+v", got)
+	}
+}
+
+func TestFinishedTarRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	partA := filepath.Join(root, "parts-a", "all_1_1_0")
+	partB := filepath.Join(root, "parts-b", "all_2_2_0")
+	for _, part := range []string{partA, partB} {
+		if err := os.MkdirAll(filepath.Join(part, "subdir"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(part, "checksums.txt"), []byte(filepath.Base(part)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(part, "subdir", "data.bin"), []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tarPath := filepath.Join(root, "finished.tar")
+	if err := WriteFinishedTar(tarPath, []string{partB, partA}); err != nil {
+		t.Fatal(err)
+	}
+	extractRoot := filepath.Join(root, "extract")
+	got, err := ExtractFinishedTar(tarPath, extractRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"all_1_1_0", "all_2_2_0"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parts = %#v, want %#v", got, want)
+	}
+	raw, err := os.ReadFile(filepath.Join(extractRoot, "all_2_2_0", "checksums.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "all_2_2_0" {
+		t.Fatalf("extracted file = %q", raw)
+	}
+}
+
+func TestWriteFinishedTarRejectsDuplicatePartNames(t *testing.T) {
+	root := t.TempDir()
+	left := filepath.Join(root, "left", "all_1_1_0")
+	right := filepath.Join(root, "right", "all_1_1_0")
+	for _, part := range []string{left, right} {
+		if err := os.MkdirAll(part, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err := WriteFinishedTar(filepath.Join(root, "finished.tar"), []string{left, right})
+	if err == nil {
+		t.Fatal("expected duplicate part name error")
 	}
 }
