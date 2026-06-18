@@ -23,6 +23,8 @@ import (
 	"github.com/partforge/partforge/internal/s3copy"
 )
 
+const DefaultMergeTimeout = 2 * time.Minute
+
 type Processor struct {
 	S3Copy           s3copy.Copier
 	ClickHouse       chhttp.Client
@@ -735,7 +737,7 @@ type mergeWaitResult struct {
 func (p Processor) waitForMerges(ctx context.Context, database, table string) (mergeWaitResult, error) {
 	timeout := p.MergeTimeout
 	if timeout == 0 {
-		timeout = 10 * time.Minute
+		timeout = DefaultMergeTimeout
 	}
 	deadline := time.Now().Add(timeout)
 	query := "SELECT count() FROM system.merges WHERE database = " +

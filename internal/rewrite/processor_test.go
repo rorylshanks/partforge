@@ -152,6 +152,31 @@ func TestWaitForMergesReturnsUnsettledAfterTimeout(t *testing.T) {
 	}
 }
 
+func TestWaitForMergesUsesDefaultTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.ReadAll(r.Body); err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte("0\n"))
+	}))
+	defer server.Close()
+
+	result, err := (Processor{
+		ClickHouse: chhttp.Client{URL: server.URL},
+	}).waitForMerges(context.Background(), "db", "query_log_archive_temp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Settled {
+		t.Fatal("expected settled merge result")
+	}
+	if result.Timeout != DefaultMergeTimeout {
+		t.Fatalf("timeout = %s, want %s", result.Timeout, DefaultMergeTimeout)
+	}
+}
+
 func TestInsertSelectRetryBackoff(t *testing.T) {
 	if got := insertSelectRetryBackoff(1); got != time.Second {
 		t.Fatalf("attempt 1 backoff = %s", got)

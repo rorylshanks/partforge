@@ -630,7 +630,7 @@ func runWorker(ctx context.Context, args []string) error {
 		pollInterval          = fs.Duration("poll-interval", 10*time.Second, "how long to wait before checking for ready work again")
 		workerID              = fs.String("worker-id", "", "worker identity recorded on claimed parts")
 		workDir               = fs.String("work-dir", "/tmp/partforge", "worker scratch directory")
-		mergeTimeout          = fs.Duration("merge-timeout", 10*time.Minute, "maximum time to wait for destination merges")
+		mergeTimeout          = fs.Duration("merge-timeout", rewrite.DefaultMergeTimeout, "maximum time to wait for destination merges")
 		metricsAddr           = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables metrics")
 		metricsPath           = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
 		stateProgressInterval = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress to DynamoDB; <=0 disables progress writes")
