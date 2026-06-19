@@ -59,7 +59,8 @@ func main() {
 
 func configureLogger() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level:       slog.LevelInfo,
+		ReplaceAttr: humanizeLogAttr,
 	})))
 }
 
@@ -143,6 +144,7 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		s5cmdNumWorkers       = fs.Int("s5cmd-numworkers", 0, "s5cmd --numworkers per upload process; <=0 auto-scales from upload-concurrency")
 		uploadConcurrency     = fs.Int("upload-concurrency", 0, "number of source parts to upload concurrently; <=0 uses detected CPU count")
 		dynamoEndpoint        = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
+		optimizeFinal         = fs.Bool("optimize-final", false, "record that workers should run OPTIMIZE TABLE ... FINAL on their local destination table for this job")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -171,6 +173,7 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		"freeze", *freezeName,
 		"bucket", *bucket,
 		"prefix", *prefix,
+		"optimize_final", *optimizeFinal,
 	)
 
 	slog.Info("reading SQL files", "stage", "read_sql_files", "destination_schema_file", *destinationSchemaFile, "insert_select_file", *insertSelectFile)
@@ -222,8 +225,9 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 	slog.Info("found frozen parts", "stage", "scan_freeze", "parts", len(scannedParts), "parts_by_disk", formatPartCountsByDisk(disks, scannedParts))
 
 	resolvedJobID := *jobID
+	options := manifest.Options{OptimizeFinal: *optimizeFinal}
 	if resolvedJobID == "" {
-		resolvedJobID = manifest.DeriveJobID(*database, *table, *freezeName, sourceSchema, destinationSchema, insertSelect)
+		resolvedJobID = manifest.DeriveJobIDWithOptions(*database, *table, *freezeName, sourceSchema, destinationSchema, insertSelect, options)
 	}
 	slog.Info("resolved job id", "stage", "resolve_job", "job_id", resolvedJobID)
 
@@ -264,6 +268,7 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		SourceSchema:      sourceSchema,
 		DestinationSchema: destinationSchema,
 		InsertSelect:      insertSelect,
+		Options:           options,
 		Bucket:            *bucket,
 		Prefix:            *prefix,
 		PartsTotal:        len(scannedParts),
@@ -333,6 +338,7 @@ type uploadFreezePartParams struct {
 	SourceSchema      string
 	DestinationSchema string
 	InsertSelect      string
+	Options           manifest.Options
 	Bucket            string
 	Prefix            string
 	PartsTotal        int
@@ -446,7 +452,7 @@ func uploadPartsInParallel(ctx context.Context, tasks []uploadPartTask, concurre
 
 func uploadFreezePart(ctx context.Context, workerID int, task uploadPartTask, params uploadFreezePartParams) (uploadPartResult, error) {
 	sourcePart := task.SourcePart
-	partID := manifest.DerivePartID(sourcePart.Disk, sourcePart.RelativePath, sourcePart.Name, params.SourceSchema, params.DestinationSchema, params.InsertSelect)
+	partID := manifest.DerivePartIDWithOptions(sourcePart.Disk, sourcePart.RelativePath, sourcePart.Name, params.SourceSchema, params.DestinationSchema, params.InsertSelect, params.Options)
 	sourceKey := manifest.SourcePartPrefix(params.Prefix, params.JobID, partID)
 	finishedKey := manifest.FinishedPartPrefix(params.Prefix, params.JobID, partID)
 	createdAt := time.Now().UTC()
@@ -460,6 +466,7 @@ func uploadFreezePart(ctx context.Context, workerID int, task uploadPartTask, pa
 		Dest:      params.Dest,
 		Part:      manifest.SourcePart{Disk: sourcePart.Disk, Name: sourcePart.Name, RelativePath: sourcePart.RelativePath},
 		SQL:       manifest.SQLBundle{SourceSchema: params.SourceSchema, DestinationSchema: params.DestinationSchema, InsertSelect: params.InsertSelect},
+		Options:   params.Options,
 		S3:        manifest.S3Refs{Bucket: params.Bucket, SourceKey: sourceKey, FinishedKey: finishedKey},
 		CreatedAt: createdAt,
 	}
@@ -623,7 +630,6 @@ func runWorker(ctx context.Context, args []string) error {
 		clickHouseURL         = fs.String("clickhouse-url", defaultClickHouseURL, "local ClickHouse HTTP URL")
 		clickHouseUser        = fs.String("clickhouse-user", "", "ClickHouse HTTP user")
 		clickHousePassword    = fs.String("clickhouse-password", "", "ClickHouse HTTP password")
-		startClickHouse       = fs.Bool("start-clickhouse", true, "start clickhouse-server as a child process")
 		clickHouseBinary      = fs.String("clickhouse-binary", "clickhouse", "clickhouse binary path")
 		clickHouseConfigFile  = fs.String("clickhouse-config-file", "/etc/clickhouse-server/config.xml", "clickhouse-server config file")
 		once                  = fs.Bool("once", false, "process one part and exit")
@@ -635,6 +641,7 @@ func runWorker(ctx context.Context, args []string) error {
 		metricsPath           = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
 		stateProgressInterval = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress heartbeats to DynamoDB; <=0 disables progress writes")
 		shutdownGracePeriod   = fs.Duration("shutdown-grace-period", defaultWorkerShutdownGracePeriod, "how long to let an active part finish after shutdown is requested before canceling it and returning it to READY; <=0 cancels immediately")
+		optimizeFinal         = fs.Bool("optimize-final", false, "run OPTIMIZE TABLE ... FINAL inside the local worker after every rewrite insert, regardless of manifest")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -651,9 +658,9 @@ func runWorker(ctx context.Context, args []string) error {
 		"once", *once,
 		"state_table", *stateTable,
 		"work_dir", *workDir,
-		"start_clickhouse", *startClickHouse,
 		"clickhouse_url", *clickHouseURL,
 		"shutdown_grace_period", *shutdownGracePeriod,
+		"optimize_final", *optimizeFinal,
 	)
 	slog.Info("initializing DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
 	stateStore, err := state.New(ctx, state.Config{
@@ -680,13 +687,20 @@ func runWorker(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("derive clickhouse insert settings: %w", err)
 	}
+	mergeTreeSettings, err := resources.MergeTreeSettingsForLimits(workerLimits)
+	if err != nil {
+		return fmt.Errorf("derive clickhouse merge settings: %w", err)
+	}
 	slog.Info(
-		"configured clickhouse insert-select settings",
+		"configured clickhouse resource settings",
 		"cpus", workerLimits.CPUs,
 		"memory_bytes", workerLimits.MemoryBytes,
 		"max_threads", insertSettings["max_threads"],
 		"max_insert_threads", insertSettings["max_insert_threads"],
 		"max_memory_usage", insertSettings["max_memory_usage"],
+		"merge_background_pool_size", workerLimits.CPUs,
+		"merge_max_block_size", mergeTreeSettings.MergeMaxBlockSize,
+		"merge_max_block_size_bytes", mergeTreeSettings.MergeMaxBlockSizeBytes,
 	)
 
 	var recorder metrics.Recorder = metrics.Noop{}
@@ -772,9 +786,8 @@ func runWorker(ctx context.Context, args []string) error {
 				}
 			}()
 
-			if *startClickHouse {
-				slog.Info("starting local ClickHouse server", "stage", "start_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", part.JobID, "part_id", part.PartID)
-				server, err = chproc.Start(processCtx, chproc.Config{
+			startServer := func(ctx context.Context, tuning chproc.Tuning) (*chproc.Server, error) {
+				return chproc.Start(ctx, chproc.Config{
 					Binary:     *clickHouseBinary,
 					ConfigFile: *clickHouseConfigFile,
 					DataDir:    runDirs.ClickHouse,
@@ -782,21 +795,45 @@ func runWorker(ctx context.Context, args []string) error {
 					User:       *clickHouseUser,
 					Password:   *clickHousePassword,
 					Timeout:    90 * time.Second,
+					Tuning:     tuning,
 				})
-				if err != nil {
-					return rewrite.ProcessResult{}, err
-				}
+			}
+
+			slog.Info("starting local ClickHouse server", "stage", "start_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", part.JobID, "part_id", part.PartID)
+			server, err = startServer(processCtx, chproc.Tuning{})
+			if err != nil {
+				return rewrite.ProcessResult{}, err
 			}
 
 			ch := chhttp.Client{URL: *clickHouseURL, User: *clickHouseUser, Password: *clickHousePassword}
 			processor := rewrite.Processor{
-				S3Copy:           s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
-				ClickHouse:       ch,
-				WorkDir:          runDirs.Scratch,
-				MergeTimeout:     *mergeTimeout,
-				Metrics:          recorder,
-				InsertSettings:   insertSettings,
-				ProgressInterval: *stateProgressInterval,
+				S3Copy:             s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
+				ClickHouse:         ch,
+				WorkDir:            runDirs.Scratch,
+				MergeTimeout:       *mergeTimeout,
+				Metrics:            recorder,
+				InsertSettings:     insertSettings,
+				ProgressInterval:   *stateProgressInterval,
+				ForceOptimizeFinal: *optimizeFinal,
+				MergeTreeSettings: rewrite.MergeTreeSettings{
+					MergeMaxBlockSize:      mergeTreeSettings.MergeMaxBlockSize,
+					MergeMaxBlockSizeBytes: mergeTreeSettings.MergeMaxBlockSizeBytes,
+				},
+			}
+			processor.RestartClickHouse = func(ctx context.Context) error {
+				if server == nil {
+					return errors.New("local ClickHouse server is not running")
+				}
+				slog.Info("stopping local ClickHouse server for restart", "stage", "restart_clickhouse", "job_id", part.JobID, "part_id", part.PartID)
+				server.Stop()
+				server = nil
+				slog.Info("starting local ClickHouse server after restart", "stage", "restart_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", part.JobID, "part_id", part.PartID, "background_pool_size", workerLimits.CPUs)
+				restarted, err := startServer(ctx, chproc.Tuning{BackgroundPoolSize: workerLimits.CPUs})
+				if err != nil {
+					return err
+				}
+				server = restarted
+				return nil
 			}
 			if *stateProgressInterval > 0 {
 				processor.ReportProgress = func(ctx context.Context, m manifest.Manifest, snapshot rewrite.ProgressSnapshot) error {
@@ -1682,8 +1719,8 @@ func printJobSummary(out *os.File, summary jobSummary) {
 	fmt.Fprintf(out, "parts: %d\n", summary.Total)
 	fmt.Fprintf(out, "rewrite_complete: %d/%d %.1f%%\n", summary.RewriteCompleted, summary.Total, summary.RewritePercent)
 	fmt.Fprintf(out, "import_complete: %d/%d %.1f%%\n", summary.ImportCompleted, summary.Total, summary.ImportPercent)
-	fmt.Fprintf(out, "read: %d rows %d bytes\n", summary.ReadRows, summary.ReadBytes)
-	fmt.Fprintf(out, "written: %d rows %d bytes\n", summary.WrittenRows, summary.WrittenBytes)
+	fmt.Fprintf(out, "read: %d rows %s\n", summary.ReadRows, formatBytes(summary.ReadBytes))
+	fmt.Fprintf(out, "written: %d rows %s\n", summary.WrittenRows, formatBytes(summary.WrittenBytes))
 
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "\nSTATE\tCOUNT")
@@ -1709,19 +1746,19 @@ func printPartRows(out *os.File, parts []state.Part) {
 	}
 	fmt.Fprintln(out, "\nPARTS")
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "PART_ID\tSTATUS\tATTEMPTS\tWORKER\tREAD_ROWS\tREAD_BYTES\tWRITTEN_ROWS\tWRITTEN_BYTES\tSOURCE_ROWS\tDEST_ROWS\tPROGRESS_AT\tUPDATED_AT\tERROR")
+	fmt.Fprintln(tw, "PART_ID\tSTATUS\tATTEMPTS\tWORKER\tREAD_ROWS\tREAD_SIZE\tWRITTEN_ROWS\tWRITTEN_SIZE\tSOURCE_ROWS\tDEST_ROWS\tPROGRESS_AT\tUPDATED_AT\tERROR")
 	for _, part := range parts {
 		fmt.Fprintf(
 			tw,
-			"%s\t%s\t%d\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n",
+			"%s\t%s\t%d\t%s\t%d\t%s\t%d\t%s\t%d\t%d\t%s\t%s\t%s\n",
 			part.PartID,
 			part.Status,
 			part.Attempts,
 			part.WorkerID,
 			part.ReadRows,
-			part.ReadBytes,
+			formatBytes(part.ReadBytes),
 			part.WrittenRows,
-			part.WrittenBytes,
+			formatBytes(part.WrittenBytes),
 			part.SourceActivePartRows,
 			part.DestinationActivePartRows,
 			part.ProgressUpdatedAt,

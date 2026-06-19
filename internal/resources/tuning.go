@@ -11,11 +11,25 @@ import (
 	"github.com/partforge/partforge/internal/chhttp"
 )
 
-const insertMemoryUsagePercent uint64 = 80
+const (
+	insertMemoryUsagePercent       uint64 = 80
+	mergeMemoryBudgetPercent       uint64 = 60
+	mergeMemoryConcurrencyDivisor  uint64 = 8
+	minMergeMaxBlockSizeBytes      uint64 = 4 * 1024 * 1024
+	maxMergeMaxBlockSizeBytes      uint64 = 256 * 1024 * 1024
+	minMergeMaxBlockSizeRows       uint64 = 8192
+	maxMergeMaxBlockSizeRows       uint64 = 262144
+	targetMergeAverageRowSizeBytes uint64 = 1024
+)
 
 type Limits struct {
 	CPUs        int
 	MemoryBytes uint64
+}
+
+type MergeTreeSettings struct {
+	MergeMaxBlockSize      uint64
+	MergeMaxBlockSizeBytes uint64
 }
 
 func DetectLimits() (Limits, error) {
@@ -41,12 +55,62 @@ func InsertSelectSettings(limits Limits) (chhttp.QuerySettings, error) {
 	if maxMemoryUsage == 0 {
 		return nil, fmt.Errorf("derived max_memory_usage is zero from memory limit %d", limits.MemoryBytes)
 	}
-	threads := strconv.Itoa(limits.CPUs)
+	threads := strconv.Itoa(insertThreadCount(limits.CPUs))
 	return chhttp.QuerySettings{
 		"max_threads":        threads,
 		"max_insert_threads": threads,
 		"max_memory_usage":   strconv.FormatUint(maxMemoryUsage, 10),
 	}, nil
+}
+
+func insertThreadCount(cpus int) int {
+	return cpus
+}
+
+func MergeTreeSettingsForLimits(limits Limits) (MergeTreeSettings, error) {
+	if limits.CPUs < 1 {
+		return MergeTreeSettings{}, fmt.Errorf("cpu limit must be at least 1, got %d", limits.CPUs)
+	}
+	if limits.MemoryBytes == 0 {
+		return MergeTreeSettings{}, fmt.Errorf("memory limit must be greater than zero")
+	}
+	mergeBudget := limits.MemoryBytes * mergeMemoryBudgetPercent / 100
+	perWorkerBudget := mergeBudget / uint64(limits.CPUs)
+	mergeMaxBlockSizeBytes := perWorkerBudget / mergeMemoryConcurrencyDivisor
+	if mergeMaxBlockSizeBytes == 0 {
+		return MergeTreeSettings{}, fmt.Errorf("derived merge_max_block_size_bytes is zero from memory limit %d and cpu limit %d", limits.MemoryBytes, limits.CPUs)
+	}
+	mergeMaxBlockSizeBytes = clampUint64(mergeMaxBlockSizeBytes, minMergeMaxBlockSizeBytes, maxMergeMaxBlockSizeBytes)
+	mergeMaxBlockSizeBytes = roundDownToMultiple(mergeMaxBlockSizeBytes, 1024*1024)
+
+	mergeMaxBlockSize := mergeMaxBlockSizeBytes / targetMergeAverageRowSizeBytes
+	mergeMaxBlockSize = clampUint64(mergeMaxBlockSize, minMergeMaxBlockSizeRows, maxMergeMaxBlockSizeRows)
+	mergeMaxBlockSize = roundDownToMultiple(mergeMaxBlockSize, minMergeMaxBlockSizeRows)
+	return MergeTreeSettings{
+		MergeMaxBlockSize:      mergeMaxBlockSize,
+		MergeMaxBlockSizeBytes: mergeMaxBlockSizeBytes,
+	}, nil
+}
+
+func clampUint64(value, minValue, maxValue uint64) uint64 {
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
+}
+
+func roundDownToMultiple(value, multiple uint64) uint64 {
+	if multiple == 0 {
+		return value
+	}
+	rounded := value / multiple * multiple
+	if rounded == 0 {
+		return multiple
+	}
+	return rounded
 }
 
 func detectCPUs() (int, error) {

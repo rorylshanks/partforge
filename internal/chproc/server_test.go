@@ -13,6 +13,7 @@ func TestArgsIncludeGeneratedStorageConfig(t *testing.T) {
 		Binary:     "clickhouse",
 		ConfigFile: "/etc/clickhouse-server/config.xml",
 		DataDir:    dataDir,
+		Tuning:     Tuning{BackgroundPoolSize: 12},
 	}
 
 	got, err := cfg.args()
@@ -38,6 +39,7 @@ func TestArgsIncludeGeneratedStorageConfig(t *testing.T) {
 		"--filesystem_caches_path=" + withTrailingSeparator(filepath.Join(root, "filesystem_caches")),
 		"--custom_local_disks_base_directory=" + withTrailingSeparator(filepath.Join(root, "disks")),
 		"--user_directories.local_directory.path=" + withTrailingSeparator(filepath.Join(root, "access")),
+		"--background_pool_size=12",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("args = %#v, want %#v", got, want)
@@ -60,5 +62,13 @@ func TestArgsForClickHouseServerBinaryOmitServerSubcommand(t *testing.T) {
 	want := []string{"--config-file=/etc/clickhouse-server/config.xml"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+}
+
+func TestArgsRejectInvalidBackgroundPoolSize(t *testing.T) {
+	cfg := Config{Binary: "clickhouse", Tuning: Tuning{BackgroundPoolSize: -1}}
+	_, err := cfg.args()
+	if err == nil {
+		t.Fatal("expected invalid background pool size error")
 	}
 }

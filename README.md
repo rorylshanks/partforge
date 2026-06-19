@@ -72,6 +72,8 @@ The worker image is a single Ubuntu-based container with ClickHouse packages, `s
 
 Large worker data should live on the same local filesystem. In production, mount local NVMe at `/mnt/nvme` and set the worker `-work-dir` under that mount, for example `/mnt/nvme/partforge-work`. Each claimed part creates a unique `run-*` directory under `-work-dir`; ClickHouse data, temp files, logs, and pid file live under `run-*/clickhouse`, while downloaded source artifacts live under `run-*/scratch`. The run directory is removed after that part finishes and the child ClickHouse process has stopped. The worker moves source parts into ClickHouse `detached`, freezes produced destination parts, and uploads the frozen part directories with an `s5cmd` glob from `shadow/<freeze>/store/*/*/*`.
 
+Workers run insert-select queries with the detected CPU count and an insert-heavy memory cap. After the insert completes, the worker applies memory-derived `merge_max_block_size` and `merge_max_block_size_bytes` settings to the local worker destination table, restarts its local ClickHouse child process with `background_pool_size` set to the detected CPU count, and then lets destination merges run. Use `upload-freeze -optimize-final` to record that this job's workers should run `OPTIMIZE TABLE ... FINAL` on their local worker destination table after each insert-select. Use `worker -optimize-final` to force that same local worker optimize for every job processed by that worker. PartForge never runs `OPTIMIZE FINAL` on the source/upload host.
+
 ```sh
 docker compose build worker
 docker compose up worker

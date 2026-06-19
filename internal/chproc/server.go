@@ -21,6 +21,11 @@ type Config struct {
 	User       string
 	Password   string
 	Timeout    time.Duration
+	Tuning     Tuning
+}
+
+type Tuning struct {
+	BackgroundPoolSize int
 }
 
 type Server struct {
@@ -76,25 +81,37 @@ func (cfg Config) args() ([]string, error) {
 	if cfg.ConfigFile != "" {
 		args = append(args, "--config-file="+cfg.ConfigFile)
 	}
+	var configOverrides []string
 	if strings.TrimSpace(cfg.DataDir) != "" {
-		storageArgs, err := storageConfigArgs(cfg.DataDir)
+		storageArgs, storageOverrides, err := storageConfigArgs(cfg.DataDir)
 		if err != nil {
 			return nil, err
 		}
 		args = append(args, storageArgs...)
+		configOverrides = append(configOverrides, storageOverrides...)
+	}
+	if cfg.Tuning.BackgroundPoolSize < 0 {
+		return nil, fmt.Errorf("background pool size must be non-negative, got %d", cfg.Tuning.BackgroundPoolSize)
+	}
+	if cfg.Tuning.BackgroundPoolSize > 0 {
+		configOverrides = append(configOverrides, fmt.Sprintf("--background_pool_size=%d", cfg.Tuning.BackgroundPoolSize))
+	}
+	if len(configOverrides) > 0 {
+		args = append(args, "--")
+		args = append(args, configOverrides...)
 	}
 	return args, nil
 }
 
-func storageConfigArgs(dataDir string) ([]string, error) {
+func storageConfigArgs(dataDir string) ([]string, []string, error) {
 	root, err := filepath.Abs(dataDir)
 	if err != nil {
-		return nil, fmt.Errorf("resolve clickhouse data dir %s: %w", dataDir, err)
+		return nil, nil, fmt.Errorf("resolve clickhouse data dir %s: %w", dataDir, err)
 	}
 	root = filepath.Clean(root)
 	logDir := filepath.Join(root, "logs")
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create clickhouse path %s: %w", logDir, err)
+		return nil, nil, fmt.Errorf("create clickhouse path %s: %w", logDir, err)
 	}
 	paths := []struct {
 		arg  string
@@ -111,20 +128,20 @@ func storageConfigArgs(dataDir string) ([]string, error) {
 	}
 	for _, p := range paths {
 		if err := os.MkdirAll(p.path, 0o755); err != nil {
-			return nil, fmt.Errorf("create clickhouse path %s: %w", p.path, err)
+			return nil, nil, fmt.Errorf("create clickhouse path %s: %w", p.path, err)
 		}
 	}
 
-	args := []string{
+	serverArgs := []string{
 		"--log-file=" + filepath.Join(logDir, "clickhouse-server.log"),
 		"--errorlog-file=" + filepath.Join(logDir, "clickhouse-server.err.log"),
 		"--pid-file=" + filepath.Join(root, "clickhouse-server.pid"),
-		"--",
 	}
+	configOverrides := make([]string, 0, len(paths))
 	for _, p := range paths {
-		args = append(args, p.arg+withTrailingSeparator(p.path))
+		configOverrides = append(configOverrides, p.arg+withTrailingSeparator(p.path))
 	}
-	return args, nil
+	return serverArgs, configOverrides, nil
 }
 
 func withTrailingSeparator(path string) string {

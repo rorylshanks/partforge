@@ -24,7 +24,7 @@ import (
 	"github.com/partforge/partforge/internal/s3copy"
 )
 
-const DefaultMergeTimeout = 2 * time.Minute
+const DefaultMergeTimeout = 10 * time.Minute
 
 const (
 	stageProcessPart             = "process_part"
@@ -34,6 +34,9 @@ const (
 	stagePrepareWorkerTables     = "prepare_worker_tables"
 	stageAttachSourcePart        = "attach_source_part"
 	stageInsertSelect            = "insert_select"
+	stageConfigureMergeSettings  = "configure_merge_settings"
+	stageRestartClickHouse       = "restart_clickhouse"
+	stageOptimizeFinal           = "optimize_final"
 	stageWaitMerges              = "wait_merges"
 	stageMeasureDestinationParts = "measure_destination_parts"
 	stageFreezeDestinationParts  = "freeze_destination_parts"
@@ -44,14 +47,22 @@ const (
 )
 
 type Processor struct {
-	S3Copy           s3copy.Copier
-	ClickHouse       chhttp.Client
-	WorkDir          string
-	MergeTimeout     time.Duration
-	Metrics          metrics.Recorder
-	InsertSettings   chhttp.QuerySettings
-	ProgressInterval time.Duration
-	ReportProgress   ProgressReporter
+	S3Copy             s3copy.Copier
+	ClickHouse         chhttp.Client
+	WorkDir            string
+	MergeTimeout       time.Duration
+	Metrics            metrics.Recorder
+	InsertSettings     chhttp.QuerySettings
+	ProgressInterval   time.Duration
+	ReportProgress     ProgressReporter
+	MergeTreeSettings  MergeTreeSettings
+	RestartClickHouse  func(context.Context) error
+	ForceOptimizeFinal bool
+}
+
+type MergeTreeSettings struct {
+	MergeMaxBlockSize      uint64
+	MergeMaxBlockSizeBytes uint64
 }
 
 type ProgressReporter func(context.Context, manifest.Manifest, ProgressSnapshot) error
@@ -258,6 +269,7 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 		"destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table),
 		"part", m.Part.RelativePath,
 		"disk", m.Part.Disk,
+		"optimize_final", m.Options.OptimizeFinal,
 	)
 	if m.JobID != item.JobID || m.PartID != item.PartID {
 		return ProcessResult{}, fmt.Errorf("work item references %s/%s but manifest contains %s/%s", item.JobID, item.PartID, m.JobID, m.PartID)
@@ -388,6 +400,29 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 		return rewriteResult{}, fmt.Errorf("run insert-select: %w", err)
 	}
 	slog.Info("insert-select complete", "stage", "insert_select", "job_id", m.JobID, "part_id", m.PartID, "elapsed", time.Since(insertStartedAt))
+	if err := p.reportStageProgress(ctx, m, stageTracker, stageConfigureMergeSettings); err != nil {
+		return rewriteResult{}, err
+	}
+	if err := p.configureDestinationMergeSettings(ctx, m); err != nil {
+		return rewriteResult{}, err
+	}
+	if err := p.reportStageProgress(ctx, m, stageTracker, stageRestartClickHouse); err != nil {
+		return rewriteResult{}, err
+	}
+	if err := p.restartClickHouse(ctx, m); err != nil {
+		return rewriteResult{}, err
+	}
+	if p.shouldOptimizeFinal(m) {
+		if err := p.reportStageProgress(ctx, m, stageTracker, stageOptimizeFinal); err != nil {
+			return rewriteResult{}, err
+		}
+		slog.Info("optimizing destination table final", "stage", "optimize_final", "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table), "manifest_optimize_final", m.Options.OptimizeFinal, "worker_force_optimize_final", p.ForceOptimizeFinal)
+		optimizeStartedAt := time.Now()
+		if err := p.optimizeFinal(ctx, m); err != nil {
+			return rewriteResult{}, fmt.Errorf("optimize destination table final: %w", err)
+		}
+		slog.Info("optimized destination table final", "stage", "optimize_final", "job_id", m.JobID, "part_id", m.PartID, "elapsed", time.Since(optimizeStartedAt))
+	}
 	if err := p.reportStageProgress(ctx, m, stageTracker, stageWaitMerges); err != nil {
 		return rewriteResult{}, err
 	}
@@ -483,6 +518,54 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 		}
 		return nil
 	}
+}
+
+func (p Processor) configureDestinationMergeSettings(ctx context.Context, m manifest.Manifest) error {
+	mergeTreeSettings := p.MergeTreeSettings
+	table := chhttp.TableSQL(m.Dest.Database, m.Dest.Table)
+	if mergeTreeSettings.MergeMaxBlockSize == 0 {
+		return fmt.Errorf("merge_max_block_size must be greater than zero")
+	}
+	if mergeTreeSettings.MergeMaxBlockSizeBytes == 0 {
+		return fmt.Errorf("merge_max_block_size_bytes must be greater than zero")
+	}
+	query := "ALTER TABLE " + table +
+		" MODIFY SETTING merge_max_block_size = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSize, 10) +
+		", merge_max_block_size_bytes = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSizeBytes, 10)
+	if err := p.ClickHouse.Exec(ctx, query); err != nil {
+		return fmt.Errorf("configure destination table merge settings: %w", err)
+	}
+	slog.Info(
+		"configured destination merge settings",
+		"stage", "prepare_worker_tables",
+		"job_id", m.JobID,
+		"part_id", m.PartID,
+		"destination_table", table,
+		"merge_max_block_size", mergeTreeSettings.MergeMaxBlockSize,
+		"merge_max_block_size_bytes", mergeTreeSettings.MergeMaxBlockSizeBytes,
+	)
+	return nil
+}
+
+func (p Processor) restartClickHouse(ctx context.Context, m manifest.Manifest) error {
+	if p.RestartClickHouse == nil {
+		return fmt.Errorf("restart clickhouse callback is required before destination merges")
+	}
+	slog.Info("restarting local ClickHouse before destination merges", "stage", "restart_clickhouse", "job_id", m.JobID, "part_id", m.PartID)
+	startedAt := time.Now()
+	if err := p.RestartClickHouse(ctx); err != nil {
+		return fmt.Errorf("restart clickhouse before destination merges: %w", err)
+	}
+	slog.Info("restarted local ClickHouse before destination merges", "stage", "restart_clickhouse", "job_id", m.JobID, "part_id", m.PartID, "elapsed", time.Since(startedAt))
+	return nil
+}
+
+func (p Processor) shouldOptimizeFinal(m manifest.Manifest) bool {
+	return p.ForceOptimizeFinal || m.Options.OptimizeFinal
+}
+
+func (p Processor) optimizeFinal(ctx context.Context, m manifest.Manifest) error {
+	return p.ClickHouse.Exec(ctx, "OPTIMIZE TABLE "+chhttp.TableSQL(m.Dest.Database, m.Dest.Table)+" FINAL")
 }
 
 func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, attempt int, settings chhttp.QuerySettings) error {

@@ -119,6 +119,144 @@ func TestResetDestinationTableAllowsLargeDrop(t *testing.T) {
 	}
 }
 
+func TestConfigureDestinationMergeSettings(t *testing.T) {
+	var queries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		queries = append(queries, string(body))
+	}))
+	defer server.Close()
+
+	err := (Processor{
+		ClickHouse: chhttp.Client{URL: server.URL},
+		MergeTreeSettings: MergeTreeSettings{
+			MergeMaxBlockSize:      32768,
+			MergeMaxBlockSizeBytes: 67108864,
+		},
+	}).configureDestinationMergeSettings(context.Background(), manifest.Manifest{
+		JobID:  "job-1",
+		PartID: "part-1",
+		Dest:   manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864"
+	if len(queries) != 1 || queries[0] != want {
+		t.Fatalf("queries = %#v, want %q", queries, want)
+	}
+}
+
+func TestRunInsertSelectRetryDoesNotApplyDestinationMergeSettings(t *testing.T) {
+	var queries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		queries = append(queries, query)
+		if strings.HasPrefix(query, "INSERT ") {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("MEMORY_LIMIT_EXCEEDED"))
+			return
+		}
+	}))
+	defer server.Close()
+
+	err := (Processor{
+		ClickHouse: chhttp.Client{URL: server.URL},
+		InsertSettings: chhttp.QuerySettings{
+			"max_threads":        "2",
+			"max_insert_threads": "2",
+		},
+		MergeTreeSettings: MergeTreeSettings{
+			MergeMaxBlockSize:      32768,
+			MergeMaxBlockSizeBytes: 67108864,
+		},
+	}).runInsertSelectWithRetries(context.Background(), manifest.Manifest{
+		JobID:  "job-1",
+		PartID: "part-1",
+		Dest:   manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
+		SQL:    manifest.SQLBundle{InsertSelect: "INSERT INTO db.query_log_archive_temp SELECT 1"},
+	}, "CREATE TABLE `db`.`query_log_archive_temp` (x UInt64) ENGINE = MergeTree ORDER BY x")
+	if err == nil {
+		t.Fatal("expected retryable insert error after reduced retry")
+	}
+
+	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864"
+	if containsString(queries, want) {
+		t.Fatalf("queries = %#v, did not expect merge settings during insert retry", queries)
+	}
+}
+
+func TestRestartClickHouse(t *testing.T) {
+	called := false
+	err := (Processor{
+		RestartClickHouse: func(ctx context.Context) error {
+			called = true
+			return nil
+		},
+	}).restartClickHouse(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("expected restart callback to be called")
+	}
+}
+
+func TestRestartClickHouseRequiresCallback(t *testing.T) {
+	err := (Processor{}).restartClickHouse(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"})
+	if err == nil {
+		t.Fatal("expected missing restart callback error")
+	}
+}
+
+func TestOptimizeFinal(t *testing.T) {
+	var queries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		queries = append(queries, string(body))
+	}))
+	defer server.Close()
+
+	err := (Processor{ClickHouse: chhttp.Client{URL: server.URL}}).optimizeFinal(context.Background(), manifest.Manifest{
+		Dest: manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "OPTIMIZE TABLE `db`.`query_log_archive_temp` FINAL"
+	if len(queries) != 1 || queries[0] != want {
+		t.Fatalf("queries = %#v, want %q", queries, want)
+	}
+}
+
+func TestShouldOptimizeFinal(t *testing.T) {
+	if (Processor{}).shouldOptimizeFinal(manifest.Manifest{}) {
+		t.Fatal("expected optimize final to be disabled by default")
+	}
+	if !(Processor{}).shouldOptimizeFinal(manifest.Manifest{Options: manifest.Options{OptimizeFinal: true}}) {
+		t.Fatal("expected manifest option to enable optimize final")
+	}
+	if !(Processor{ForceOptimizeFinal: true}).shouldOptimizeFinal(manifest.Manifest{}) {
+		t.Fatal("expected worker override to enable optimize final")
+	}
+}
+
 func TestWaitForMergesReturnsUnsettledAfterTimeout(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -176,6 +314,12 @@ func TestWaitForMergesUsesDefaultTimeout(t *testing.T) {
 	}
 	if result.Timeout != DefaultMergeTimeout {
 		t.Fatalf("timeout = %s, want %s", result.Timeout, DefaultMergeTimeout)
+	}
+}
+
+func TestDefaultMergeTimeout(t *testing.T) {
+	if DefaultMergeTimeout != 10*time.Minute {
+		t.Fatalf("DefaultMergeTimeout = %s, want 10m", DefaultMergeTimeout)
 	}
 }
 
@@ -481,4 +625,13 @@ func createFrozenPart(t *testing.T, path string) {
 	if err := os.WriteFile(filepath.Join(path, "data.bin"), []byte("data"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

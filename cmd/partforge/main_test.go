@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -240,6 +242,127 @@ func TestFormatStageDurations(t *testing.T) {
 	})
 	if got != "a=1.5s,b=2s" {
 		t.Fatalf("formatStageDurations = %q", got)
+	}
+}
+
+func TestFormatBytes(t *testing.T) {
+	tests := []struct {
+		bytes uint64
+		want  string
+	}{
+		{bytes: 0, want: "0 B"},
+		{bytes: 300, want: "300 B"},
+		{bytes: 1536, want: "1.5 KB"},
+		{bytes: 10 * 1024 * 1024, want: "10 MB"},
+		{bytes: 5*1024*1024*1024 + 512*1024*1024, want: "5.5 GB"},
+	}
+
+	for _, tt := range tests {
+		if got := formatBytes(tt.bytes); got != tt.want {
+			t.Fatalf("formatBytes(%d) = %q, want %q", tt.bytes, got, tt.want)
+		}
+	}
+}
+
+func TestFormatByteRate(t *testing.T) {
+	tests := []struct {
+		bytesPerSecond float64
+		want           string
+	}{
+		{bytesPerSecond: 0, want: "0 B/s"},
+		{bytesPerSecond: 1536, want: "1.5 KB/s"},
+		{bytesPerSecond: 10 * 1024 * 1024, want: "10 MB/s"},
+		{bytesPerSecond: 1.5 * 1024 * 1024 * 1024, want: "1.5 GB/s"},
+	}
+
+	for _, tt := range tests {
+		if got := formatByteRate(tt.bytesPerSecond); got != tt.want {
+			t.Fatalf("formatByteRate(%f) = %q, want %q", tt.bytesPerSecond, got, tt.want)
+		}
+	}
+}
+
+func TestHumanizeLogAttrHumanizesByteFields(t *testing.T) {
+	tests := []struct {
+		attr slog.Attr
+		want string
+	}{
+		{attr: slog.Uint64("uploaded_bytes", 10*1024*1024), want: "10 MB"},
+		{attr: slog.Float64("overall_bytes_per_second", 1.5*1024*1024), want: "1.5 MB/s"},
+		{attr: slog.String("max_memory_usage", "1073741824"), want: "1 GB"},
+		{attr: slog.Int("bytes", 1536), want: "1.5 KB"},
+	}
+
+	for _, tt := range tests {
+		got := humanizeLogAttr(nil, tt.attr)
+		if got.Value.String() != tt.want {
+			t.Fatalf("humanizeLogAttr(%s) = %q, want %q", tt.attr.Key, got.Value.String(), tt.want)
+		}
+	}
+}
+
+func TestHumanizeLogAttrLeavesOtherNumbersRaw(t *testing.T) {
+	got := humanizeLogAttr(nil, slog.Int("attempt", 7))
+	if got.Value.Kind() != slog.KindInt64 || got.Value.Int64() != 7 {
+		t.Fatalf("humanizeLogAttr changed non-byte number: %+v", got)
+	}
+}
+
+func TestPrintJobSummaryHumanizesBytes(t *testing.T) {
+	summary := jobSummary{
+		JobID:        "job-1",
+		Status:       "READY",
+		Total:        1,
+		Counts:       map[state.Status]int{state.StatusReady: 1},
+		ReadRows:     1000,
+		ReadBytes:    10 * 1024 * 1024,
+		WrittenRows:  900,
+		WrittenBytes: 3 * 1024 * 1024 * 1024,
+	}
+
+	got := captureFileOutput(t, func(out *os.File) {
+		printJobSummary(out, summary)
+	})
+
+	for _, want := range []string{
+		"read: 1000 rows 10 MB",
+		"written: 900 rows 3 GB",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("printJobSummary output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "10485760 bytes") || strings.Contains(got, "3221225472 bytes") {
+		t.Fatalf("printJobSummary output contains raw byte values:\n%s", got)
+	}
+}
+
+func TestPrintPartRowsHumanizesBytes(t *testing.T) {
+	got := captureFileOutput(t, func(out *os.File) {
+		printPartRows(out, []state.Part{
+			{
+				PartID:       "part-1",
+				Status:       state.StatusFinished,
+				ReadRows:     100,
+				ReadBytes:    1536,
+				WrittenRows:  90,
+				WrittenBytes: 2 * 1024 * 1024,
+			},
+		})
+	})
+
+	for _, want := range []string{
+		"READ_SIZE",
+		"WRITTEN_SIZE",
+		"1.5 KB",
+		"2 MB",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("printPartRows output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "READ_BYTES") || strings.Contains(got, "WRITTEN_BYTES") {
+		t.Fatalf("printPartRows output still uses raw byte headers:\n%s", got)
 	}
 }
 
@@ -587,4 +710,22 @@ func writeTestFile(t *testing.T, path, content string) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func captureFileOutput(t *testing.T, write func(*os.File)) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "output.txt")
+	out, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(out)
+	if err := out.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }

@@ -22,6 +22,7 @@ type Manifest struct {
 	Dest      TableRef   `json:"dest"`
 	Part      SourcePart `json:"part"`
 	SQL       SQLBundle  `json:"sql"`
+	Options   Options    `json:"options"`
 	S3        S3Refs     `json:"s3"`
 	CreatedAt time.Time  `json:"created_at"`
 }
@@ -49,6 +50,10 @@ type S3Refs struct {
 	FinishedKey string `json:"finished_key"`
 }
 
+type Options struct {
+	OptimizeFinal bool `json:"optimize_final"`
+}
+
 func (m Manifest) Validate() error {
 	if m.Version != Version {
 		return Error("unsupported manifest version")
@@ -73,11 +78,30 @@ type Error string
 func (e Error) Error() string { return string(e) }
 
 func DeriveJobID(database, table, freeze, sourceSchema, destinationSchema, insertSelect string) string {
-	return "job-" + shortHash(database, table, freeze, sourceSchema, destinationSchema, insertSelect)
+	return DeriveJobIDWithOptions(database, table, freeze, sourceSchema, destinationSchema, insertSelect, Options{})
+}
+
+func DeriveJobIDWithOptions(database, table, freeze, sourceSchema, destinationSchema, insertSelect string, options Options) string {
+	values := []string{database, table, freeze, sourceSchema, destinationSchema, insertSelect}
+	values = appendOptionHashFields(values, options)
+	return "job-" + shortHash(values...)
 }
 
 func DerivePartID(disk, relativePath, name, sourceSchema, destinationSchema, insertSelect string) string {
-	return "part-" + shortHash(disk, relativePath, name, sourceSchema, destinationSchema, insertSelect)
+	return DerivePartIDWithOptions(disk, relativePath, name, sourceSchema, destinationSchema, insertSelect, Options{})
+}
+
+func DerivePartIDWithOptions(disk, relativePath, name, sourceSchema, destinationSchema, insertSelect string, options Options) string {
+	values := []string{disk, relativePath, name, sourceSchema, destinationSchema, insertSelect}
+	values = appendOptionHashFields(values, options)
+	return "part-" + shortHash(values...)
+}
+
+func appendOptionHashFields(values []string, options Options) []string {
+	if options.OptimizeFinal {
+		values = append(values, "optimize_final=true")
+	}
+	return values
 }
 
 func SourcePartPrefix(prefix, jobID, partID string) string {
