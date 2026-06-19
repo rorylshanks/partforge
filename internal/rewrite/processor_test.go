@@ -324,7 +324,7 @@ func TestWaitForMergesReturnsUnsettledAfterTimeout(t *testing.T) {
 		ClickHouse:       chhttp.Client{URL: server.URL},
 		MergeTimeout:     timeout,
 		MergeHardTimeout: timeout,
-	}).waitForMerges(context.Background(), "db", "query_log_archive_temp")
+	}).waitForMerges(context.Background(), testMergeWaitTarget())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,7 +365,7 @@ func TestWaitForMergesUsesDefaultTimeout(t *testing.T) {
 
 	result, err := (Processor{
 		ClickHouse: chhttp.Client{URL: server.URL},
-	}).waitForMerges(context.Background(), "db", "query_log_archive_temp")
+	}).waitForMerges(context.Background(), testMergeWaitTarget())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +403,7 @@ func TestWaitForMergesSettlesLargeTailParts(t *testing.T) {
 
 	result, err := (Processor{
 		ClickHouse: chhttp.Client{URL: server.URL},
-	}).waitForMerges(context.Background(), "db", "query_log_archive_temp")
+	}).waitForMerges(context.Background(), testMergeWaitTarget())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,7 +464,7 @@ func TestWaitForMergesExtendsBaseTimeoutForActiveSmallDebtMerges(t *testing.T) {
 		MergeTimeout:      baseTimeout,
 		MergeHardTimeout:  hardTimeout,
 		MergePollInterval: time.Millisecond,
-	}).waitForMerges(context.Background(), "db", "query_log_archive_temp")
+	}).waitForMerges(context.Background(), testMergeWaitTarget())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -513,7 +513,7 @@ func TestWaitForMergesKeepsWaitingWhenZeroMergesAndManyActiveParts(t *testing.T)
 		ClickHouse:          chhttp.Client{URL: server.URL},
 		MergeSettleMinWait:  time.Hour,
 		MergeSettleMinParts: 3,
-	}).waitForMerges(ctx, "db", "query_log_archive_temp")
+	}).waitForMerges(ctx, testMergeWaitTarget())
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waitForMerges error = %v, want context deadline exceeded", err)
 	}
@@ -563,7 +563,7 @@ func TestWaitForMergesResetsIdleWindowWhenActivePartCountChanges(t *testing.T) {
 		MergeSettleMinWait:  10 * time.Millisecond,
 		MergeSettleMinParts: 1,
 		MergePollInterval:   time.Millisecond,
-	}).waitForMerges(ctx, "db", "query_log_archive_temp")
+	}).waitForMerges(ctx, testMergeWaitTarget())
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waitForMerges error = %v, want context deadline exceeded", err)
 	}
@@ -575,12 +575,55 @@ func TestWaitForMergesResetsIdleWindowWhenActivePartCountChanges(t *testing.T) {
 	}
 }
 
+func TestDestinationMergeCountFiltersToTargetTable(t *testing.T) {
+	var mergeQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		mergeQuery = string(body)
+		_, _ = w.Write([]byte("0\n"))
+	}))
+	defer server.Close()
+
+	count, err := (Processor{
+		ClickHouse: chhttp.Client{URL: server.URL},
+	}).destinationMergeCount(context.Background(), testMergeWaitTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("merge count = %d, want 0", count)
+	}
+	for _, want := range []string{
+		"FROM system.merges",
+		"database = 'db'",
+		"table = 'query_log_archive_temp'",
+	} {
+		if !strings.Contains(mergeQuery, want) {
+			t.Fatalf("merge query = %q, missing %q", mergeQuery, want)
+		}
+	}
+}
+
 func smallDebtMergeSnapshot() string {
 	return "4\t1073741824\t4\t1073741824\t268435456\n"
 }
 
 func largeTailMergeSnapshot() string {
 	return "2\t10737418240\t0\t0\t5368709120\n"
+}
+
+func testMergeWaitTarget() mergeWaitTarget {
+	return mergeWaitTarget{
+		JobID:    "job-1",
+		PartID:   "part-1",
+		Database: "db",
+		Table:    "query_log_archive_temp",
+	}
 }
 
 func TestDefaultMergeTimeout(t *testing.T) {

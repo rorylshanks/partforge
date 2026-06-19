@@ -32,6 +32,7 @@ const DefaultMergeSmallPartBytes uint64 = 1024 * 1024 * 1024
 const DefaultMergeSmallPartMaxCount uint64 = 2
 const DefaultMergeSmallPartMaxPercent uint64 = 5
 const defaultMergePollInterval = time.Second
+const defaultMergeWaitLogInterval = 30 * time.Second
 
 const (
 	stageProcessPart             = "process_part"
@@ -477,7 +478,12 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 		return rewriteResult{}, err
 	}
 	slog.Info("waiting for destination merges", "stage", "wait_merges", "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table))
-	mergeWait, err := p.waitForMerges(ctx, m.Dest.Database, m.Dest.Table)
+	mergeWait, err := p.waitForMerges(ctx, mergeWaitTarget{
+		JobID:    m.JobID,
+		PartID:   m.PartID,
+		Database: m.Dest.Database,
+		Table:    m.Dest.Table,
+	})
 	if err != nil {
 		return rewriteResult{}, err
 	}
@@ -487,6 +493,7 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 			"stage", "wait_merges",
 			"job_id", m.JobID,
 			"part_id", m.PartID,
+			"settle_reason", mergeWait.Reason,
 			"active_parts", mergeWait.ActiveParts,
 			"small_parts", mergeWait.SmallParts,
 			"small_part_bytes", mergeWait.SmallPartBytes,
@@ -501,6 +508,7 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 			"stage", "wait_merges",
 			"job_id", m.JobID,
 			"part_id", m.PartID,
+			"wait_reason", mergeWait.Reason,
 			"timeout", mergeWait.Timeout,
 			"hard_timeout", mergeWait.HardTimeout,
 			"active_merges", mergeWait.ActiveMerges,
@@ -1160,6 +1168,7 @@ func parseQueryProgress(out string) (metrics.QueryProgress, bool, error) {
 
 type mergeWaitResult struct {
 	Settled          bool
+	Reason           string
 	ActiveMerges     uint64
 	ActiveParts      uint64
 	SmallParts       uint64
@@ -1172,7 +1181,23 @@ type mergeWaitResult struct {
 	HardTimeout      time.Duration
 }
 
-func (p Processor) waitForMerges(ctx context.Context, database, table string) (mergeWaitResult, error) {
+type mergeWaitTarget struct {
+	JobID    string
+	PartID   string
+	Database string
+	Table    string
+}
+
+func (t mergeWaitTarget) tableSQL() string {
+	return chhttp.TableSQL(t.Database, t.Table)
+}
+
+type mergeWaitLogState struct {
+	lastAt     time.Time
+	lastReason string
+}
+
+func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (mergeWaitResult, error) {
 	timeout := p.MergeTimeout
 	if timeout == 0 {
 		timeout = DefaultMergeTimeout
@@ -1223,24 +1248,19 @@ func (p Processor) waitForMerges(ctx context.Context, database, table string) (m
 	startedAt := time.Now()
 	baseDeadline := startedAt.Add(timeout)
 	hardDeadline := startedAt.Add(hardTimeout)
-	mergeQuery := "SELECT count() FROM system.merges WHERE database = " +
-		chhttp.StringLiteral(database) + " AND table = " + chhttp.StringLiteral(table) + " FORMAT TSV"
 	var zeroMergesStableSnapshotSince time.Time
 	var zeroMergesSnapshot mergePartSnapshot
 	var previousSnapshot mergePartSnapshot
 	var havePreviousSnapshot bool
 	lastProgressAt := startedAt
+	logState := mergeWaitLogState{}
 	for {
-		out, err := p.ClickHouse.QueryString(ctx, mergeQuery)
-		if err != nil {
-			return mergeWaitResult{}, err
-		}
-		count, err := chhttp.ParseUInt(out)
+		count, err := p.destinationMergeCount(ctx, target)
 		if err != nil {
 			return mergeWaitResult{}, err
 		}
 		now := time.Now()
-		snapshot, err := p.mergePartSnapshot(ctx, database, table, smallPartBytes)
+		snapshot, err := p.mergePartSnapshot(ctx, target, smallPartBytes)
 		if err != nil {
 			return mergeWaitResult{}, err
 		}
@@ -1256,10 +1276,19 @@ func (p Processor) waitForMerges(ctx context.Context, database, table string) (m
 		previousSnapshot = snapshot
 		noProgressIdle := now.Sub(lastProgressAt)
 
+		zeroMergesIdle := time.Duration(0)
+		reason := "active_destination_merges"
 		if count == 0 {
 			if snapshot.ActiveParts <= minParts || !debt {
+				reason = "active_parts_settled"
+				if debt {
+					reason = "one_or_fewer_active_parts"
+				} else {
+					reason = "no_small_part_debt"
+				}
 				return mergeWaitResult{
 					Settled:          true,
+					Reason:           reason,
 					ActiveParts:      snapshot.ActiveParts,
 					SmallParts:       snapshot.SmallParts,
 					SmallPartBytes:   snapshot.SmallPartBytes,
@@ -1274,10 +1303,11 @@ func (p Processor) waitForMerges(ctx context.Context, database, table string) (m
 				zeroMergesStableSnapshotSince = now
 				zeroMergesSnapshot = snapshot
 			}
-			zeroMergesIdle := now.Sub(zeroMergesStableSnapshotSince)
+			zeroMergesIdle = now.Sub(zeroMergesStableSnapshotSince)
 			if zeroMergesIdle >= minWait {
 				return mergeWaitResult{
 					Settled:          true,
+					Reason:           "destination_merges_idle",
 					ActiveParts:      snapshot.ActiveParts,
 					SmallParts:       snapshot.SmallParts,
 					SmallPartBytes:   snapshot.SmallPartBytes,
@@ -1291,6 +1321,7 @@ func (p Processor) waitForMerges(ctx context.Context, database, table string) (m
 			}
 			if !now.Before(hardDeadline) {
 				return mergeWaitResult{
+					Reason:           "hard_timeout_no_destination_merges",
 					ActiveParts:      snapshot.ActiveParts,
 					SmallParts:       snapshot.SmallParts,
 					SmallPartBytes:   snapshot.SmallPartBytes,
@@ -1302,12 +1333,14 @@ func (p Processor) waitForMerges(ctx context.Context, database, table string) (m
 					HardTimeout:      hardTimeout,
 				}, nil
 			}
+			reason = "waiting_for_destination_merge_selection"
 		} else {
 			zeroMergesStableSnapshotSince = time.Time{}
 			zeroMergesSnapshot = mergePartSnapshot{}
 		}
 		if !now.Before(hardDeadline) {
 			return mergeWaitResult{
+				Reason:           "hard_timeout",
 				ActiveMerges:     count,
 				ActiveParts:      snapshot.ActiveParts,
 				SmallParts:       snapshot.SmallParts,
@@ -1321,6 +1354,7 @@ func (p Processor) waitForMerges(ctx context.Context, database, table string) (m
 		}
 		if !now.Before(baseDeadline) && !shouldExtendMergeWait(count, debt, noProgressIdle, minWait) {
 			return mergeWaitResult{
+				Reason:           "base_timeout_no_useful_destination_merge_progress",
 				ActiveMerges:     count,
 				ActiveParts:      snapshot.ActiveParts,
 				SmallParts:       snapshot.SmallParts,
@@ -1333,6 +1367,27 @@ func (p Processor) waitForMerges(ctx context.Context, database, table string) (m
 			}, nil
 		}
 		sleep := mergeWaitSleepDuration(now, pollInterval, baseDeadline, hardDeadline)
+		if !now.Before(baseDeadline) {
+			reason = "extending_base_timeout_for_small_part_debt"
+		}
+		logState.maybeLog(
+			now,
+			target,
+			reason,
+			count,
+			snapshot,
+			debt,
+			progress,
+			zeroMergesIdle,
+			noProgressIdle,
+			timeout,
+			hardTimeout,
+			minWait,
+			startedAt,
+			baseDeadline,
+			hardDeadline,
+			sleep,
+		)
 		select {
 		case <-ctx.Done():
 			return mergeWaitResult{}, ctx.Err()
@@ -1349,10 +1404,75 @@ type mergePartSnapshot struct {
 	LargestPartBytes uint64
 }
 
-func (p Processor) mergePartSnapshot(ctx context.Context, database, table string, smallPartBytes uint64) (mergePartSnapshot, error) {
+func (p Processor) destinationMergeCount(ctx context.Context, target mergeWaitTarget) (uint64, error) {
+	query := "SELECT count() FROM system.merges WHERE database = " +
+		chhttp.StringLiteral(target.Database) + " AND table = " + chhttp.StringLiteral(target.Table) + " FORMAT TSV"
+	out, err := p.ClickHouse.QueryString(ctx, query)
+	if err != nil {
+		return 0, err
+	}
+	count, err := chhttp.ParseUInt(out)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *mergeWaitLogState) maybeLog(
+	now time.Time,
+	target mergeWaitTarget,
+	reason string,
+	activeMerges uint64,
+	snapshot mergePartSnapshot,
+	hasDebt bool,
+	progress bool,
+	zeroMergesIdle time.Duration,
+	noProgressIdle time.Duration,
+	timeout time.Duration,
+	hardTimeout time.Duration,
+	minWait time.Duration,
+	startedAt time.Time,
+	baseDeadline time.Time,
+	hardDeadline time.Time,
+	nextPollIn time.Duration,
+) {
+	if !s.lastAt.IsZero() && reason == s.lastReason && now.Sub(s.lastAt) < defaultMergeWaitLogInterval {
+		return
+	}
+	s.lastAt = now
+	s.lastReason = reason
+	slog.Info(
+		"destination merge wait state",
+		"stage", stageWaitMerges,
+		"job_id", target.JobID,
+		"part_id", target.PartID,
+		"destination_table", target.tableSQL(),
+		"merge_scope", "destination_table",
+		"wait_reason", reason,
+		"elapsed", nonNegativeDuration(now.Sub(startedAt)),
+		"timeout", timeout,
+		"hard_timeout", hardTimeout,
+		"base_timeout_remaining", nonNegativeDuration(baseDeadline.Sub(now)),
+		"hard_timeout_remaining", nonNegativeDuration(hardDeadline.Sub(now)),
+		"active_destination_merges", activeMerges,
+		"active_parts", snapshot.ActiveParts,
+		"small_parts", snapshot.SmallParts,
+		"small_part_bytes", snapshot.SmallPartBytes,
+		"total_bytes", snapshot.TotalBytes,
+		"largest_part_bytes", snapshot.LargestPartBytes,
+		"has_small_part_debt", hasDebt,
+		"progress_observed", progress,
+		"zero_merges_idle", zeroMergesIdle,
+		"zero_merges_required", minWait,
+		"no_progress_idle", noProgressIdle,
+		"next_poll_in", nextPollIn,
+	)
+}
+
+func (p Processor) mergePartSnapshot(ctx context.Context, target mergeWaitTarget, smallPartBytes uint64) (mergePartSnapshot, error) {
 	query := "SELECT count(), ifNull(sum(bytes_on_disk), 0), countIf(bytes_on_disk < " + strconv.FormatUint(smallPartBytes, 10) + "), " +
 		"ifNull(sumIf(bytes_on_disk, bytes_on_disk < " + strconv.FormatUint(smallPartBytes, 10) + "), 0), ifNull(max(bytes_on_disk), 0) FROM system.parts WHERE database = " +
-		chhttp.StringLiteral(database) + " AND table = " + chhttp.StringLiteral(table) +
+		chhttp.StringLiteral(target.Database) + " AND table = " + chhttp.StringLiteral(target.Table) +
 		" AND active FORMAT TSV"
 	out, err := p.ClickHouse.QueryString(ctx, query)
 	if err != nil {
