@@ -82,20 +82,24 @@ func TestImportArtifactDownloadsFinishedTarballs(t *testing.T) {
 	if err := os.Mkdir(detachedPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	owner, err := ownerFromPath(detachedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	artifact := FinishedArtifact{
 		Bucket: "bucket",
 		Key:    "partforge/jobs/job-1/finished/part-1",
 		PartID: "part-1",
 	}
 
-	err := (Importer{
+	err = (Importer{
 		S3Copy:     s3copy.Copier{Binary: binary},
 		ClickHouse: chhttp.Client{URL: server.URL},
 	}).importArtifact(context.Background(), ImportJob{
 		JobID:    "job-1",
 		Database: "db",
 		Table:    "dst",
-	}, artifact, detachedPath, filepath.Join(root, "work"))
+	}, artifact, detachedPath, filepath.Join(root, "work"), owner)
 	if err != nil {
 		t.Fatal(err)
 	}

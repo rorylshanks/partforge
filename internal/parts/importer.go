@@ -62,10 +62,17 @@ func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 	if err != nil {
 		return err
 	}
-	slog.Info("located destination table data path", "stage", "prepare_destination", "job_id", job.JobID, "data_path", dataPath)
+	owner, err := ownerFromPath(dataPath)
+	if err != nil {
+		return fmt.Errorf("stat destination table owner %s: %w", dataPath, err)
+	}
+	slog.Info("located destination table data path", "stage", "prepare_destination", "job_id", job.JobID, "data_path", dataPath, "owner_uid", owner.uid, "owner_gid", owner.gid)
 	detachedPath := filepath.Join(dataPath, "detached")
 	if err := os.MkdirAll(detachedPath, 0o755); err != nil {
 		return err
+	}
+	if err := chownPathIfNeeded(detachedPath, owner); err != nil {
+		return fmt.Errorf("set detached directory ownership %s: %w", detachedPath, err)
 	}
 	if job.RequireEmpty {
 		slog.Info("checking destination table is empty", "stage", "prepare_destination", "job_id", job.JobID, "destination_table", chhttp.TableSQL(job.Database, job.Table))
@@ -115,7 +122,7 @@ func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 				return err
 			}
 		}
-		if err := i.importArtifact(ctx, job, artifact, detachedPath, filepath.Join(root, fmt.Sprintf("%06d", idx))); err != nil {
+		if err := i.importArtifact(ctx, job, artifact, detachedPath, filepath.Join(root, fmt.Sprintf("%06d", idx)), owner); err != nil {
 			if job.MarkImportFailed != nil {
 				if markErr := job.MarkImportFailed(ctx, artifact, err); markErr != nil {
 					return fmt.Errorf("import artifact s3://%s/%s: %w; additionally failed to mark import failed: %v", artifact.Bucket, artifact.Key, err, markErr)
@@ -144,7 +151,7 @@ func (i Importer) ImportJob(ctx context.Context, job ImportJob) error {
 	return nil
 }
 
-func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact FinishedArtifact, detachedPath, workDir string) error {
+func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact FinishedArtifact, detachedPath, workDir string, owner pathOwner) error {
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		return err
 	}
@@ -180,6 +187,9 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact Fi
 		}
 		if err := fileutil.MoveDir(src, dst); err != nil {
 			return fmt.Errorf("move finished part %s into detached directory: %w", partName, err)
+		}
+		if err := chownTree(dst, owner); err != nil {
+			return fmt.Errorf("set ownership on finished part %s to %d:%d: %w", partName, owner.uid, owner.gid, err)
 		}
 		partStats, err := fileutil.StatDir(dst)
 		if err != nil {
@@ -256,6 +266,50 @@ func (i Importer) tableDataPath(ctx context.Context, database, table string) (st
 		return "", fmt.Errorf("could not find data path for %s", chhttp.TableSQL(database, table))
 	}
 	return path, nil
+}
+
+type pathOwner struct {
+	uid int
+	gid int
+}
+
+func ownerFromPath(path string) (pathOwner, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return pathOwner{}, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return pathOwner{}, fmt.Errorf("stat %s did not return syscall.Stat_t", path)
+	}
+	return pathOwner{uid: int(stat.Uid), gid: int(stat.Gid)}, nil
+}
+
+func chownTree(root string, owner pathOwner) error {
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		return chownPathIfNeeded(path, owner)
+	})
+}
+
+func chownPathIfNeeded(path string, owner pathOwner) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("stat %s did not return syscall.Stat_t", path)
+	}
+	if int(stat.Uid) == owner.uid && int(stat.Gid) == owner.gid {
+		return nil
+	}
+	if err := os.Lchown(path, owner.uid, owner.gid); err != nil {
+		return fmt.Errorf("chown %s: %w", path, err)
+	}
+	return nil
 }
 
 func (i Importer) activePartCount(ctx context.Context, database, table string) (uint64, error) {
