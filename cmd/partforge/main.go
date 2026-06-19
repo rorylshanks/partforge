@@ -784,7 +784,9 @@ func runWorker(ctx context.Context, args []string) error {
 			defer func() {
 				if server != nil {
 					slog.Info("stopping local ClickHouse server", "stage", "stop_clickhouse", "job_id", part.JobID, "part_id", part.PartID)
-					server.Stop()
+					if err := server.Stop(); err != nil {
+						slog.Warn("failed to stop local ClickHouse server", "stage", "stop_clickhouse", "job_id", part.JobID, "part_id", part.PartID, "error", err)
+					}
 				}
 				if err := os.RemoveAll(runDirs.Root); err != nil {
 					slog.Warn("failed to remove worker run directory", "run_dir", runDirs.Root, "job_id", part.JobID, "part_id", part.PartID, "error", err)
@@ -830,7 +832,9 @@ func runWorker(ctx context.Context, args []string) error {
 					return errors.New("local ClickHouse server is not running")
 				}
 				slog.Info("stopping local ClickHouse server for restart", "stage", "restart_clickhouse", "job_id", part.JobID, "part_id", part.PartID)
-				server.Stop()
+				if err := server.Stop(); err != nil {
+					return fmt.Errorf("stop clickhouse before restart: %w", err)
+				}
 				server = nil
 				slog.Info("starting local ClickHouse server after restart", "stage", "restart_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", part.JobID, "part_id", part.PartID, "background_pool_size", mergeBackgroundPoolSize)
 				restarted, err := startServer(ctx, chproc.Tuning{BackgroundPoolSize: mergeBackgroundPoolSize})

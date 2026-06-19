@@ -1,11 +1,16 @@
 package chproc
 
 import (
+	"bufio"
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -137,4 +142,83 @@ func TestClickHouseErrorLogLinePrefersErrorLine(t *testing.T) {
 	if got != want {
 		t.Fatalf("clickHouseErrorLogLine = %q, want %q", got, want)
 	}
+}
+
+func TestPIDFileUnlockedReportsFcntlLockedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "clickhouse-server.pid")
+	if err := os.WriteFile(path, []byte("123\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestPIDFileLockHelper", "--", path)
+	cmd.Env = append(os.Environ(), "PARTFORGE_PID_LOCK_HELPER=1")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+		_ = cmd.Wait()
+	})
+
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(line) != "locked" {
+		t.Fatalf("helper output = %q, want locked", line)
+	}
+
+	unlocked, err := pidFileUnlocked(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unlocked {
+		t.Fatal("pidFileUnlocked = true, want false while another process holds the lock")
+	}
+
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	unlocked, err = pidFileUnlocked(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unlocked {
+		t.Fatal("pidFileUnlocked = false, want true after helper exits")
+	}
+}
+
+func TestPIDFileLockHelper(t *testing.T) {
+	if os.Getenv("PARTFORGE_PID_LOCK_HELPER") != "1" {
+		return
+	}
+	path := os.Args[len(os.Args)-1]
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	defer file.Close()
+	lock := syscall.Flock_t{Type: syscall.F_WRLCK}
+	if err := syscall.FcntlFlock(file.Fd(), syscall.F_SETLK, &lock); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	fmt.Println("locked")
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGTERM)
+	<-signals
+	lock.Type = syscall.F_UNLCK
+	if err := syscall.FcntlFlock(file.Fd(), syscall.F_SETLK, &lock); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	os.Exit(0)
 }

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/partforge/partforge/internal/chhttp"
@@ -32,16 +33,21 @@ type Tuning struct {
 }
 
 type Server struct {
-	cmd      *exec.Cmd
-	done     chan error
-	stopOnce sync.Once
+	cmd         *exec.Cmd
+	done        chan error
+	pidFilePath string
+	stopErr     error
+	stopOnce    sync.Once
 }
+
+const clickHouseStopTimeout = 30 * time.Second
 
 func Start(ctx context.Context, cfg Config) (*Server, error) {
 	if cfg.Binary == "" {
 		return nil, fmt.Errorf("clickhouse binary is empty")
 	}
 	errorLogPath := cfg.errorLogPath()
+	pidFilePath := cfg.pidFilePath()
 	args, err := cfg.args()
 	if err != nil {
 		return nil, err
@@ -53,7 +59,7 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start clickhouse server: %w", err)
 	}
-	server := &Server{cmd: cmd, done: make(chan error, 1)}
+	server := &Server{cmd: cmd, done: make(chan error, 1), pidFilePath: pidFilePath}
 	go func() {
 		server.done <- cmd.Wait()
 	}()
@@ -70,7 +76,7 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 			return server, nil
 		}
 		if time.Now().After(deadline) {
-			server.Stop()
+			_ = server.Stop()
 			return nil, clickHouseStartError(fmt.Sprintf("clickhouse did not become ready within %s", timeout), nil, errorLogPath)
 		}
 		select {
@@ -80,7 +86,7 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 			}
 			return nil, clickHouseStartError("clickhouse server exited before becoming ready", err, errorLogPath)
 		case <-ctx.Done():
-			server.Stop()
+			_ = server.Stop()
 			return nil, ctx.Err()
 		case <-time.After(500 * time.Millisecond):
 		}
@@ -126,6 +132,17 @@ func (cfg Config) errorLogPath() string {
 		return ""
 	}
 	return filepath.Join(filepath.Clean(root), "logs", "clickhouse-server.err.log")
+}
+
+func (cfg Config) pidFilePath() string {
+	if strings.TrimSpace(cfg.DataDir) == "" {
+		return ""
+	}
+	root, err := filepath.Abs(cfg.DataDir)
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(filepath.Clean(root), "clickhouse-server.pid")
 }
 
 func clickHouseStartError(message string, cause error, errorLogPath string) error {
@@ -237,16 +254,86 @@ func withTrailingSeparator(path string) string {
 	return clean + string(filepath.Separator)
 }
 
-func (s *Server) Stop() {
+func (s *Server) Stop() error {
 	if s == nil || s.cmd == nil || s.cmd.Process == nil {
-		return
+		return nil
 	}
 	s.stopOnce.Do(func() {
-		_ = s.cmd.Process.Kill()
-		select {
-		case <-s.done:
-		case <-time.After(30 * time.Second):
-			slog.Warn("timed out waiting for killed clickhouse process")
-		}
+		s.stopErr = s.stop()
 	})
+	return s.stopErr
+}
+
+func (s *Server) stop() error {
+	signalErr := s.cmd.Process.Signal(syscall.SIGTERM)
+	if signalErr != nil && !errors.Is(signalErr, os.ErrProcessDone) {
+		return fmt.Errorf("send SIGTERM to clickhouse process: %w", signalErr)
+	}
+
+	select {
+	case err := <-s.done:
+		if err != nil && !processTerminatedBy(err, syscall.SIGTERM) {
+			return fmt.Errorf("wait for clickhouse process after SIGTERM: %w", err)
+		}
+	case <-time.After(clickHouseStopTimeout):
+		return fmt.Errorf("clickhouse process did not exit within %s after SIGTERM", clickHouseStopTimeout)
+	}
+
+	if err := waitForPIDFileUnlock(s.pidFilePath, clickHouseStopTimeout); err != nil {
+		return err
+	}
+	return nil
+}
+
+func processTerminatedBy(err error, signal syscall.Signal) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	return ok && status.Signaled() && status.Signal() == signal
+}
+
+func waitForPIDFileUnlock(path string, timeout time.Duration) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		unlocked, err := pidFileUnlocked(path)
+		if err != nil {
+			return err
+		}
+		if unlocked {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("clickhouse pid file %s remained locked after %s", path, timeout)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func pidFileUnlocked(path string) (bool, error) {
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("open clickhouse pid file %s: %w", path, err)
+	}
+	defer file.Close()
+
+	lock := syscall.Flock_t{Type: syscall.F_WRLCK, Whence: int16(io.SeekStart)}
+	if err := syscall.FcntlFlock(file.Fd(), syscall.F_SETLK, &lock); err != nil {
+		if err == syscall.EACCES || err == syscall.EAGAIN {
+			return false, nil
+		}
+		return false, fmt.Errorf("lock clickhouse pid file %s: %w", path, err)
+	}
+	lock.Type = syscall.F_UNLCK
+	if err := syscall.FcntlFlock(file.Fd(), syscall.F_SETLK, &lock); err != nil {
+		return false, fmt.Errorf("unlock clickhouse pid file %s: %w", path, err)
+	}
+	return true, nil
 }
