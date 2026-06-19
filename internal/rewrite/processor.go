@@ -34,7 +34,7 @@ const DefaultMergeIdleOptimizeFinalMaxBytes uint64 = 50 * 1024 * 1024 * 1024
 const DefaultOptimizeFinalMaxAttempts uint64 = 10
 const defaultMergePollInterval = time.Second
 const defaultMergeWaitLogInterval = 30 * time.Second
-const defaultOptimizeFinalRetryMaxBackoff = 10 * time.Second
+const defaultOptimizeFinalRetryMaxBackoff = 10 * time.Minute
 
 const (
 	autoMergeTargetPartCount             uint64 = 4
@@ -899,12 +899,12 @@ func (p Processor) optimizeFinalBackoff(attempt uint64) time.Duration {
 
 func optimizeFinalRetryBackoff(attempt uint64) time.Duration {
 	if attempt < 1 {
-		return time.Second
+		return time.Minute
 	}
-	if attempt >= 5 {
+	if attempt >= 10 {
 		return defaultOptimizeFinalRetryMaxBackoff
 	}
-	return time.Second << (attempt - 1)
+	return time.Duration(attempt) * time.Minute
 }
 
 func (p Processor) runInsertSelect(ctx context.Context, m manifest.Manifest, attempt int, settings chhttp.QuerySettings) error {
