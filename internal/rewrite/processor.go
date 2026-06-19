@@ -27,6 +27,7 @@ import (
 const DefaultMergeTimeout = 10 * time.Minute
 const DefaultMergeSettleMinWait = 2 * time.Minute
 const DefaultMergeSettleMinParts uint64 = 1
+const defaultMergePollInterval = time.Second
 
 const (
 	stageProcessPart             = "process_part"
@@ -85,6 +86,7 @@ type Processor struct {
 	MergeTreeSettings   MergeTreeSettings
 	MergeSettleMinWait  time.Duration
 	MergeSettleMinParts uint64
+	MergePollInterval   time.Duration
 	RestartClickHouse   func(context.Context) error
 	ForceOptimizeFinal  bool
 }
@@ -462,7 +464,14 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 		return rewriteResult{}, err
 	}
 	if mergeWait.Settled {
-		slog.Info("destination merges complete", "stage", "wait_merges", "job_id", m.JobID, "part_id", m.PartID)
+		slog.Info(
+			"destination merges complete",
+			"stage", "wait_merges",
+			"job_id", m.JobID,
+			"part_id", m.PartID,
+			"active_parts", mergeWait.ActiveParts,
+			"zero_merges_idle", mergeWait.ZeroMergesIdle,
+		)
 	} else {
 		slog.Warn(
 			"destination merges did not settle before timeout; freezing current destination parts",
@@ -472,6 +481,7 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 			"timeout", mergeWait.Timeout,
 			"active_merges", mergeWait.ActiveMerges,
 			"active_parts", mergeWait.ActiveParts,
+			"zero_merges_idle", mergeWait.ZeroMergesIdle,
 		)
 	}
 	if err := p.reportStageProgress(ctx, m, stageTracker, stageMeasureDestinationParts); err != nil {
@@ -1095,10 +1105,11 @@ func parseQueryProgress(out string) (metrics.QueryProgress, bool, error) {
 }
 
 type mergeWaitResult struct {
-	Settled      bool
-	ActiveMerges uint64
-	ActiveParts  uint64
-	Timeout      time.Duration
+	Settled        bool
+	ActiveMerges   uint64
+	ActiveParts    uint64
+	ZeroMergesIdle time.Duration
+	Timeout        time.Duration
 }
 
 func (p Processor) waitForMerges(ctx context.Context, database, table string) (mergeWaitResult, error) {
@@ -1117,10 +1128,18 @@ func (p Processor) waitForMerges(ctx context.Context, database, table string) (m
 	if minParts == 0 {
 		minParts = DefaultMergeSettleMinParts
 	}
+	pollInterval := p.MergePollInterval
+	if pollInterval == 0 {
+		pollInterval = defaultMergePollInterval
+	}
+	if pollInterval < 0 {
+		return mergeWaitResult{}, fmt.Errorf("merge poll interval must be non-negative, got %s", pollInterval)
+	}
 	deadline := time.Now().Add(timeout)
 	mergeQuery := "SELECT count() FROM system.merges WHERE database = " +
 		chhttp.StringLiteral(database) + " AND table = " + chhttp.StringLiteral(table) + " FORMAT TSV"
-	var zeroMergesWithManyPartsSince time.Time
+	var zeroMergesStablePartsSince time.Time
+	var zeroMergesActiveParts uint64
 	for {
 		out, err := p.ClickHouse.QueryString(ctx, mergeQuery)
 		if err != nil {
@@ -1139,17 +1158,20 @@ func (p Processor) waitForMerges(ctx context.Context, database, table string) (m
 			if activeParts <= minParts {
 				return mergeWaitResult{Settled: true, ActiveParts: activeParts, Timeout: timeout}, nil
 			}
-			if zeroMergesWithManyPartsSince.IsZero() {
-				zeroMergesWithManyPartsSince = now
+			if zeroMergesStablePartsSince.IsZero() || activeParts != zeroMergesActiveParts {
+				zeroMergesStablePartsSince = now
+				zeroMergesActiveParts = activeParts
 			}
-			if now.Sub(zeroMergesWithManyPartsSince) >= minWait {
-				return mergeWaitResult{Settled: true, ActiveParts: activeParts, Timeout: timeout}, nil
+			zeroMergesIdle := now.Sub(zeroMergesStablePartsSince)
+			if zeroMergesIdle >= minWait {
+				return mergeWaitResult{Settled: true, ActiveParts: activeParts, ZeroMergesIdle: zeroMergesIdle, Timeout: timeout}, nil
 			}
 			if now.After(deadline) {
-				return mergeWaitResult{ActiveParts: activeParts, Timeout: timeout}, nil
+				return mergeWaitResult{ActiveParts: activeParts, ZeroMergesIdle: zeroMergesIdle, Timeout: timeout}, nil
 			}
 		} else {
-			zeroMergesWithManyPartsSince = time.Time{}
+			zeroMergesStablePartsSince = time.Time{}
+			zeroMergesActiveParts = 0
 		}
 		if now.After(deadline) {
 			return mergeWaitResult{ActiveMerges: count, Timeout: timeout}, nil
@@ -1157,7 +1179,7 @@ func (p Processor) waitForMerges(ctx context.Context, database, table string) (m
 		select {
 		case <-ctx.Done():
 			return mergeWaitResult{}, ctx.Err()
-		case <-time.After(time.Second):
+		case <-time.After(pollInterval):
 		}
 	}
 }

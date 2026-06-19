@@ -362,6 +362,51 @@ func TestWaitForMergesKeepsWaitingWhenZeroMergesAndManyActiveParts(t *testing.T)
 	}
 }
 
+func TestWaitForMergesResetsIdleWindowWhenActivePartCountChanges(t *testing.T) {
+	var mergeRequests int
+	var partRequests int
+	activeParts := []string{"4\n", "3\n", "4\n", "3\n"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case strings.Contains(query, "system.merges"):
+			mergeRequests++
+			_, _ = w.Write([]byte("0\n"))
+		case strings.Contains(query, "system.parts"):
+			partRequests++
+			_, _ = w.Write([]byte(activeParts[partRequests%len(activeParts)]))
+		default:
+			t.Errorf("unexpected query: %s", query)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	_, err := (Processor{
+		ClickHouse:          chhttp.Client{URL: server.URL},
+		MergeSettleMinWait:  10 * time.Millisecond,
+		MergeSettleMinParts: 1,
+		MergePollInterval:   time.Millisecond,
+	}).waitForMerges(ctx, "db", "query_log_archive_temp")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForMerges error = %v, want context deadline exceeded", err)
+	}
+	if mergeRequests < 2 {
+		t.Fatalf("merge requests = %d, want at least 2", mergeRequests)
+	}
+	if partRequests < 2 {
+		t.Fatalf("part requests = %d, want at least 2", partRequests)
+	}
+}
+
 func TestDefaultMergeTimeout(t *testing.T) {
 	if DefaultMergeTimeout != 10*time.Minute {
 		t.Fatalf("DefaultMergeTimeout = %s, want 10m", DefaultMergeTimeout)
