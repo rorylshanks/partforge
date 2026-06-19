@@ -369,8 +369,8 @@ func TestDefaultMergeTimeout(t *testing.T) {
 	if DefaultMergeSettleMinWait != 2*time.Minute {
 		t.Fatalf("DefaultMergeSettleMinWait = %s, want 2m", DefaultMergeSettleMinWait)
 	}
-	if DefaultMergeSettleMinParts != 3 {
-		t.Fatalf("DefaultMergeSettleMinParts = %d, want 3", DefaultMergeSettleMinParts)
+	if DefaultMergeSettleMinParts != 1 {
+		t.Fatalf("DefaultMergeSettleMinParts = %d, want 1", DefaultMergeSettleMinParts)
 	}
 }
 
