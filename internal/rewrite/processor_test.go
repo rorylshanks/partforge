@@ -152,7 +152,7 @@ func TestConfigureDestinationMergeSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864, merge_selecting_sleep_ms = 1000, max_bytes_to_merge_at_max_space_in_pool = 26843545600, max_bytes_to_merge_at_min_space_in_pool = 1677721600"
+	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864, merge_selecting_sleep_ms = 1000, max_bytes_to_merge_at_max_space_in_pool = 26843545600, max_bytes_to_merge_at_min_space_in_pool = 1677721600, enable_vertical_merge_algorithm = 0"
 	if len(queries) != 2 || queries[1] != want {
 		t.Fatalf("queries = %#v, want %q", queries, want)
 	}
@@ -338,375 +338,12 @@ func TestOptimizeFinal(t *testing.T) {
 		t.Fatalf("queries = %#v, want %q", queries, want)
 	}
 	for key, want := range map[string]string{
-		"optimize_throw_if_noop": "1",
-		"receive_timeout":        "0",
-		"send_timeout":           "0",
+		"receive_timeout": "0",
+		"send_timeout":    "0",
 	} {
 		if got := optimizeSettings.Get(key); got != want {
 			t.Fatalf("%s = %q, want %q", key, got, want)
 		}
-	}
-}
-
-func TestOptimizeFinalUntilSinglePartRetriesUntilSinglePart(t *testing.T) {
-	var queries []string
-	snapshotResponses := []string{
-		"3\t3000\t300\t1\t3\n",
-		"2\t2000\t200\t1\t2\n",
-		"2\t2000\t200\t1\t2\n",
-		"1\t1000\t100\t1\t1\n",
-	}
-	var snapshotQueries int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read request body: %v", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		query := string(body)
-		queries = append(queries, query)
-		switch {
-		case strings.Contains(query, "system.parts"):
-			if snapshotQueries >= len(snapshotResponses) {
-				t.Fatalf("unexpected extra snapshot query: %s", query)
-			}
-			_, _ = w.Write([]byte(snapshotResponses[snapshotQueries]))
-			snapshotQueries++
-		case strings.Contains(query, "system.merges"):
-			_, _ = w.Write([]byte("0\n"))
-		case strings.Contains(query, "system.part_log"):
-			_, _ = w.Write([]byte(""))
-		}
-	}))
-	defer server.Close()
-
-	var backoffAttempts []uint64
-	stats, err := (Processor{
-		ClickHouse: chhttp.Client{URL: server.URL},
-		optimizeFinalRetryBackoff: func(attempt uint64) time.Duration {
-			backoffAttempts = append(backoffAttempts, attempt)
-			return 0
-		},
-	}).optimizeFinalUntilSinglePartPerPartition(context.Background(), manifest.Manifest{
-		JobID:  "job-1",
-		PartID: "part-1",
-		Dest:   manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stats.Count != 1 {
-		t.Fatalf("active parts = %d, want 1", stats.Count)
-	}
-	optimizeQueries := countQueriesWith(queries, "OPTIMIZE TABLE")
-	if optimizeQueries != 2 {
-		t.Fatalf("optimize queries = %d, want 2; queries = %#v", optimizeQueries, queries)
-	}
-	if len(backoffAttempts) != 1 || backoffAttempts[0] != 1 {
-		t.Fatalf("backoff attempts = %#v, want [1]", backoffAttempts)
-	}
-}
-
-func TestOptimizeFinalUntilSinglePartFailsAfterMaxAttempts(t *testing.T) {
-	var queries []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read request body: %v", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		query := string(body)
-		queries = append(queries, query)
-		switch {
-		case strings.Contains(query, "system.parts"):
-			_, _ = w.Write([]byte("2\t2000\t200\t1\t2\n"))
-		case strings.Contains(query, "system.merges"):
-			_, _ = w.Write([]byte("0\n"))
-		case strings.Contains(query, "system.part_log"):
-			_, _ = w.Write([]byte(""))
-		}
-	}))
-	defer server.Close()
-
-	var backoffAttempts []uint64
-	_, err := (Processor{
-		ClickHouse: chhttp.Client{URL: server.URL},
-		optimizeFinalRetryBackoff: func(attempt uint64) time.Duration {
-			backoffAttempts = append(backoffAttempts, attempt)
-			return 0
-		},
-	}).optimizeFinalUntilSinglePartPerPartition(context.Background(), manifest.Manifest{
-		JobID:  "job-1",
-		PartID: "part-1",
-		Dest:   manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
-	})
-	if err == nil {
-		t.Fatal("expected optimize final attempt limit error")
-	}
-	if !strings.Contains(err.Error(), "left 2 active destination parts across 1 partitions after 10 optimize final checks") {
-		t.Fatalf("error = %q, want attempt limit", err)
-	}
-	optimizeQueries := countQueriesWith(queries, "OPTIMIZE TABLE")
-	if optimizeQueries != int(DefaultOptimizeFinalMaxAttempts) {
-		t.Fatalf("optimize queries = %d, want %d", optimizeQueries, DefaultOptimizeFinalMaxAttempts)
-	}
-	if len(backoffAttempts) != int(DefaultOptimizeFinalMaxAttempts-1) {
-		t.Fatalf("backoff attempts = %#v, want %d attempts", backoffAttempts, DefaultOptimizeFinalMaxAttempts-1)
-	}
-	for i, attempt := range backoffAttempts {
-		want := uint64(i + 1)
-		if attempt != want {
-			t.Fatalf("backoff attempt %d = %d, want %d", i, attempt, want)
-		}
-	}
-}
-
-func TestOptimizeFinalUntilSinglePartWaitsForActiveMergeAfterClickHouseReturns(t *testing.T) {
-	var queries []string
-	snapshotResponses := []string{
-		"2\t2000\t200\t1\t2\n",
-		"2\t2000\t200\t1\t2\n",
-		"1\t2000\t190\t1\t1\n",
-	}
-	mergeResponses := []string{
-		"0\n",
-		"1\n",
-		"0\n",
-	}
-	var snapshotQueries int
-	var mergeQueries int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read request body: %v", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		query := string(body)
-		queries = append(queries, query)
-		switch {
-		case strings.Contains(query, "system.parts"):
-			if snapshotQueries >= len(snapshotResponses) {
-				t.Fatalf("unexpected extra snapshot query: %s", query)
-			}
-			_, _ = w.Write([]byte(snapshotResponses[snapshotQueries]))
-			snapshotQueries++
-		case strings.Contains(query, "system.merges"):
-			if mergeQueries >= len(mergeResponses) {
-				t.Fatalf("unexpected extra merge query: %s", query)
-			}
-			_, _ = w.Write([]byte(mergeResponses[mergeQueries]))
-			mergeQueries++
-		case strings.Contains(query, "system.part_log"):
-			t.Fatalf("did not expect part_log query while an active merge can finish")
-		}
-	}))
-	defer server.Close()
-
-	var backoffAttempts []uint64
-	stats, err := (Processor{
-		ClickHouse: chhttp.Client{URL: server.URL},
-		optimizeFinalRetryBackoff: func(attempt uint64) time.Duration {
-			backoffAttempts = append(backoffAttempts, attempt)
-			return 0
-		},
-	}).optimizeFinalUntilSinglePartPerPartition(context.Background(), manifest.Manifest{
-		JobID:  "job-1",
-		PartID: "part-1",
-		Dest:   manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stats.Count != 1 {
-		t.Fatalf("active parts = %d, want 1", stats.Count)
-	}
-	optimizeQueries := countQueriesWith(queries, "OPTIMIZE TABLE")
-	if optimizeQueries != 1 {
-		t.Fatalf("optimize queries = %d, want 1; queries = %#v", optimizeQueries, queries)
-	}
-	if len(backoffAttempts) != 1 || backoffAttempts[0] != 1 {
-		t.Fatalf("backoff attempts = %#v, want [1]", backoffAttempts)
-	}
-}
-
-func TestOptimizeFinalUntilSinglePartWaitsForActiveMergeAfterClientError(t *testing.T) {
-	var queries []string
-	snapshotResponses := []string{
-		"2\t2000\t200\t1\t2\n",
-		"2\t2000\t200\t1\t2\n",
-		"1\t2000\t190\t1\t1\n",
-	}
-	mergeResponses := []string{
-		"0\n",
-		"1\n",
-		"0\n",
-	}
-	var snapshotQueries int
-	var mergeQueries int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read request body: %v", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		query := string(body)
-		queries = append(queries, query)
-		switch {
-		case strings.Contains(query, "OPTIMIZE TABLE"):
-			conn, _, err := w.(http.Hijacker).Hijack()
-			if err != nil {
-				t.Errorf("hijack response: %v", err)
-				return
-			}
-			_ = conn.Close()
-		case strings.Contains(query, "system.parts"):
-			if snapshotQueries >= len(snapshotResponses) {
-				t.Fatalf("unexpected extra snapshot query: %s", query)
-			}
-			_, _ = w.Write([]byte(snapshotResponses[snapshotQueries]))
-			snapshotQueries++
-		case strings.Contains(query, "system.merges"):
-			if mergeQueries >= len(mergeResponses) {
-				t.Fatalf("unexpected extra merge query: %s", query)
-			}
-			_, _ = w.Write([]byte(mergeResponses[mergeQueries]))
-			mergeQueries++
-		case strings.Contains(query, "system.part_log"):
-			t.Fatalf("did not expect part_log query while an active merge can finish")
-		}
-	}))
-	defer server.Close()
-
-	var backoffAttempts []uint64
-	stats, err := (Processor{
-		ClickHouse: chhttp.Client{URL: server.URL},
-		optimizeFinalRetryBackoff: func(attempt uint64) time.Duration {
-			backoffAttempts = append(backoffAttempts, attempt)
-			return 0
-		},
-	}).optimizeFinalUntilSinglePartPerPartition(context.Background(), manifest.Manifest{
-		JobID:  "job-1",
-		PartID: "part-1",
-		Dest:   manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stats.Count != 1 {
-		t.Fatalf("active parts = %d, want 1", stats.Count)
-	}
-	optimizeQueries := countQueriesWith(queries, "OPTIMIZE TABLE")
-	if optimizeQueries != 1 {
-		t.Fatalf("optimize queries = %d, want 1; queries = %#v", optimizeQueries, queries)
-	}
-	if len(backoffAttempts) != 1 || backoffAttempts[0] != 1 {
-		t.Fatalf("backoff attempts = %#v, want [1]", backoffAttempts)
-	}
-}
-
-func TestOptimizeFinalUntilSinglePartFailsOnClickHouseQueryError(t *testing.T) {
-	var queries []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read request body: %v", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		query := string(body)
-		queries = append(queries, query)
-		switch {
-		case strings.Contains(query, "OPTIMIZE TABLE"):
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte("MEMORY_LIMIT_EXCEEDED"))
-		case strings.Contains(query, "system.parts"):
-			_, _ = w.Write([]byte("2\t2000\t200\t1\t2\n"))
-		case strings.Contains(query, "system.merges"):
-			_, _ = w.Write([]byte("0\n"))
-		case strings.Contains(query, "system.part_log"):
-			t.Fatalf("did not expect part_log query after ClickHouse query error")
-		}
-	}))
-	defer server.Close()
-
-	_, err := (Processor{
-		ClickHouse: chhttp.Client{URL: server.URL},
-		optimizeFinalRetryBackoff: func(attempt uint64) time.Duration {
-			return 0
-		},
-	}).optimizeFinalUntilSinglePartPerPartition(context.Background(), manifest.Manifest{
-		JobID:  "job-1",
-		PartID: "part-1",
-		Dest:   manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
-	})
-	if err == nil {
-		t.Fatal("expected ClickHouse query error")
-	}
-	if !strings.Contains(err.Error(), "MEMORY_LIMIT_EXCEEDED") {
-		t.Fatalf("error = %q, want ClickHouse query error", err)
-	}
-	optimizeQueries := countQueriesWith(queries, "OPTIMIZE TABLE")
-	if optimizeQueries != 1 {
-		t.Fatalf("optimize queries = %d, want 1; queries = %#v", optimizeQueries, queries)
-	}
-}
-
-func TestOptimizeFinalUntilSinglePartFailsFastOnPartLogMergeFailure(t *testing.T) {
-	var queries []string
-	snapshotResponses := []string{
-		"2\t2000\t200\t1\t2\n",
-		"2\t2000\t200\t1\t2\n",
-	}
-	var snapshotQueries int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read request body: %v", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		query := string(body)
-		queries = append(queries, query)
-		switch {
-		case strings.Contains(query, "system.parts"):
-			if snapshotQueries >= len(snapshotResponses) {
-				t.Fatalf("unexpected extra snapshot query: %s", query)
-			}
-			_, _ = w.Write([]byte(snapshotResponses[snapshotQueries]))
-			snapshotQueries++
-		case strings.Contains(query, "system.merges"):
-			_, _ = w.Write([]byte("0\n"))
-		case strings.Contains(query, "system.part_log"):
-			_, _ = w.Write([]byte("MergeParts\t241\tMEMORY_LIMIT_EXCEEDED\tall_1_2_1\tall_1_1_0,all_2_2_0\t0\t0\t123456\n"))
-		}
-	}))
-	defer server.Close()
-
-	_, err := (Processor{
-		ClickHouse: chhttp.Client{URL: server.URL},
-		optimizeFinalRetryBackoff: func(attempt uint64) time.Duration {
-			return 0
-		},
-	}).optimizeFinalUntilSinglePartPerPartition(context.Background(), manifest.Manifest{
-		JobID:  "job-1",
-		PartID: "part-1",
-		Dest:   manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
-	})
-	if err == nil {
-		t.Fatal("expected part_log merge failure")
-	}
-	for _, want := range []string{"latest destination merge failed", "MEMORY_LIMIT_EXCEEDED", "peak_memory_usage=123456"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("error = %q, missing %q", err, want)
-		}
-	}
-	optimizeQueries := countQueriesWith(queries, "OPTIMIZE TABLE")
-	if optimizeQueries != 1 {
-		t.Fatalf("optimize queries = %d, want 1; queries = %#v", optimizeQueries, queries)
 	}
 }
 
@@ -722,42 +359,71 @@ func TestShouldOptimizeFinal(t *testing.T) {
 	}
 }
 
-func TestShouldOptimizeFinalAfterIdleMerges(t *testing.T) {
-	eligible := mergeWaitResult{
-		Settled:     true,
-		Reason:      "destination_merges_idle",
-		ActiveParts: 4,
-		TotalBytes:  40 * 1024 * 1024 * 1024,
+func TestWaitForDestinationMergesReportsSettled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case strings.Contains(query, "system.merges"):
+			_, _ = w.Write([]byte("0\n"))
+		case strings.Contains(query, "system.parts"):
+			_, _ = w.Write([]byte("0\t0\t0\t0\t0\n"))
+		default:
+			t.Errorf("unexpected query: %s", query)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	tracker := newRewriteStageTracker(time.Now(), stageProcessPart)
+	settled, err := (Processor{
+		ClickHouse: chhttp.Client{URL: server.URL},
+	}).waitForDestinationMerges(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"}, tracker, testMergeWaitTarget(), "test")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !((Processor{MergeIdleOptimizeFinalMaxBytes: DefaultMergeIdleOptimizeFinalMaxBytes}).shouldOptimizeFinalAfterIdleMerges(eligible)) {
-		t.Fatal("expected idle small output to trigger optimize final")
+	if !settled {
+		t.Fatal("expected merge wait to settle")
 	}
-	if (Processor{}).shouldOptimizeFinalAfterIdleMerges(eligible) {
-		t.Fatal("expected zero threshold to disable idle optimize final")
+}
+
+func TestWaitForDestinationMergesReturnsFalseAfterTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case strings.Contains(query, "system.merges"):
+			_, _ = w.Write([]byte("1\n"))
+		case strings.Contains(query, "system.parts"):
+			_, _ = w.Write([]byte(smallDebtMergeSnapshot()))
+		default:
+			t.Errorf("unexpected query: %s", query)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	tracker := newRewriteStageTracker(time.Now(), stageProcessPart)
+	settled, err := (Processor{
+		ClickHouse:        chhttp.Client{URL: server.URL},
+		MergeTimeout:      time.Nanosecond,
+		MergePollInterval: time.Nanosecond,
+	}).waitForDestinationMerges(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"}, tracker, testMergeWaitTarget(), "test")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if (Processor{MergeIdleOptimizeFinalMaxBytes: DefaultMergeIdleOptimizeFinalMaxBytes}).shouldOptimizeFinalAfterIdleMerges(mergeWaitResult{
-		Settled:     true,
-		Reason:      "destination_merges_idle",
-		ActiveParts: 4,
-		TotalBytes:  60 * 1024 * 1024 * 1024,
-	}) {
-		t.Fatal("expected large output to skip idle optimize final")
-	}
-	if (Processor{MergeIdleOptimizeFinalMaxBytes: DefaultMergeIdleOptimizeFinalMaxBytes}).shouldOptimizeFinalAfterIdleMerges(mergeWaitResult{
-		Settled:     true,
-		Reason:      "no_small_part_debt",
-		ActiveParts: 4,
-		TotalBytes:  40 * 1024 * 1024 * 1024,
-	}) {
-		t.Fatal("expected settled output without idle merge debt to skip optimize final")
-	}
-	if (Processor{MergeIdleOptimizeFinalMaxBytes: DefaultMergeIdleOptimizeFinalMaxBytes}).shouldOptimizeFinalAfterIdleMerges(mergeWaitResult{
-		Settled:     true,
-		Reason:      "destination_merges_idle",
-		ActiveParts: 1,
-		TotalBytes:  40 * 1024 * 1024 * 1024,
-	}) {
-		t.Fatal("expected one active part to skip idle optimize final")
+	if settled {
+		t.Fatal("expected merge wait timeout to return unsettled")
 	}
 }
 
@@ -786,9 +452,8 @@ func TestWaitForMergesReturnsUnsettledAfterTimeout(t *testing.T) {
 
 	timeout := time.Nanosecond
 	result, err := (Processor{
-		ClickHouse:       chhttp.Client{URL: server.URL},
-		MergeTimeout:     timeout,
-		MergeHardTimeout: timeout,
+		ClickHouse:   chhttp.Client{URL: server.URL},
+		MergeTimeout: timeout,
 	}).waitForMerges(context.Background(), testMergeWaitTarget())
 	if err != nil {
 		t.Fatal(err)
@@ -839,9 +504,6 @@ func TestWaitForMergesUsesDefaultTimeout(t *testing.T) {
 	}
 	if result.Timeout != DefaultMergeTimeout {
 		t.Fatalf("timeout = %s, want %s", result.Timeout, DefaultMergeTimeout)
-	}
-	if result.HardTimeout != DefaultMergeHardTimeout {
-		t.Fatalf("hard timeout = %s, want %s", result.HardTimeout, DefaultMergeHardTimeout)
 	}
 }
 
@@ -907,7 +569,7 @@ func TestHasSmallPartDebtUsesSmallPartCount(t *testing.T) {
 	}
 }
 
-func TestWaitForMergesExtendsBaseTimeoutForActiveSmallDebtMerges(t *testing.T) {
+func TestWaitForMergesStopsAtMergeTimeoutForActiveSmallDebtMerges(t *testing.T) {
 	var mergeRequests int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -931,27 +593,25 @@ func TestWaitForMergesExtendsBaseTimeoutForActiveSmallDebtMerges(t *testing.T) {
 	defer server.Close()
 
 	baseTimeout := time.Millisecond
-	hardTimeout := 8 * time.Millisecond
 	result, err := (Processor{
 		ClickHouse:        chhttp.Client{URL: server.URL},
 		MergeTimeout:      baseTimeout,
-		MergeHardTimeout:  hardTimeout,
 		MergePollInterval: time.Millisecond,
 	}).waitForMerges(context.Background(), testMergeWaitTarget())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Settled {
-		t.Fatal("expected hard timeout before settling")
+		t.Fatal("expected merge timeout before settling")
+	}
+	if result.Reason != "merge_timeout" {
+		t.Fatalf("reason = %q, want merge_timeout", result.Reason)
 	}
 	if result.Timeout != baseTimeout {
 		t.Fatalf("timeout = %s, want %s", result.Timeout, baseTimeout)
 	}
-	if result.HardTimeout != hardTimeout {
-		t.Fatalf("hard timeout = %s, want %s", result.HardTimeout, hardTimeout)
-	}
-	if mergeRequests < 2 {
-		t.Fatalf("merge requests = %d, want at least 2", mergeRequests)
+	if mergeRequests == 0 {
+		t.Fatal("expected system.merges to be queried")
 	}
 }
 
@@ -1138,9 +798,6 @@ func TestDefaultMergeTimeout(t *testing.T) {
 	if DefaultMergeTimeout != 10*time.Minute {
 		t.Fatalf("DefaultMergeTimeout = %s, want 10m", DefaultMergeTimeout)
 	}
-	if DefaultMergeHardTimeout != 20*time.Minute {
-		t.Fatalf("DefaultMergeHardTimeout = %s, want 20m", DefaultMergeHardTimeout)
-	}
 	if DefaultMergeSettleMinWait != 2*time.Minute {
 		t.Fatalf("DefaultMergeSettleMinWait = %s, want 2m", DefaultMergeSettleMinWait)
 	}
@@ -1153,12 +810,6 @@ func TestDefaultMergeTimeout(t *testing.T) {
 	if DefaultMergeSmallPartMaxCount != 2 {
 		t.Fatalf("DefaultMergeSmallPartMaxCount = %d, want 2", DefaultMergeSmallPartMaxCount)
 	}
-	if DefaultMergeIdleOptimizeFinalMaxBytes != 50*1024*1024*1024 {
-		t.Fatalf("DefaultMergeIdleOptimizeFinalMaxBytes = %d, want 50 GiB", DefaultMergeIdleOptimizeFinalMaxBytes)
-	}
-	if DefaultOptimizeFinalMaxAttempts != 10 {
-		t.Fatalf("DefaultOptimizeFinalMaxAttempts = %d, want 10", DefaultOptimizeFinalMaxAttempts)
-	}
 }
 
 func TestInsertSelectRetryBackoff(t *testing.T) {
@@ -1170,27 +821,6 @@ func TestInsertSelectRetryBackoff(t *testing.T) {
 	}
 	if got := insertSelectRetryBackoff(10); got != 10*time.Second {
 		t.Fatalf("attempt 10 backoff = %s", got)
-	}
-}
-
-func TestOptimizeFinalRetryBackoff(t *testing.T) {
-	tests := []struct {
-		attempt uint64
-		want    time.Duration
-	}{
-		{attempt: 0, want: time.Minute},
-		{attempt: 1, want: time.Minute},
-		{attempt: 2, want: 2 * time.Minute},
-		{attempt: 3, want: 3 * time.Minute},
-		{attempt: 9, want: 9 * time.Minute},
-		{attempt: 10, want: 10 * time.Minute},
-		{attempt: 11, want: 10 * time.Minute},
-	}
-
-	for _, tt := range tests {
-		if got := optimizeFinalRetryBackoff(tt.attempt); got != tt.want {
-			t.Fatalf("attempt %d backoff = %s, want %s", tt.attempt, got, tt.want)
-		}
 	}
 }
 
