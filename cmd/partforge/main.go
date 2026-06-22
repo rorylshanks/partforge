@@ -959,6 +959,7 @@ func runImportFinished(ctx context.Context, args []string) error {
 		database           = fs.String("database", "", "final destination database")
 		table              = fs.String("table", "", "final destination table")
 		jobID              = fs.String("job-id", "", "job id to import")
+		partID             = fs.String("part-id", "", "optional finished part id to import")
 		stateTable         = fs.String("state-table", defaultStateTable, "DynamoDB state table")
 		region             = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
 		s3Endpoint         = fs.String("s3-endpoint", "", "optional S3 endpoint, e.g. LocalStack")
@@ -987,6 +988,7 @@ func runImportFinished(ctx context.Context, args []string) error {
 		"import-finished started",
 		"stage", "start",
 		"job_id", *jobID,
+		"part_id", *partID,
 		"destination_table", chhttp.TableSQL(*database, *table),
 		"work_dir", *workDir,
 		"require_empty", *requireEmpty,
@@ -1007,6 +1009,11 @@ func runImportFinished(ctx context.Context, args []string) error {
 		return err
 	}
 	slog.Info("listed finished parts", "stage", "list_finished_parts", "job_id", *jobID, "finished_parts", len(finishedParts))
+	finishedParts, err = selectImportFinishedParts(finishedParts, *partID)
+	if err != nil {
+		return err
+	}
+	slog.Info("selected finished parts for import", "stage", "list_finished_parts", "job_id", *jobID, "part_id", *partID, "import_parts", len(finishedParts))
 	artifacts := make([]parts.FinishedArtifact, 0, len(finishedParts))
 	partsByID := make(map[string]state.Part, len(finishedParts))
 	for _, part := range finishedParts {
@@ -1139,6 +1146,19 @@ func runJobStatus(ctx context.Context, args []string) error {
 		printPartDetails(os.Stdout, jobParts)
 	}
 	return nil
+}
+
+func selectImportFinishedParts(finishedParts []state.Part, partID string) ([]state.Part, error) {
+	partID = strings.TrimSpace(partID)
+	if partID == "" {
+		return finishedParts, nil
+	}
+	for _, part := range finishedParts {
+		if part.PartID == partID {
+			return []state.Part{part}, nil
+		}
+	}
+	return nil, fmt.Errorf("finished part %s was not found in job", partID)
 }
 
 func runRetryFailed(ctx context.Context, args []string) error {

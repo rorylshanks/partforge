@@ -139,6 +139,33 @@ func TestSelectRetryParts(t *testing.T) {
 	}
 }
 
+func TestSelectImportFinishedParts(t *testing.T) {
+	parts := []state.Part{
+		{PartID: "part-1", Status: state.StatusFinished},
+		{PartID: "part-2", Status: state.StatusFinished},
+	}
+
+	all, err := selectImportFinishedParts(parts, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("all parts len = %d, want 2", len(all))
+	}
+
+	one, err := selectImportFinishedParts(parts, "part-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(one) != 1 || one[0].PartID != "part-2" {
+		t.Fatalf("selected part = %+v, want part-2", one)
+	}
+
+	if _, err := selectImportFinishedParts(parts, "part-missing"); err == nil {
+		t.Fatal("expected missing part error")
+	}
+}
+
 func TestSelectRetryPartsStale(t *testing.T) {
 	now := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
 	parts := []state.Part{
