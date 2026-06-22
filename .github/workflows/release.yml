@@ -105,7 +105,9 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.version.outputs.image }}:${{ steps.version.outputs.version }}
+          tags: |
+            ${{ steps.version.outputs.image }}:${{ steps.version.outputs.version }}
+            ${{ steps.version.outputs.image }}:latest
 
       - name: Create or update release
         env:
@@ -113,7 +115,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           IMAGE: ${{ steps.version.outputs.image }}
         run: |
-          notes="Worker image: ${IMAGE}:${VERSION}"
+          notes="Worker image: ${IMAGE}:${VERSION} and ${IMAGE}:latest"
           if gh release view "$VERSION" >/dev/null 2>&1; then
             gh release upload "$VERSION" dist/partforge-linux-* --clobber
           else
