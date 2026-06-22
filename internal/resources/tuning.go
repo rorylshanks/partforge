@@ -12,19 +12,24 @@ import (
 )
 
 const (
-	DefaultCompressionCodec               = "ZSTD(5)"
-	insertMemoryUsagePercent       uint64 = 80
-	insertBlockMemoryDivisor       uint64 = 3
-	mergeMemoryBudgetPercent       uint64 = 60
-	mergeMemoryConcurrencyDivisor  uint64 = 8
-	minMergeBackgroundPoolSize            = 13
-	minMergeMaxBlockSizeBytes      uint64 = 4 * 1024 * 1024
-	maxMergeMaxBlockSizeBytes      uint64 = 256 * 1024 * 1024
-	minMergeMaxBlockSizeRows       uint64 = 8192
-	maxMergeMaxBlockSizeRows       uint64 = 262144
-	targetMergeAverageRowSizeBytes uint64 = 1024
-	defaultMergeSelectingSleepMS   uint64 = 1000
-	defaultMergeSchedulingPolicy          = "shortest_task_first"
+	DefaultCompressionCodec                = "ZSTD(5)"
+	insertMemoryUsagePercent        uint64 = 70
+	insertCPUConcurrencyDivisor            = 4
+	insertBlockMemoryDivisor        uint64 = 6
+	targetInsertBlockSizeBytes      uint64 = 2 * 1024 * 1024 * 1024
+	targetInsertAverageRowSizeBytes uint64 = 1024
+	minInsertBlockSizeRowCount      uint64 = 8192
+	maxInsertBlockSizeRowCount      uint64 = 8 * 1024 * 1024
+	mergeMemoryBudgetPercent        uint64 = 60
+	mergeMemoryConcurrencyDivisor   uint64 = 8
+	minMergeBackgroundPoolSize             = 13
+	minMergeMaxBlockSizeBytes       uint64 = 4 * 1024 * 1024
+	maxMergeMaxBlockSizeBytes       uint64 = 256 * 1024 * 1024
+	minMergeMaxBlockSizeRows        uint64 = 8192
+	maxMergeMaxBlockSizeRows        uint64 = 262144
+	targetMergeAverageRowSizeBytes  uint64 = 1024
+	defaultMergeSelectingSleepMS    uint64 = 1000
+	defaultMergeSchedulingPolicy           = "shortest_task_first"
 )
 
 type Limits struct {
@@ -73,26 +78,36 @@ func InsertSelectSettings(limits Limits) (chhttp.QuerySettings, error) {
 	if maxMemoryUsage == 0 {
 		return nil, fmt.Errorf("derived max_memory_usage is zero from memory limit %d", limits.MemoryBytes)
 	}
-	threadCount := insertThreadCount(limits.CPUs)
+	threadCount := insertThreadCount(limits.CPUs, maxMemoryUsage)
 	minInsertBlockSizeBytes := maxMemoryUsage / (insertBlockMemoryDivisor * uint64(threadCount))
 	if minInsertBlockSizeBytes == 0 {
 		return nil, fmt.Errorf("derived min_insert_block_size_bytes is zero from memory limit %d and cpu limit %d", limits.MemoryBytes, limits.CPUs)
 	}
+	minInsertBlockSizeRows := minInsertBlockSizeBytes / targetInsertAverageRowSizeBytes
+	minInsertBlockSizeRows = clampUint64(minInsertBlockSizeRows, minInsertBlockSizeRowCount, maxInsertBlockSizeRowCount)
 	threads := strconv.Itoa(threadCount)
 	return chhttp.QuerySettings{
 		"max_threads":                 threads,
 		"max_insert_threads":          threads,
 		"max_memory_usage":            strconv.FormatUint(maxMemoryUsage, 10),
-		"min_insert_block_size_rows":  "0",
+		"min_insert_block_size_rows":  strconv.FormatUint(minInsertBlockSizeRows, 10),
 		"min_insert_block_size_bytes": strconv.FormatUint(minInsertBlockSizeBytes, 10),
 	}, nil
 }
 
-func insertThreadCount(cpus int) int {
-	if cpus < 2 {
-		return 1
+func insertThreadCount(cpus int, maxMemoryUsage uint64) int {
+	cpuThreads := cpus / insertCPUConcurrencyDivisor
+	if cpuThreads < 1 {
+		cpuThreads = 1
 	}
-	return cpus / 2
+	memoryThreads := int(maxMemoryUsage / (insertBlockMemoryDivisor * targetInsertBlockSizeBytes))
+	if memoryThreads < 1 {
+		memoryThreads = 1
+	}
+	if memoryThreads < cpuThreads {
+		return memoryThreads
+	}
+	return cpuThreads
 }
 
 func MergeTreeSettingsForLimits(limits Limits) (MergeTreeSettings, error) {

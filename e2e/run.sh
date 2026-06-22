@@ -55,15 +55,30 @@ assert_worker_insert_memory_settings() {
   require_uint "min_insert_block_size_rows" "$min_rows"
   require_uint "min_insert_block_size_bytes" "$min_bytes"
 
-  local expected_threads
-  if (( cpus < 2 )); then
-    expected_threads=1
+  local cpu_threads memory_threads expected_threads
+  if (( cpus < 4 )); then
+    cpu_threads=1
   else
-    expected_threads=$((cpus / 2))
+    cpu_threads=$((cpus / 4))
   fi
-  local expected_max_memory expected_min_bytes reserved_insert_block_memory
-  expected_max_memory=$((memory_bytes * 80 / 100))
-  expected_min_bytes=$((expected_max_memory / (3 * expected_threads)))
+  local expected_max_memory expected_min_bytes expected_min_rows reserved_insert_block_memory
+  expected_max_memory=$((memory_bytes * 70 / 100))
+  memory_threads=$((expected_max_memory / (6 * 2 * 1024 * 1024 * 1024)))
+  if (( memory_threads < 1 )); then
+    memory_threads=1
+  fi
+  if (( memory_threads < cpu_threads )); then
+    expected_threads=$memory_threads
+  else
+    expected_threads=$cpu_threads
+  fi
+  expected_min_bytes=$((expected_max_memory / (6 * expected_threads)))
+  expected_min_rows=$((expected_min_bytes / 1024))
+  if (( expected_min_rows < 8192 )); then
+    expected_min_rows=8192
+  elif (( expected_min_rows > 8388608 )); then
+    expected_min_rows=8388608
+  fi
   reserved_insert_block_memory=$((min_bytes * max_insert_threads * 3))
 
   if (( max_threads != expected_threads )); then
@@ -78,16 +93,16 @@ assert_worker_insert_memory_settings() {
     echo "max_memory_usage=$max_memory_usage, expected $expected_max_memory from memory_bytes=$memory_bytes" >&2
     exit 1
   fi
-  if (( min_rows != 0 )); then
-    echo "min_insert_block_size_rows=$min_rows, expected 0" >&2
+  if (( min_rows != expected_min_rows )); then
+    echo "min_insert_block_size_rows=$min_rows, expected $expected_min_rows" >&2
     exit 1
   fi
   if (( min_bytes != expected_min_bytes )); then
     echo "min_insert_block_size_bytes=$min_bytes, expected $expected_min_bytes" >&2
     exit 1
   fi
-  if (( reserved_insert_block_memory > max_memory_usage )); then
-    echo "insert block memory budget $reserved_insert_block_memory exceeds max_memory_usage $max_memory_usage" >&2
+  if (( reserved_insert_block_memory > max_memory_usage / 2 )); then
+    echo "modeled insert block memory budget $reserved_insert_block_memory exceeds half max_memory_usage $((max_memory_usage / 2))" >&2
     exit 1
   fi
 }
