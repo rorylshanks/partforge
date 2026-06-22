@@ -24,11 +24,9 @@ import (
 	"github.com/partforge/partforge/internal/s3copy"
 )
 
-const DefaultMergeTimeout = 10 * time.Minute
+const DefaultMergeTimeout = 20 * time.Minute
 const DefaultMergeSettleMinWait = 2 * time.Minute
 const DefaultMergeSettleMinParts uint64 = 1
-const DefaultMergeSmallPartBytes uint64 = 1024 * 1024 * 1024
-const DefaultMergeSmallPartMaxCount uint64 = 2
 const defaultMergePollInterval = time.Second
 const defaultMergeWaitLogInterval = 30 * time.Second
 
@@ -90,22 +88,20 @@ func StageOrder() []string {
 }
 
 type Processor struct {
-	S3Copy                 s3copy.Copier
-	ClickHouse             chhttp.Client
-	WorkDir                string
-	MergeTimeout           time.Duration
-	Metrics                metrics.Recorder
-	InsertSettings         chhttp.QuerySettings
-	ProgressInterval       time.Duration
-	ReportProgress         ProgressReporter
-	MergeTreeSettings      MergeTreeSettings
-	MergeSettleMinWait     time.Duration
-	MergeSettleMinParts    uint64
-	MergeSmallPartBytes    uint64
-	MergeSmallPartMaxCount uint64
-	MergePollInterval      time.Duration
-	RestartClickHouse      func(context.Context) error
-	ForceOptimizeFinal     bool
+	S3Copy              s3copy.Copier
+	ClickHouse          chhttp.Client
+	WorkDir             string
+	MergeTimeout        time.Duration
+	Metrics             metrics.Recorder
+	InsertSettings      chhttp.QuerySettings
+	ProgressInterval    time.Duration
+	ReportProgress      ProgressReporter
+	MergeTreeSettings   MergeTreeSettings
+	MergeSettleMinWait  time.Duration
+	MergeSettleMinParts uint64
+	MergePollInterval   time.Duration
+	RestartClickHouse   func(context.Context) error
+	ForceOptimizeFinal  bool
 }
 
 type MergeTreeSettings struct {
@@ -789,8 +785,6 @@ func (p Processor) waitForDestinationMerges(ctx context.Context, m manifest.Mani
 			"wait_context", waitContext,
 			"settle_reason", mergeWait.Reason,
 			"active_parts", mergeWait.ActiveParts,
-			"small_parts", mergeWait.SmallParts,
-			"small_part_bytes_on_disk", mergeWait.SmallPartBytes,
 			"total_bytes_on_disk", mergeWait.TotalBytes,
 			"largest_part_bytes_on_disk", mergeWait.LargestPartBytes,
 			"zero_merges_idle", mergeWait.ZeroMergesIdle,
@@ -808,8 +802,6 @@ func (p Processor) waitForDestinationMerges(ctx context.Context, m manifest.Mani
 		"timeout", mergeWait.Timeout,
 		"active_merges", mergeWait.ActiveMerges,
 		"active_parts", mergeWait.ActiveParts,
-		"small_parts", mergeWait.SmallParts,
-		"small_part_bytes_on_disk", mergeWait.SmallPartBytes,
 		"total_bytes_on_disk", mergeWait.TotalBytes,
 		"largest_part_bytes_on_disk", mergeWait.LargestPartBytes,
 		"zero_merges_idle", mergeWait.ZeroMergesIdle,
@@ -1330,8 +1322,6 @@ type mergeWaitResult struct {
 	Reason           string
 	ActiveMerges     uint64
 	ActiveParts      uint64
-	SmallParts       uint64
-	SmallPartBytes   uint64
 	TotalBytes       uint64
 	LargestPartBytes uint64
 	ZeroMergesIdle   time.Duration
@@ -1373,11 +1363,6 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 	if minParts == 0 {
 		minParts = DefaultMergeSettleMinParts
 	}
-	smallPartBytes := p.mergeSmallPartBytes()
-	smallPartMaxCount := p.MergeSmallPartMaxCount
-	if smallPartMaxCount == 0 {
-		smallPartMaxCount = DefaultMergeSmallPartMaxCount
-	}
 	pollInterval := p.MergePollInterval
 	if pollInterval == 0 {
 		pollInterval = defaultMergePollInterval
@@ -1396,28 +1381,19 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 			return mergeWaitResult{}, err
 		}
 		now := time.Now()
-		snapshot, err := p.mergePartSnapshot(ctx, target, smallPartBytes)
+		snapshot, err := p.mergePartSnapshot(ctx, target)
 		if err != nil {
 			return mergeWaitResult{}, err
 		}
-		debt := hasSmallPartDebt(snapshot, smallPartMaxCount)
 
 		zeroMergesIdle := time.Duration(0)
 		reason := "active_destination_merges"
 		if count == 0 {
-			if snapshot.ActiveParts <= minParts || !debt {
-				reason = "active_parts_settled"
-				if debt {
-					reason = "one_or_fewer_active_parts"
-				} else {
-					reason = "no_small_part_debt"
-				}
+			if snapshot.ActiveParts <= minParts {
 				return mergeWaitResult{
 					Settled:          true,
-					Reason:           reason,
+					Reason:           "active_parts_settled",
 					ActiveParts:      snapshot.ActiveParts,
-					SmallParts:       snapshot.SmallParts,
-					SmallPartBytes:   snapshot.SmallPartBytes,
 					TotalBytes:       snapshot.TotalBytes,
 					LargestPartBytes: snapshot.LargestPartBytes,
 					Timeout:          timeout,
@@ -1433,8 +1409,6 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 					Settled:          true,
 					Reason:           "destination_merges_idle",
 					ActiveParts:      snapshot.ActiveParts,
-					SmallParts:       snapshot.SmallParts,
-					SmallPartBytes:   snapshot.SmallPartBytes,
 					TotalBytes:       snapshot.TotalBytes,
 					LargestPartBytes: snapshot.LargestPartBytes,
 					ZeroMergesIdle:   zeroMergesIdle,
@@ -1445,8 +1419,6 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 				return mergeWaitResult{
 					Reason:           "merge_timeout_no_destination_merges",
 					ActiveParts:      snapshot.ActiveParts,
-					SmallParts:       snapshot.SmallParts,
-					SmallPartBytes:   snapshot.SmallPartBytes,
 					TotalBytes:       snapshot.TotalBytes,
 					LargestPartBytes: snapshot.LargestPartBytes,
 					ZeroMergesIdle:   zeroMergesIdle,
@@ -1463,8 +1435,6 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 				Reason:           "merge_timeout",
 				ActiveMerges:     count,
 				ActiveParts:      snapshot.ActiveParts,
-				SmallParts:       snapshot.SmallParts,
-				SmallPartBytes:   snapshot.SmallPartBytes,
 				TotalBytes:       snapshot.TotalBytes,
 				LargestPartBytes: snapshot.LargestPartBytes,
 				Timeout:          timeout,
@@ -1477,7 +1447,6 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 			reason,
 			count,
 			snapshot,
-			debt,
 			zeroMergesIdle,
 			timeout,
 			minWait,
@@ -1496,8 +1465,6 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 type mergePartSnapshot struct {
 	ActiveParts      uint64
 	TotalBytes       uint64
-	SmallParts       uint64
-	SmallPartBytes   uint64
 	LargestPartBytes uint64
 }
 
@@ -1521,7 +1488,6 @@ func (s *mergeWaitLogState) maybeLog(
 	reason string,
 	activeMerges uint64,
 	snapshot mergePartSnapshot,
-	hasDebt bool,
 	zeroMergesIdle time.Duration,
 	timeout time.Duration,
 	minWait time.Duration,
@@ -1547,27 +1513,23 @@ func (s *mergeWaitLogState) maybeLog(
 		"base_timeout_remaining", nonNegativeDuration(baseDeadline.Sub(now)),
 		"active_destination_merges", activeMerges,
 		"active_parts", snapshot.ActiveParts,
-		"small_parts", snapshot.SmallParts,
-		"small_part_bytes_on_disk", snapshot.SmallPartBytes,
 		"total_bytes_on_disk", snapshot.TotalBytes,
 		"largest_part_bytes_on_disk", snapshot.LargestPartBytes,
-		"has_small_part_debt", hasDebt,
 		"zero_merges_idle", zeroMergesIdle,
 		"zero_merges_required", minWait,
 		"next_poll_in", nextPollIn,
 	)
 }
 
-func (p Processor) mergePartSnapshot(ctx context.Context, target mergeWaitTarget, smallPartBytes uint64) (mergePartSnapshot, error) {
-	query := "SELECT count(), ifNull(sum(bytes_on_disk), 0), countIf(bytes_on_disk < " + strconv.FormatUint(smallPartBytes, 10) + "), " +
-		"ifNull(sumIf(bytes_on_disk, bytes_on_disk < " + strconv.FormatUint(smallPartBytes, 10) + "), 0), ifNull(max(bytes_on_disk), 0) FROM system.parts WHERE database = " +
+func (p Processor) mergePartSnapshot(ctx context.Context, target mergeWaitTarget) (mergePartSnapshot, error) {
+	query := "SELECT count(), ifNull(sum(bytes_on_disk), 0), ifNull(max(bytes_on_disk), 0) FROM system.parts WHERE database = " +
 		chhttp.StringLiteral(target.Database) + " AND table = " + chhttp.StringLiteral(target.Table) +
 		" AND active FORMAT TSV"
 	out, err := p.ClickHouse.QueryString(ctx, query)
 	if err != nil {
 		return mergePartSnapshot{}, err
 	}
-	rows, err := chhttp.FormatTSVStrings(out, 5)
+	rows, err := chhttp.FormatTSVStrings(out, 3)
 	if err != nil {
 		return mergePartSnapshot{}, err
 	}
@@ -1582,45 +1544,19 @@ func (p Processor) mergePartSnapshot(ctx context.Context, target mergeWaitTarget
 	if err != nil {
 		return mergePartSnapshot{}, err
 	}
-	smallParts, err := chhttp.ParseUInt(rows[0][2])
-	if err != nil {
-		return mergePartSnapshot{}, err
-	}
-	smallPartBytesSum, err := chhttp.ParseUInt(rows[0][3])
-	if err != nil {
-		return mergePartSnapshot{}, err
-	}
-	largestPartBytes, err := chhttp.ParseUInt(rows[0][4])
+	largestPartBytes, err := chhttp.ParseUInt(rows[0][2])
 	if err != nil {
 		return mergePartSnapshot{}, err
 	}
 	return mergePartSnapshot{
 		ActiveParts:      activeParts,
 		TotalBytes:       totalBytes,
-		SmallParts:       smallParts,
-		SmallPartBytes:   smallPartBytesSum,
 		LargestPartBytes: largestPartBytes,
 	}, nil
 }
 
-func (p Processor) mergeSmallPartBytes() uint64 {
-	if p.MergeSmallPartBytes == 0 {
-		return DefaultMergeSmallPartBytes
-	}
-	return p.MergeSmallPartBytes
-}
-
-func hasSmallPartDebt(snapshot mergePartSnapshot, maxSmallParts uint64) bool {
-	if snapshot.ActiveParts <= 1 {
-		return false
-	}
-	return snapshot.SmallParts > maxSmallParts
-}
-
 func sameMergePartSnapshot(a, b mergePartSnapshot) bool {
 	return a.ActiveParts == b.ActiveParts &&
-		a.SmallParts == b.SmallParts &&
-		a.SmallPartBytes == b.SmallPartBytes &&
 		a.TotalBytes == b.TotalBytes &&
 		a.LargestPartBytes == b.LargestPartBytes
 }

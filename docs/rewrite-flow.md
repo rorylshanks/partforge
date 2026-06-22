@@ -77,16 +77,14 @@ graph TD
     D -- No --> E{Merge timeout reached?}
     E -- No --> A
     E -- Yes --> F[Stop waiting and continue with current parts]
-    D -- Yes --> G{Active parts <= settle min OR no small-part debt?}
+    D -- Yes --> G{Active parts <= settle min?}
     G -- Yes --> H[Settled]
     G -- No --> I{Same part snapshot idle for settle min wait?}
     I -- No --> E
     I -- Yes --> H
 ```
 
-If the merge wait times out or merge-wait inspection fails, that is not a rewrite failure. The worker logs the reason and continues with whatever active destination parts exist.
-
-Small-part debt means the destination table has more than one active part and more than `-merge-small-part-max-count` active parts below `-merge-small-part-bytes`. The default small-part threshold is 1 GiB and the default allowed small-part count is 2.
+If the merge wait times out or merge-wait inspection fails, that is not a rewrite failure. The worker logs the reason and continues with whatever active destination parts exist. Any destination with more active parts than `-merge-settle-min-parts` must keep the same part snapshot idle for `-merge-settle-min-wait` before the worker treats merges as settled.
 
 ## Optional optimize_final Step
 

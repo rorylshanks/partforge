@@ -403,7 +403,7 @@ func TestWaitForDestinationMergesReportsSettled(t *testing.T) {
 		case strings.Contains(query, "system.merges"):
 			_, _ = w.Write([]byte("0\n"))
 		case strings.Contains(query, "system.parts"):
-			_, _ = w.Write([]byte("0\t0\t0\t0\t0\n"))
+			_, _ = w.Write([]byte("0\t0\t0\n"))
 		default:
 			t.Errorf("unexpected query: %s", query)
 			w.WriteHeader(http.StatusBadRequest)
@@ -436,7 +436,7 @@ func TestWaitForDestinationMergesReturnsFalseAfterTimeout(t *testing.T) {
 		case strings.Contains(query, "system.merges"):
 			_, _ = w.Write([]byte("1\n"))
 		case strings.Contains(query, "system.parts"):
-			_, _ = w.Write([]byte(smallDebtMergeSnapshot()))
+			_, _ = w.Write([]byte(multiPartMergeSnapshot()))
 		default:
 			t.Errorf("unexpected query: %s", query)
 			w.WriteHeader(http.StatusBadRequest)
@@ -516,7 +516,7 @@ func TestWaitForMergesUsesDefaultTimeout(t *testing.T) {
 		case strings.Contains(query, "system.merges"):
 			_, _ = w.Write([]byte("0\n"))
 		case strings.Contains(query, "system.parts"):
-			_, _ = w.Write([]byte("0\t0\t0\t0\t0\n"))
+			_, _ = w.Write([]byte("0\t0\t0\n"))
 		default:
 			t.Errorf("unexpected query: %s", query)
 			w.WriteHeader(http.StatusBadRequest)
@@ -538,7 +538,7 @@ func TestWaitForMergesUsesDefaultTimeout(t *testing.T) {
 	}
 }
 
-func TestWaitForMergesSettlesLargeTailParts(t *testing.T) {
+func TestWaitForMergesSettlesLargeTailPartsAfterIdleWindow(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -559,8 +559,12 @@ func TestWaitForMergesSettlesLargeTailParts(t *testing.T) {
 	}))
 	defer server.Close()
 
+	minWait := 5 * time.Millisecond
 	result, err := (Processor{
-		ClickHouse: chhttp.Client{URL: server.URL},
+		ClickHouse:          chhttp.Client{URL: server.URL},
+		MergeSettleMinWait:  minWait,
+		MergePollInterval:   time.Millisecond,
+		MergeSettleMinParts: 1,
 	}).waitForMerges(context.Background(), testMergeWaitTarget())
 	if err != nil {
 		t.Fatal(err)
@@ -571,36 +575,12 @@ func TestWaitForMergesSettlesLargeTailParts(t *testing.T) {
 	if result.ActiveParts != 2 {
 		t.Fatalf("active parts = %d, want 2", result.ActiveParts)
 	}
-}
-
-func TestHasSmallPartDebtUsesSmallPartCount(t *testing.T) {
-	if hasSmallPartDebt(mergePartSnapshot{
-		ActiveParts:    1,
-		TotalBytes:     1,
-		SmallParts:     10,
-		SmallPartBytes: 1,
-	}, 2) {
-		t.Fatal("expected no small-part debt with one active part")
-	}
-	if hasSmallPartDebt(mergePartSnapshot{
-		ActiveParts:    4,
-		TotalBytes:     10 * 1024 * 1024 * 1024,
-		SmallParts:     2,
-		SmallPartBytes: 2 * 1024 * 1024 * 1024,
-	}, 2) {
-		t.Fatal("expected no small-part debt at the allowed small-part count")
-	}
-	if !hasSmallPartDebt(mergePartSnapshot{
-		ActiveParts:    4,
-		TotalBytes:     10 * 1024 * 1024 * 1024,
-		SmallParts:     3,
-		SmallPartBytes: 1,
-	}, 2) {
-		t.Fatal("expected small-part debt above the allowed small-part count")
+	if result.ZeroMergesIdle < minWait {
+		t.Fatalf("zero merges idle = %s, want at least %s", result.ZeroMergesIdle, minWait)
 	}
 }
 
-func TestWaitForMergesStopsAtMergeTimeoutForActiveSmallDebtMerges(t *testing.T) {
+func TestWaitForMergesStopsAtMergeTimeoutForActiveMerges(t *testing.T) {
 	var mergeRequests int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -615,7 +595,7 @@ func TestWaitForMergesStopsAtMergeTimeoutForActiveSmallDebtMerges(t *testing.T) 
 			mergeRequests++
 			_, _ = w.Write([]byte("1\n"))
 		case strings.Contains(query, "system.parts"):
-			_, _ = w.Write([]byte(smallDebtMergeSnapshot()))
+			_, _ = w.Write([]byte(multiPartMergeSnapshot()))
 		default:
 			t.Errorf("unexpected query: %s", query)
 			w.WriteHeader(http.StatusBadRequest)
@@ -663,7 +643,7 @@ func TestWaitForMergesKeepsWaitingWhenZeroMergesAndManyActiveParts(t *testing.T)
 			_, _ = w.Write([]byte("0\n"))
 		case strings.Contains(query, "system.parts"):
 			partRequests++
-			_, _ = w.Write([]byte(smallDebtMergeSnapshot()))
+			_, _ = w.Write([]byte(multiPartMergeSnapshot()))
 		default:
 			t.Errorf("unexpected query: %s", query)
 			w.WriteHeader(http.StatusBadRequest)
@@ -689,14 +669,57 @@ func TestWaitForMergesKeepsWaitingWhenZeroMergesAndManyActiveParts(t *testing.T)
 	}
 }
 
+func TestWaitForMergesKeepsWaitingWhenZeroMergesAndLargeTailParts(t *testing.T) {
+	var mergeRequests int
+	var partRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case strings.Contains(query, "system.merges"):
+			mergeRequests++
+			_, _ = w.Write([]byte("0\n"))
+		case strings.Contains(query, "system.parts"):
+			partRequests++
+			_, _ = w.Write([]byte(largeTailMergeSnapshot()))
+		default:
+			t.Errorf("unexpected query: %s", query)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := (Processor{
+		ClickHouse:          chhttp.Client{URL: server.URL},
+		MergeSettleMinWait:  time.Hour,
+		MergeSettleMinParts: 1,
+	}).waitForMerges(ctx, testMergeWaitTarget())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForMerges error = %v, want context deadline exceeded", err)
+	}
+	if mergeRequests == 0 {
+		t.Fatal("expected system.merges to be queried")
+	}
+	if partRequests == 0 {
+		t.Fatal("expected system.parts to be queried after zero active merges")
+	}
+}
+
 func TestWaitForMergesResetsIdleWindowWhenActivePartCountChanges(t *testing.T) {
 	var mergeRequests int
 	var partRequests int
 	activeParts := []string{
-		"4\t1073741824\t4\t1073741824\t268435456\n",
-		"3\t1073741824\t3\t1073741824\t357913941\n",
-		"4\t1073741824\t4\t1073741824\t268435456\n",
-		"3\t1073741824\t3\t1073741824\t357913941\n",
+		"4\t1073741824\t268435456\n",
+		"3\t1073741824\t357913941\n",
+		"4\t1073741824\t268435456\n",
+		"3\t1073741824\t357913941\n",
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -783,13 +806,13 @@ func TestMergePartSnapshotUsesBytesOnDisk(t *testing.T) {
 			return
 		}
 		partQuery = string(body)
-		_, _ = w.Write([]byte(smallDebtMergeSnapshot()))
+		_, _ = w.Write([]byte(multiPartMergeSnapshot()))
 	}))
 	defer server.Close()
 
 	snapshot, err := (Processor{
 		ClickHouse: chhttp.Client{URL: server.URL},
-	}).mergePartSnapshot(context.Background(), testMergeWaitTarget(), DefaultMergeSmallPartBytes)
+	}).mergePartSnapshot(context.Background(), testMergeWaitTarget())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -798,22 +821,28 @@ func TestMergePartSnapshotUsesBytesOnDisk(t *testing.T) {
 	}
 	for _, want := range []string{
 		"sum(bytes_on_disk)",
-		"countIf(bytes_on_disk <",
-		"sumIf(bytes_on_disk, bytes_on_disk <",
 		"max(bytes_on_disk)",
 	} {
 		if !strings.Contains(partQuery, want) {
 			t.Fatalf("part query = %q, missing %q", partQuery, want)
 		}
 	}
+	for _, notWant := range []string{
+		"countIf(",
+		"sumIf(",
+	} {
+		if strings.Contains(partQuery, notWant) {
+			t.Fatalf("part query = %q, should not contain %q", partQuery, notWant)
+		}
+	}
 }
 
-func smallDebtMergeSnapshot() string {
-	return "4\t1073741824\t4\t1073741824\t268435456\n"
+func multiPartMergeSnapshot() string {
+	return "4\t1073741824\t268435456\n"
 }
 
 func largeTailMergeSnapshot() string {
-	return "2\t10737418240\t0\t0\t5368709120\n"
+	return "2\t10737418240\t5368709120\n"
 }
 
 func testMergeWaitTarget() mergeWaitTarget {
@@ -826,20 +855,14 @@ func testMergeWaitTarget() mergeWaitTarget {
 }
 
 func TestDefaultMergeTimeout(t *testing.T) {
-	if DefaultMergeTimeout != 10*time.Minute {
-		t.Fatalf("DefaultMergeTimeout = %s, want 10m", DefaultMergeTimeout)
+	if DefaultMergeTimeout != 20*time.Minute {
+		t.Fatalf("DefaultMergeTimeout = %s, want 20m", DefaultMergeTimeout)
 	}
 	if DefaultMergeSettleMinWait != 2*time.Minute {
 		t.Fatalf("DefaultMergeSettleMinWait = %s, want 2m", DefaultMergeSettleMinWait)
 	}
 	if DefaultMergeSettleMinParts != 1 {
 		t.Fatalf("DefaultMergeSettleMinParts = %d, want 1", DefaultMergeSettleMinParts)
-	}
-	if DefaultMergeSmallPartBytes != 1024*1024*1024 {
-		t.Fatalf("DefaultMergeSmallPartBytes = %d, want 1 GiB", DefaultMergeSmallPartBytes)
-	}
-	if DefaultMergeSmallPartMaxCount != 2 {
-		t.Fatalf("DefaultMergeSmallPartMaxCount = %d, want 2", DefaultMergeSmallPartMaxCount)
 	}
 }
 

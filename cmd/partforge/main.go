@@ -642,8 +642,6 @@ func runWorker(ctx context.Context, args []string) error {
 		mergeTimeout            = fs.Duration("merge-timeout", rewrite.DefaultMergeTimeout, "maximum time to wait for destination merges before freezing current destination parts")
 		mergeSettleMinWait      = fs.Duration("merge-settle-min-wait", rewrite.DefaultMergeSettleMinWait, "minimum time destination merges must stay idle with unchanged active output part count before settling when active output parts remain above -merge-settle-min-parts")
 		mergeSettleMinParts     = fs.Uint64("merge-settle-min-parts", rewrite.DefaultMergeSettleMinParts, "active output part count above which idle destination merges and unchanged active output part count are required for -merge-settle-min-wait before settling")
-		mergeSmallPartBytes     = fs.Uint64("merge-small-part-bytes", rewrite.DefaultMergeSmallPartBytes, "active output parts below this byte size count as small merge debt")
-		mergeSmallPartMaxCount  = fs.Uint64("merge-small-part-max-count", rewrite.DefaultMergeSmallPartMaxCount, "maximum small active output parts allowed before merge wait treats the table as having small-part debt")
 		metricsAddr             = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables metrics")
 		metricsPath             = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
 		stateProgressInterval   = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress heartbeats to DynamoDB; <=0 disables progress writes")
@@ -727,8 +725,6 @@ func runWorker(ctx context.Context, args []string) error {
 		"merge_timeout", *mergeTimeout,
 		"merge_settle_min_wait", *mergeSettleMinWait,
 		"merge_settle_min_parts", *mergeSettleMinParts,
-		"merge_small_part_bytes_on_disk", *mergeSmallPartBytes,
-		"merge_small_part_max_count", *mergeSmallPartMaxCount,
 	)
 
 	var recorder metrics.Recorder = metrics.Noop{}
@@ -837,18 +833,16 @@ func runWorker(ctx context.Context, args []string) error {
 
 			ch := chhttp.Client{URL: *clickHouseURL, User: *clickHouseUser, Password: *clickHousePassword}
 			processor := rewrite.Processor{
-				S3Copy:                 s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
-				ClickHouse:             ch,
-				WorkDir:                runDirs.Scratch,
-				MergeTimeout:           *mergeTimeout,
-				MergeSettleMinWait:     *mergeSettleMinWait,
-				MergeSettleMinParts:    *mergeSettleMinParts,
-				MergeSmallPartBytes:    *mergeSmallPartBytes,
-				MergeSmallPartMaxCount: *mergeSmallPartMaxCount,
-				Metrics:                recorder,
-				InsertSettings:         insertSettings,
-				ProgressInterval:       *stateProgressInterval,
-				ForceOptimizeFinal:     *optimizeFinal,
+				S3Copy:              s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
+				ClickHouse:          ch,
+				WorkDir:             runDirs.Scratch,
+				MergeTimeout:        *mergeTimeout,
+				MergeSettleMinWait:  *mergeSettleMinWait,
+				MergeSettleMinParts: *mergeSettleMinParts,
+				Metrics:             recorder,
+				InsertSettings:      insertSettings,
+				ProgressInterval:    *stateProgressInterval,
+				ForceOptimizeFinal:  *optimizeFinal,
 				MergeTreeSettings: rewrite.MergeTreeSettings{
 					MergeMaxBlockSize:       mergeTreeSettings.MergeMaxBlockSize,
 					MergeMaxBlockSizeBytes:  mergeTreeSettings.MergeMaxBlockSizeBytes,
