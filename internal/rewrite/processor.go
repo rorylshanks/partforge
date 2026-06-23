@@ -885,9 +885,6 @@ type progressHeartbeat struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
-
-	mu  sync.Mutex
-	err error
 }
 
 func (p Processor) startProgressHeartbeat(ctx context.Context, m manifest.Manifest, tracker *rewriteStageTracker) (*progressHeartbeat, error) {
@@ -899,8 +896,7 @@ func (p Processor) startProgressHeartbeat(ctx context.Context, m manifest.Manife
 	heartbeat.ctx, heartbeat.cancel = context.WithCancel(ctx)
 	heartbeat.done = make(chan struct{})
 	if err := p.reportStageSnapshot(heartbeat.ctx, m, tracker); err != nil {
-		heartbeat.cancel()
-		return heartbeat, err
+		slog.Warn("progress heartbeat update failed; continuing", "job_id", m.JobID, "part_id", m.PartID, "error", err)
 	}
 
 	go func() {
@@ -911,8 +907,10 @@ func (p Processor) startProgressHeartbeat(ctx context.Context, m manifest.Manife
 			select {
 			case <-ticker.C:
 				if err := p.reportStageSnapshot(heartbeat.ctx, m, tracker); err != nil {
-					heartbeat.setErr(err)
-					return
+					if heartbeat.ctx.Err() != nil {
+						return
+					}
+					slog.Warn("progress heartbeat update failed; continuing", "job_id", m.JobID, "part_id", m.PartID, "error", err)
 				}
 			case <-heartbeat.ctx.Done():
 				return
@@ -967,22 +965,7 @@ func (h *progressHeartbeat) Stop() error {
 	}
 	h.cancel()
 	<-h.done
-	return h.Err()
-}
-
-func (h *progressHeartbeat) Err() error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.err
-}
-
-func (h *progressHeartbeat) setErr(err error) {
-	h.mu.Lock()
-	if h.err == nil {
-		h.err = err
-		h.cancel()
-	}
-	h.mu.Unlock()
+	return nil
 }
 
 func shouldReportProgress(interval time.Duration, last time.Time, now time.Time) bool {

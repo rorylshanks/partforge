@@ -1033,14 +1033,16 @@ func TestProgressHeartbeatDisabled(t *testing.T) {
 	}
 }
 
-func TestProgressHeartbeatReportFailureCancelsContext(t *testing.T) {
+func TestProgressHeartbeatReportFailureContinues(t *testing.T) {
 	reportErr := errors.New("progress update failed")
+	attempts := make(chan struct{}, 8)
 	reports := 0
 	processor := Processor{
 		ProgressInterval: time.Millisecond,
 		ReportProgress: func(ctx context.Context, m manifest.Manifest, snapshot ProgressSnapshot) error {
 			reports++
-			if reports > 1 {
+			attempts <- struct{}{}
+			if reports == 2 {
 				return reportErr
 			}
 			return nil
@@ -1052,14 +1054,54 @@ func TestProgressHeartbeatReportFailureCancelsContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() {
+		if err := heartbeat.Stop(); err != nil {
+			t.Fatal(err)
+		}
+	}()
 
+	for i := 0; i < 4; i++ {
+		select {
+		case <-attempts:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for heartbeat report")
+		}
+	}
 	select {
 	case <-heartbeat.Context().Done():
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for heartbeat context cancellation")
+		t.Fatal("heartbeat context was canceled by report failure")
+	default:
 	}
-	if err := heartbeat.Stop(); !errors.Is(err, reportErr) {
-		t.Fatalf("heartbeat stop error = %v, want %v", err, reportErr)
+}
+
+func TestProgressHeartbeatStopIgnoresInFlightContextCancellation(t *testing.T) {
+	inFlight := make(chan struct{})
+	reports := 0
+	processor := Processor{
+		ProgressInterval: time.Millisecond,
+		ReportProgress: func(ctx context.Context, m manifest.Manifest, snapshot ProgressSnapshot) error {
+			reports++
+			if reports == 1 {
+				return nil
+			}
+			close(inFlight)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	tracker := newRewriteStageTracker(time.Now(), stageProcessPart)
+	heartbeat, err := processor.startProgressHeartbeat(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"}, tracker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-inFlight:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for in-flight heartbeat report")
+	}
+	if err := heartbeat.Stop(); err != nil {
+		t.Fatalf("heartbeat stop error = %v, want nil", err)
 	}
 }
 
