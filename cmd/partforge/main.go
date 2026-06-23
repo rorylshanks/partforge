@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -38,6 +39,10 @@ const defaultStateTable = "partforge"
 const defaultConfigPath = "/etc/partforge/config.json"
 const defaultClickHouseClientConfigPath = "/etc/clickhouse-client/config.xml"
 const defaultWorkerShutdownGracePeriod = 90 * time.Second
+const defaultCompactWindow = 2 * time.Hour
+const defaultCompactMaxArtifacts = 8
+const defaultCompactMaxBytes uint64 = 150 * 1024 * 1024 * 1024
+const compactMinInputParts uint64 = 2
 const defaultRetryStaleAfter = 5 * time.Minute
 const workerStateUpdateTimeout = 30 * time.Second
 const inProgressStageUnknown = "unknown"
@@ -639,9 +644,13 @@ func runWorker(ctx context.Context, args []string) error {
 		workerID                = fs.String("worker-id", "", "worker identity recorded on claimed parts")
 		workDir                 = fs.String("work-dir", "/tmp/partforge", "worker scratch directory")
 		defaultCompressionCodec = fs.String("default-compression-codec", resources.DefaultCompressionCodec, "destination table default_compression_codec applied before insert-select starts")
-		mergeTimeout            = fs.Duration("merge-timeout", rewrite.DefaultMergeTimeout, "maximum time to wait for destination merges before freezing current destination parts")
-		mergeSettleMinWait      = fs.Duration("merge-settle-min-wait", rewrite.DefaultMergeSettleMinWait, "minimum time destination merges must stay idle with unchanged active output part count before settling when active output parts remain above -merge-settle-min-parts")
-		mergeSettleMinParts     = fs.Uint64("merge-settle-min-parts", rewrite.DefaultMergeSettleMinParts, "active output part count above which idle destination merges and unchanged active output part count are required for -merge-settle-min-wait before settling")
+		mergeIdleTimeout        = fs.Duration("merge-idle-timeout", rewrite.DefaultMergeTimeout, "how long destination merges may be idle before freezing current destination parts")
+		mergeMaxRuntime         = fs.Duration("merge-max-runtime", rewrite.DefaultMergeMaxTimeout, "hard cap for a destination merge wait even while ClickHouse keeps making progress")
+		compact                 = fs.Bool("compact", true, "run opportunistic compaction when no READY source work is available")
+		compactWindow           = fs.Duration("compact-window", defaultCompactWindow, "how long COMPACT_READY artifacts remain eligible for compaction before being promoted to FINISHED; 0 finalizes as soon as no useful compaction is available")
+		compactMergeIdleTimeout = fs.Duration("compact-merge-idle-timeout", rewrite.DefaultCompactMergeTimeout, "how long compact destination merges may be idle before freezing current compact output")
+		compactMergeMaxRuntime  = fs.Duration("compact-merge-max-runtime", rewrite.DefaultCompactMergeMaxTimeout, "hard cap for a compact merge wait even while ClickHouse keeps making progress")
+		compactMaxBytes         = fs.Uint64("compact-max-bytes", defaultCompactMaxBytes, "maximum summed input bytes_on_disk for one compaction batch; 0 disables the byte cap")
 		metricsAddr             = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables metrics")
 		metricsPath             = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
 		stateProgressInterval   = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress heartbeats to DynamoDB; <=0 disables progress writes")
@@ -660,11 +669,20 @@ func runWorker(ctx context.Context, args []string) error {
 	if strings.TrimSpace(*defaultCompressionCodec) == "" {
 		return fmt.Errorf("default-compression-codec must not be empty")
 	}
-	if *mergeSettleMinWait < 0 {
-		return fmt.Errorf("merge-settle-min-wait must be non-negative, got %s", *mergeSettleMinWait)
+	if *mergeIdleTimeout < 0 {
+		return fmt.Errorf("merge-idle-timeout must be non-negative, got %s", *mergeIdleTimeout)
 	}
-	if *mergeTimeout < 0 {
-		return fmt.Errorf("merge-timeout must be non-negative, got %s", *mergeTimeout)
+	if *mergeMaxRuntime < 0 {
+		return fmt.Errorf("merge-max-runtime must be non-negative, got %s", *mergeMaxRuntime)
+	}
+	if *compactWindow < 0 {
+		return fmt.Errorf("compact-window must be non-negative, got %s", *compactWindow)
+	}
+	if *compactMergeIdleTimeout < 0 {
+		return fmt.Errorf("compact-merge-idle-timeout must be non-negative, got %s", *compactMergeIdleTimeout)
+	}
+	if *compactMergeMaxRuntime < 0 {
+		return fmt.Errorf("compact-merge-max-runtime must be non-negative, got %s", *compactMergeMaxRuntime)
 	}
 	slog.Info(
 		"worker started",
@@ -675,6 +693,7 @@ func runWorker(ctx context.Context, args []string) error {
 		"clickhouse_url", *clickHouseURL,
 		"shutdown_grace_period", *shutdownGracePeriod,
 		"optimize_final", *optimizeFinal,
+		"compact", *compact,
 	)
 	slog.Info("initializing DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
 	stateStore, err := state.New(ctx, state.Config{
@@ -727,9 +746,19 @@ func runWorker(ctx context.Context, args []string) error {
 		"merge_max_block_size_bytes", mergeTreeSettings.MergeMaxBlockSizeBytes,
 		"merge_selecting_sleep_ms", mergeTreeSettings.MergeSelectingSleepMS,
 		"background_merges_mutations_scheduling_policy", mergeTreeSettings.MergeSchedulingPolicy,
-		"merge_timeout", *mergeTimeout,
-		"merge_settle_min_wait", *mergeSettleMinWait,
-		"merge_settle_min_parts", *mergeSettleMinParts,
+		"merge_idle_timeout", *mergeIdleTimeout,
+		"merge_max_runtime", *mergeMaxRuntime,
+		"merge_settle_min_wait", derivedMergeSettleMinWait(*mergeIdleTimeout, rewrite.DefaultMergeSettleMinWait),
+		"compact_window", *compactWindow,
+		"compact_retry_cooldown", compactRetryCooldown(*compactWindow),
+		"compact_claim_splay_max", compactClaimSplayMax(*compactWindow),
+		"compact_merge_idle_timeout", *compactMergeIdleTimeout,
+		"compact_merge_max_runtime", *compactMergeMaxRuntime,
+		"compact_merge_settle_min_wait", derivedMergeSettleMinWait(*compactMergeIdleTimeout, rewrite.DefaultCompactMergeSettleMinWait),
+		"compact_load_more_interval", compactLoadMoreInterval(*compactWindow),
+		"compact_max_artifacts", defaultCompactMaxArtifacts,
+		"compact_max_bytes", *compactMaxBytes,
+		"compact_min_input_parts", compactMinInputParts,
 	)
 
 	var recorder metrics.Recorder = metrics.Noop{}
@@ -757,8 +786,42 @@ func runWorker(ctx context.Context, args []string) error {
 			return err
 		}
 		if part == nil {
+			if *compact {
+				didCompactWork, err := runWorkerCompaction(ctx, workerCompactionConfig{
+					StateStore:              stateStore,
+					WorkerID:                resolvedWorkerID,
+					WorkDir:                 *workDir,
+					ClickHouseURL:           *clickHouseURL,
+					ClickHouseUser:          *clickHouseUser,
+					ClickHousePassword:      *clickHousePassword,
+					ClickHouseBinary:        *clickHouseBinary,
+					ClickHouseConfigFile:    *clickHouseConfigFile,
+					S5cmdBinary:             *s5cmdBinary,
+					S3Endpoint:              *s3Endpoint,
+					DefaultCompressionCodec: *defaultCompressionCodec,
+					MergeBackgroundPoolSize: mergeBackgroundPoolSize,
+					MergeSchedulingPolicy:   mergeTreeSettings.MergeSchedulingPolicy,
+					MergeMaxBlockSize:       mergeTreeSettings.MergeMaxBlockSize,
+					MergeMaxBlockSizeBytes:  mergeTreeSettings.MergeMaxBlockSizeBytes,
+					MergeSelectingSleepMS:   mergeTreeSettings.MergeSelectingSleepMS,
+					CompactWindow:           *compactWindow,
+					CompactMergeIdleTimeout: *compactMergeIdleTimeout,
+					CompactMergeMaxRuntime:  *compactMergeMaxRuntime,
+					CompactMaxBytes:         *compactMaxBytes,
+					ShutdownGracePeriod:     *shutdownGracePeriod,
+				})
+				if err != nil {
+					return err
+				}
+				if didCompactWork {
+					if *once {
+						return nil
+					}
+					continue
+				}
+			}
 			if *once {
-				slog.Info("no ready part available")
+				slog.Info("no ready or compactable work available")
 				return nil
 			}
 			slog.Info("no ready part available; sleeping", "stage", "claim_work", "poll_interval", *pollInterval)
@@ -841,9 +904,10 @@ func runWorker(ctx context.Context, args []string) error {
 				S3Copy:              s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
 				ClickHouse:          ch,
 				WorkDir:             runDirs.Scratch,
-				MergeTimeout:        *mergeTimeout,
-				MergeSettleMinWait:  *mergeSettleMinWait,
-				MergeSettleMinParts: *mergeSettleMinParts,
+				MergeTimeout:        *mergeIdleTimeout,
+				MergeMaxTimeout:     *mergeMaxRuntime,
+				MergeSettleMinWait:  derivedMergeSettleMinWait(*mergeIdleTimeout, rewrite.DefaultMergeSettleMinWait),
+				MergeSettleMinParts: rewrite.DefaultMergeSettleMinParts,
 				Metrics:             recorder,
 				InsertSettings:      insertSettings,
 				ProgressInterval:    *stateProgressInterval,
@@ -903,14 +967,18 @@ func runWorker(ctx context.Context, args []string) error {
 			}
 			return err
 		}
-		slog.Info("marking part finished", "stage", "mark_finished", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey)
+		slog.Info("marking part compact-ready", "stage", "mark_compact_ready", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey, "output_parts", result.DestinationStats.Count, "output_bytes", result.DestinationStats.Bytes)
 		stateCtx, cancel := workerStateUpdateContext()
-		err = stateStore.MarkFinished(stateCtx, *part, resolvedWorkerID, result.FinishedKey, time.Now().UTC())
+		err = stateStore.MarkCompactReady(stateCtx, *part, resolvedWorkerID, result.FinishedKey, result.DestinationDatabase, result.DestinationTable, result.DestinationSchema, state.PartStats{
+			Count: result.DestinationStats.Count,
+			Rows:  result.DestinationStats.Rows,
+			Bytes: result.DestinationStats.Bytes,
+		}, partitionCountsFromRewrite(result.DestinationPartitions), time.Now().UTC())
 		cancel()
 		if err != nil {
 			return err
 		}
-		slog.Info("part marked finished", "stage", "mark_finished", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey)
+		slog.Info("part marked compact-ready", "stage", "mark_compact_ready", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey)
 		if shutdownRequested {
 			slog.Info("worker shutdown requested; stopping after completed part", "stage", "shutdown", "job_id", part.JobID, "part_id", part.PartID)
 			return nil
@@ -949,6 +1017,466 @@ func createWorkerRunDirs(workDir string) (workerRunDirs, error) {
 		}
 	}
 	return dirs, nil
+}
+
+type workerCompactionConfig struct {
+	StateStore              *state.Store
+	WorkerID                string
+	WorkDir                 string
+	ClickHouseURL           string
+	ClickHouseUser          string
+	ClickHousePassword      string
+	ClickHouseBinary        string
+	ClickHouseConfigFile    string
+	S5cmdBinary             string
+	S3Endpoint              string
+	DefaultCompressionCodec string
+	MergeBackgroundPoolSize int
+	MergeSchedulingPolicy   string
+	MergeMaxBlockSize       uint64
+	MergeMaxBlockSizeBytes  uint64
+	MergeSelectingSleepMS   uint64
+	CompactWindow           time.Duration
+	CompactMergeIdleTimeout time.Duration
+	CompactMergeMaxRuntime  time.Duration
+	CompactMaxBytes         uint64
+	ShutdownGracePeriod     time.Duration
+}
+
+func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool, error) {
+	retryCooldown := compactRetryCooldown(cfg.CompactWindow)
+	if delay := compactClaimSplay(cfg.CompactWindow); delay > 0 {
+		slog.Info("waiting before compact claim", "stage", "claim_compact_splay", "worker_id", cfg.WorkerID, "delay", delay)
+		if err := sleepOrDone(ctx, delay); err != nil {
+			if ctx.Err() != nil {
+				slog.Info("worker shutdown requested while waiting to claim compact work", "stage", "shutdown")
+				return false, nil
+			}
+			return false, err
+		}
+	}
+	slog.Info("claiming compact-ready batch", "stage", "claim_compact", "worker_id", cfg.WorkerID)
+	batch, err := cfg.StateStore.ClaimNextCompactBatch(ctx, cfg.WorkerID, time.Now().UTC(), state.CompactClaimOptions{
+		MaxArtifacts:  defaultCompactMaxArtifacts,
+		MaxBytes:      cfg.CompactMaxBytes,
+		MinInputParts: compactMinInputParts,
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			slog.Info("worker shutdown requested while claiming compact work", "stage", "shutdown")
+			return false, nil
+		}
+		return false, err
+	}
+	if batch == nil {
+		finalized, err := finalizeCompactReadyJobs(ctx, cfg.StateStore, cfg.CompactWindow, time.Now().UTC())
+		if err != nil {
+			return false, err
+		}
+		if finalized > 0 {
+			slog.Info("finalized compact-ready artifacts", "stage", "finalize_compact", "artifacts", finalized)
+			return true, nil
+		}
+		return false, nil
+	}
+
+	inputIDs := compactBatchPartIDs(batch.Parts)
+	outputPartID := manifest.DeriveCompactPartID(inputIDs, batch.Generation)
+	outputFinishedKey, err := rewrite.CompactFinishedKeyFromInput(batch.Parts[0].FinishedKey, outputPartID)
+	if err != nil {
+		return false, err
+	}
+	slog.Info(
+		"claimed compact-ready batch",
+		"stage", "claim_compact",
+		"job_id", batch.JobID,
+		"output_part_id", outputPartID,
+		"input_artifacts", len(batch.Parts),
+		"input_parts", batch.InputPartCount,
+		"input_rows", batch.InputRows,
+		"input_bytes", batch.InputBytes,
+		"generation", batch.Generation,
+	)
+
+	claimedParts := append([]state.Part(nil), batch.Parts...)
+	workItem := rewrite.CompactWorkItem{
+		JobID:               batch.JobID,
+		OutputPartID:        outputPartID,
+		OutputFinishedKey:   outputFinishedKey,
+		DestinationDatabase: batch.Parts[0].DestinationDatabase,
+		DestinationTable:    batch.Parts[0].DestinationTable,
+		DestinationSchema:   batch.Parts[0].DestinationSchema,
+		Inputs:              compactInputs(batch.Parts),
+	}
+	loadMoreInputs := func(ctx context.Context, current rewrite.CompactLoadState) ([]rewrite.CompactInput, error) {
+		remainingArtifacts := defaultCompactMaxArtifacts - len(claimedParts)
+		if remainingArtifacts <= 0 {
+			return nil, nil
+		}
+		remainingBytes := uint64(0)
+		if cfg.CompactMaxBytes > 0 {
+			if current.Stats.Bytes >= cfg.CompactMaxBytes {
+				return nil, nil
+			}
+			remainingBytes = cfg.CompactMaxBytes - current.Stats.Bytes
+		}
+		requiredPartitions := partitionIDsFromRewrite(current.Partitions)
+		if len(requiredPartitions) == 0 {
+			return nil, nil
+		}
+		more, err := cfg.StateStore.ClaimNextCompactBatch(ctx, cfg.WorkerID, time.Now().UTC(), state.CompactClaimOptions{
+			MaxArtifacts:         remainingArtifacts,
+			MaxBytes:             remainingBytes,
+			MinInputParts:        1,
+			JobID:                batch.JobID,
+			Bucket:               batch.Parts[0].Bucket,
+			DestinationDatabase:  batch.Parts[0].DestinationDatabase,
+			DestinationTable:     batch.Parts[0].DestinationTable,
+			DestinationSchema:    batch.Parts[0].DestinationSchema,
+			RequiredPartitionIDs: requiredPartitions,
+		})
+		if err != nil || more == nil {
+			return nil, err
+		}
+		claimedParts = append(claimedParts, more.Parts...)
+		slog.Info("claimed more compact-ready artifacts for running compaction", "stage", "claim_more_compact", "job_id", batch.JobID, "output_part_id", outputPartID, "claimed_more", len(more.Parts), "claimed_total", len(claimedParts), "current_active_parts", current.Stats.Count, "current_active_bytes", current.Stats.Bytes, "current_partitions", len(requiredPartitions))
+		return compactInputs(more.Parts), nil
+	}
+	processCtx, compactShutdown := workerProcessContext(ctx, cfg.ShutdownGracePeriod, batch.JobID, outputPartID)
+	result, err := processCompactBatch(processCtx, cfg, workItem, loadMoreInputs)
+	shutdownRequested := compactShutdown.Requested()
+	shutdownForced := compactShutdown.Forced()
+	compactShutdown.Stop()
+	currentBatch := func() state.CompactBatch {
+		out := *batch
+		out.Parts = append([]state.Part(nil), claimedParts...)
+		return out
+	}
+	if err != nil {
+		stateCtx, cancel := workerStateUpdateContext()
+		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC().Add(retryCooldown), time.Now().UTC())
+		cancel()
+		if shutdownForced {
+			if releaseErr != nil {
+				return true, fmt.Errorf("shutdown release compact batch %s/%s: %w", batch.JobID, outputPartID, releaseErr)
+			}
+			slog.Info("released compact batch after shutdown grace period", "stage", "shutdown", "job_id", batch.JobID, "output_part_id", outputPartID)
+			return true, nil
+		}
+		if releaseErr != nil {
+			return true, fmt.Errorf("compact batch %s/%s failed: %w; additionally failed to release compact batch: %v", batch.JobID, outputPartID, err, releaseErr)
+		}
+		return true, err
+	}
+	if !result.Reduced {
+		stateCtx, cancel := workerStateUpdateContext()
+		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC().Add(retryCooldown), time.Now().UTC())
+		cancel()
+		if releaseErr != nil {
+			return true, releaseErr
+		}
+		slog.Info("compact batch did not reduce active part count; released with cooldown", "stage", "compact_no_reduction", "job_id", batch.JobID, "output_part_id", outputPartID, "input_parts", result.InputStats.Count, "output_parts", result.DestinationStats.Count, "cooldown", retryCooldown)
+		return true, nil
+	}
+
+	outputInputIDs := compactResultInputPartIDs(result.Inputs)
+	if len(outputInputIDs) == 0 {
+		outputInputIDs = inputIDs
+	}
+	output := state.NewCompactPart(batch.JobID, outputPartID, batch.Parts[0].Bucket, outputFinishedKey, workItem.DestinationDatabase, workItem.DestinationTable, workItem.DestinationSchema, outputInputIDs, batch.Generation, state.PartStats{
+		Count: result.DestinationStats.Count,
+		Rows:  result.DestinationStats.Rows,
+		Bytes: result.DestinationStats.Bytes,
+	}, partitionCountsFromRewrite(result.DestinationPartitions), time.Now().UTC())
+	stateCtx, cancel := workerStateUpdateContext()
+	err = cfg.StateStore.CompleteCompaction(stateCtx, currentBatch(), output, cfg.WorkerID, time.Now().UTC())
+	cancel()
+	if err != nil {
+		releaseCtx, releaseCancel := workerStateUpdateContext()
+		releaseErr := cfg.StateStore.ReleaseCompactBatch(releaseCtx, currentBatch(), cfg.WorkerID, time.Now().UTC().Add(retryCooldown), time.Now().UTC())
+		releaseCancel()
+		if releaseErr != nil {
+			return true, fmt.Errorf("complete compaction %s/%s: %w; additionally failed to release compact batch: %v", batch.JobID, outputPartID, err, releaseErr)
+		}
+		return true, err
+	}
+	slog.Info("completed compact batch", "stage", "complete_compact", "job_id", batch.JobID, "output_part_id", outputPartID, "finished_key", outputFinishedKey, "input_artifacts", len(claimedParts), "input_parts", result.InputStats.Count, "output_parts", result.DestinationStats.Count, "output_bytes", result.DestinationStats.Bytes)
+	if shutdownRequested {
+		slog.Info("worker shutdown requested; stopping after completed compaction", "stage", "shutdown", "job_id", batch.JobID, "output_part_id", outputPartID)
+	}
+	return true, nil
+}
+
+func processCompactBatch(ctx context.Context, cfg workerCompactionConfig, item rewrite.CompactWorkItem, loadMoreInputs func(context.Context, rewrite.CompactLoadState) ([]rewrite.CompactInput, error)) (rewrite.CompactResult, error) {
+	runDirs, err := createWorkerRunDirs(cfg.WorkDir)
+	if err != nil {
+		return rewrite.CompactResult{}, err
+	}
+	slog.Info("created compact worker run directory", "stage", "compact_prepare_work_dir", "work_dir", cfg.WorkDir, "run_dir", runDirs.Root, "clickhouse_data_dir", runDirs.ClickHouse, "scratch_dir", runDirs.Scratch, "job_id", item.JobID, "output_part_id", item.OutputPartID)
+
+	var server *chproc.Server
+	defer func() {
+		if server != nil {
+			slog.Info("stopping local ClickHouse server", "stage", "compact_stop_clickhouse", "job_id", item.JobID, "output_part_id", item.OutputPartID)
+			if err := server.Stop(); err != nil {
+				slog.Warn("failed to stop local ClickHouse server", "stage", "compact_stop_clickhouse", "job_id", item.JobID, "output_part_id", item.OutputPartID, "error", err)
+			}
+		}
+		if err := os.RemoveAll(runDirs.Root); err != nil {
+			slog.Warn("failed to remove compact worker run directory", "run_dir", runDirs.Root, "job_id", item.JobID, "output_part_id", item.OutputPartID, "error", err)
+		}
+	}()
+
+	startServer := func(ctx context.Context, tuning chproc.Tuning) (*chproc.Server, error) {
+		return chproc.Start(ctx, chproc.Config{
+			Binary:     cfg.ClickHouseBinary,
+			ConfigFile: cfg.ClickHouseConfigFile,
+			DataDir:    runDirs.ClickHouse,
+			URL:        cfg.ClickHouseURL,
+			User:       cfg.ClickHouseUser,
+			Password:   cfg.ClickHousePassword,
+			Timeout:    90 * time.Second,
+			Tuning:     tuning,
+		})
+	}
+	slog.Info("starting local ClickHouse server for compaction", "stage", "compact_start_clickhouse", "binary", cfg.ClickHouseBinary, "config_file", cfg.ClickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", item.JobID, "output_part_id", item.OutputPartID)
+	server, err = startServer(ctx, chproc.Tuning{})
+	if err != nil {
+		return rewrite.CompactResult{}, err
+	}
+
+	ch := chhttp.Client{URL: cfg.ClickHouseURL, User: cfg.ClickHouseUser, Password: cfg.ClickHousePassword}
+	compactor := rewrite.Compactor{
+		S3Copy:              s3copy.Copier{Binary: cfg.S5cmdBinary, Endpoint: cfg.S3Endpoint},
+		ClickHouse:          ch,
+		WorkDir:             runDirs.Scratch,
+		MergeTimeout:        cfg.CompactMergeIdleTimeout,
+		MergeMaxTimeout:     cfg.CompactMergeMaxRuntime,
+		MergeSettleMinWait:  derivedMergeSettleMinWait(cfg.CompactMergeIdleTimeout, rewrite.DefaultCompactMergeSettleMinWait),
+		MergeSettleMinParts: rewrite.DefaultMergeSettleMinParts,
+		LoadMoreInputs:      loadMoreInputs,
+		LoadMoreInterval:    compactLoadMoreInterval(cfg.CompactWindow),
+		MergeTreeSettings: rewrite.MergeTreeSettings{
+			MergeMaxBlockSize:       cfg.MergeMaxBlockSize,
+			MergeMaxBlockSizeBytes:  cfg.MergeMaxBlockSizeBytes,
+			MergeSelectingSleepMS:   cfg.MergeSelectingSleepMS,
+			DefaultCompressionCodec: cfg.DefaultCompressionCodec,
+		},
+	}
+	compactor.RestartClickHouse = func(ctx context.Context) error {
+		if server == nil {
+			return errors.New("local ClickHouse server is not running")
+		}
+		slog.Info("stopping local ClickHouse server for compact restart", "stage", "compact_restart_clickhouse", "job_id", item.JobID, "output_part_id", item.OutputPartID)
+		if err := server.Stop(); err != nil {
+			return fmt.Errorf("stop clickhouse before compact restart: %w", err)
+		}
+		server = nil
+		slog.Info("starting local ClickHouse server after compact restart", "stage", "compact_restart_clickhouse", "binary", cfg.ClickHouseBinary, "config_file", cfg.ClickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", item.JobID, "output_part_id", item.OutputPartID, "background_pool_size", cfg.MergeBackgroundPoolSize, "background_merges_mutations_scheduling_policy", cfg.MergeSchedulingPolicy)
+		restarted, err := startServer(ctx, chproc.Tuning{BackgroundPoolSize: cfg.MergeBackgroundPoolSize, MergeSchedulingPolicy: cfg.MergeSchedulingPolicy})
+		if err != nil {
+			return err
+		}
+		server = restarted
+		return nil
+	}
+	return compactor.Compact(ctx, item)
+}
+
+func compactBatchPartIDs(parts []state.Part) []string {
+	ids := make([]string, 0, len(parts))
+	for _, part := range parts {
+		ids = append(ids, part.PartID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func compactInputs(parts []state.Part) []rewrite.CompactInput {
+	inputs := make([]rewrite.CompactInput, 0, len(parts))
+	for _, part := range parts {
+		inputs = append(inputs, rewrite.CompactInput{
+			PartID:          part.PartID,
+			Bucket:          part.Bucket,
+			FinishedKey:     part.FinishedKey,
+			Parts:           part.DestinationActivePartCount,
+			Rows:            part.DestinationActivePartRows,
+			Bytes:           part.DestinationActivePartBytes,
+			PartitionCounts: cloneUint64Map(part.DestinationActivePartitionCounts),
+		})
+	}
+	return inputs
+}
+
+func compactResultInputPartIDs(inputs []rewrite.CompactInput) []string {
+	ids := make([]string, 0, len(inputs))
+	for _, input := range inputs {
+		ids = append(ids, input.PartID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func partitionCountsFromRewrite(partitions []rewrite.PartPartitionStats) map[string]uint64 {
+	counts := make(map[string]uint64, len(partitions))
+	for _, partition := range partitions {
+		if strings.TrimSpace(partition.PartitionID) == "" || partition.Parts == 0 {
+			continue
+		}
+		counts[partition.PartitionID] = partition.Parts
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+	return counts
+}
+
+func partitionIDsFromRewrite(partitions []rewrite.PartPartitionStats) []string {
+	ids := make([]string, 0, len(partitions))
+	for _, partition := range partitions {
+		if strings.TrimSpace(partition.PartitionID) == "" || partition.Parts == 0 {
+			continue
+		}
+		ids = append(ids, partition.PartitionID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func cloneUint64Map(values map[string]uint64) map[string]uint64 {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]uint64, len(values))
+	for key, value := range values {
+		if strings.TrimSpace(key) == "" || value == 0 {
+			continue
+		}
+		out[key] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func derivedMergeSettleMinWait(idleTimeout, maxWait time.Duration) time.Duration {
+	if idleTimeout <= 0 {
+		return 0
+	}
+	wait := idleTimeout / 4
+	if wait < time.Second {
+		wait = time.Second
+	}
+	if maxWait > 0 && wait > maxWait {
+		wait = maxWait
+	}
+	return wait
+}
+
+func compactRetryCooldown(compactWindow time.Duration) time.Duration {
+	if compactWindow <= 0 {
+		return time.Minute
+	}
+	cooldown := compactWindow / 4
+	if cooldown < time.Minute {
+		return time.Minute
+	}
+	if cooldown > 30*time.Minute {
+		return 30 * time.Minute
+	}
+	return cooldown
+}
+
+func compactLoadMoreInterval(compactWindow time.Duration) time.Duration {
+	cooldown := compactRetryCooldown(compactWindow)
+	interval := cooldown / 60
+	if interval < 5*time.Second {
+		return 5 * time.Second
+	}
+	if interval > 30*time.Second {
+		return 30 * time.Second
+	}
+	return interval
+}
+
+func compactClaimSplay(compactWindow time.Duration) time.Duration {
+	maxDelay := compactClaimSplayMax(compactWindow)
+	if maxDelay <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int63n(int64(maxDelay) + 1))
+}
+
+func compactClaimSplayMax(compactWindow time.Duration) time.Duration {
+	if compactWindow <= 0 {
+		return 0
+	}
+	maxDelay := compactRetryCooldown(compactWindow) / 360
+	if maxDelay < 250*time.Millisecond {
+		return 250 * time.Millisecond
+	}
+	if maxDelay > 5*time.Second {
+		return 5 * time.Second
+	}
+	return maxDelay
+}
+
+func finalizeCompactReadyJobs(ctx context.Context, store *state.Store, compactWindow time.Duration, now time.Time) (int, error) {
+	jobIDs, err := store.ListJobIDs(ctx)
+	if err != nil {
+		return 0, err
+	}
+	finalized := 0
+	for _, jobID := range jobIDs {
+		parts, err := store.ListJobParts(ctx, jobID)
+		if err != nil {
+			return finalized, err
+		}
+		compactReady, ok, err := finalizableCompactReadyParts(parts, compactWindow, now)
+		if err != nil {
+			return finalized, err
+		}
+		if !ok {
+			continue
+		}
+		for _, part := range compactReady {
+			if err := store.MarkCompactReadyFinished(ctx, part, now); err != nil {
+				return finalized, err
+			}
+			finalized++
+		}
+	}
+	return finalized, nil
+}
+
+func finalizableCompactReadyParts(parts []state.Part, compactWindow time.Duration, now time.Time) ([]state.Part, bool, error) {
+	var compactReady []state.Part
+	for _, part := range parts {
+		switch part.Status {
+		case state.StatusReady, state.StatusInProgress, state.StatusCompacting, state.StatusFailed:
+			return nil, false, nil
+		case state.StatusCompactReady:
+			compactReady = append(compactReady, part)
+		}
+	}
+	if len(compactReady) == 0 {
+		return nil, false, nil
+	}
+	if compactWindow <= 0 {
+		return compactReady, true, nil
+	}
+	cutoff := now.Add(-compactWindow)
+	for _, part := range compactReady {
+		updatedAt, err := time.Parse(time.RFC3339Nano, part.UpdatedAt)
+		if err != nil {
+			return nil, false, fmt.Errorf("parse updated_at for compact-ready part %s: %w", part.PartID, err)
+		}
+		if updatedAt.After(cutoff) {
+			return nil, false, nil
+		}
+	}
+	return compactReady, true, nil
 }
 
 func runImportFinished(ctx context.Context, args []string) error {
@@ -1770,7 +2298,7 @@ func summarizeJob(jobID string, parts []state.Part) jobSummary {
 	})
 
 	total := len(parts)
-	rewriteCompleted := counts[state.StatusFinished] + counts[state.StatusImporting] + counts[state.StatusImported]
+	rewriteCompleted := counts[state.StatusCompactReady] + counts[state.StatusCompacting] + counts[state.StatusSuperseded] + counts[state.StatusFinished] + counts[state.StatusImporting] + counts[state.StatusImported]
 	importCompleted := counts[state.StatusImported]
 	return jobSummary{
 		JobID:            jobID,
@@ -2133,6 +2661,9 @@ func statusOrder() []state.Status {
 	return []state.Status{
 		state.StatusReady,
 		state.StatusInProgress,
+		state.StatusCompactReady,
+		state.StatusCompacting,
+		state.StatusSuperseded,
 		state.StatusFinished,
 		state.StatusImporting,
 		state.StatusImported,
@@ -2146,12 +2677,14 @@ func overallStatus(total int, counts map[state.Status]int) string {
 		return "EMPTY"
 	case counts[state.StatusFailed] > 0:
 		return "FAILED"
-	case counts[state.StatusImported] == total:
+	case counts[state.StatusImported]+counts[state.StatusSuperseded] == total:
 		return "IMPORTED"
 	case counts[state.StatusImporting] > 0:
 		return "IMPORTING"
-	case counts[state.StatusFinished]+counts[state.StatusImporting]+counts[state.StatusImported] == total:
+	case counts[state.StatusFinished]+counts[state.StatusImporting]+counts[state.StatusImported]+counts[state.StatusSuperseded] == total:
 		return "READY_FOR_IMPORT"
+	case counts[state.StatusCompacting] > 0 || counts[state.StatusCompactReady] > 0:
+		return "COMPACTING"
 	case counts[state.StatusInProgress] > 0:
 		return "REWRITING"
 	default:

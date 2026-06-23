@@ -24,8 +24,12 @@ import (
 	"github.com/partforge/partforge/internal/s3copy"
 )
 
-const DefaultMergeTimeout = time.Hour
-const DefaultMergeSettleMinWait = 2 * time.Minute
+const DefaultMergeTimeout = 5 * time.Minute
+const DefaultMergeMaxTimeout = time.Hour
+const DefaultMergeSettleMinWait = time.Minute
+const DefaultCompactMergeTimeout = 15 * time.Minute
+const DefaultCompactMergeMaxTimeout = 2 * time.Hour
+const DefaultCompactMergeSettleMinWait = 2 * time.Minute
 const DefaultMergeSettleMinParts uint64 = 1
 const defaultMergePollInterval = time.Second
 const defaultMergeWaitLogInterval = 30 * time.Second
@@ -92,6 +96,7 @@ type Processor struct {
 	ClickHouse          chhttp.Client
 	WorkDir             string
 	MergeTimeout        time.Duration
+	MergeMaxTimeout     time.Duration
 	Metrics             metrics.Recorder
 	InsertSettings      chhttp.QuerySettings
 	ProgressInterval    time.Duration
@@ -102,6 +107,7 @@ type Processor struct {
 	MergePollInterval   time.Duration
 	RestartClickHouse   func(context.Context) error
 	ForceOptimizeFinal  bool
+	mergeWaitHook       func(context.Context, mergeWaitTarget, mergePartSnapshot, uint64) (bool, error)
 }
 
 type MergeTreeSettings struct {
@@ -138,7 +144,12 @@ type WorkItem struct {
 }
 
 type ProcessResult struct {
-	FinishedKey string
+	FinishedKey           string
+	DestinationDatabase   string
+	DestinationTable      string
+	DestinationSchema     string
+	DestinationStats      metrics.PartStats
+	DestinationPartitions []PartPartitionStats
 }
 
 type frozenPartGlob struct {
@@ -147,7 +158,16 @@ type frozenPartGlob struct {
 }
 
 type rewriteResult struct {
-	FrozenPartGlobs []frozenPartGlob
+	FrozenPartGlobs       []frozenPartGlob
+	DestinationStats      metrics.PartStats
+	DestinationPartitions []PartPartitionStats
+}
+
+type PartPartitionStats struct {
+	PartitionID string
+	Parts       uint64
+	Rows        uint64
+	Bytes       uint64
 }
 
 type workerTableInfo struct {
@@ -372,7 +392,14 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 		return ProcessResult{}, err
 	}
 	slog.Info("processed part", "stage", "complete_part", "job_id", m.JobID, "part_id", m.PartID, "finished_key", m.S3.FinishedKey, "frozen_part_globs", len(rewriteResult.FrozenPartGlobs), "elapsed", time.Since(startedAt))
-	return ProcessResult{FinishedKey: m.S3.FinishedKey}, nil
+	return ProcessResult{
+		FinishedKey:           m.S3.FinishedKey,
+		DestinationDatabase:   m.Dest.Database,
+		DestinationTable:      m.Dest.Table,
+		DestinationSchema:     m.SQL.DestinationSchema,
+		DestinationStats:      rewriteResult.DestinationStats,
+		DestinationPartitions: rewriteResult.DestinationPartitions,
+	}, nil
 }
 
 func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourcePartRoot string, stageTracker *rewriteStageTracker) (result rewriteResult, err error) {
@@ -518,10 +545,13 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	} else {
 		destinationFailedMerges = &failedMerges
 	}
-	destStats, err := p.activePartStats(ctx, m.Dest.Database, m.Dest.Table)
+	destPartitions, err := p.activePartPartitionStats(ctx, m.Dest.Database, m.Dest.Table)
 	if err != nil {
-		return rewriteResult{}, fmt.Errorf("measure destination active parts: %w", err)
+		return rewriteResult{}, fmt.Errorf("measure destination active part partitions: %w", err)
 	}
+	destStats := summarizePartPartitions(destPartitions)
+	result.DestinationStats = destStats
+	result.DestinationPartitions = destPartitions
 	p.recorder().SetActivePartStats("destination", m, destStats)
 	if err := p.reportProgress(ctx, m, ProgressSnapshot{DestinationActivePartStats: &destStats, DestinationFailedMerges: destinationFailedMerges}); err != nil {
 		return rewriteResult{}, err
@@ -687,7 +717,6 @@ func mergePoolByteSettingsForActiveBytes(activeBytes uint64) mergePoolByteSettin
 	if activeBytes > 0 {
 		target := ceilDivUint64(activeBytes, autoMergeTargetPartCount)
 		maxAtMaxSpace = maxUint64(target, minMergeMaxBytesAtMaxSpaceInPool)
-		maxAtMaxSpace = minUint64(maxAtMaxSpace, activeBytes)
 		maxAtMaxSpace = minUint64(maxAtMaxSpace, maxMergeMaxBytesAtMaxSpaceInPool)
 	}
 	if maxAtMaxSpace == 0 {
@@ -1224,6 +1253,52 @@ func (p Processor) activePartStats(ctx context.Context, database, table string) 
 	return metrics.PartStats{Count: count, Rows: partRows, Bytes: bytes}, nil
 }
 
+func (p Processor) activePartPartitionStats(ctx context.Context, database, table string) ([]PartPartitionStats, error) {
+	query := "SELECT partition_id, count(), ifNull(sum(rows), 0), ifNull(sum(bytes_on_disk), 0) FROM system.parts WHERE database = " +
+		chhttp.StringLiteral(database) + " AND table = " + chhttp.StringLiteral(table) +
+		" AND active GROUP BY partition_id ORDER BY partition_id FORMAT TSV"
+	out, err := p.ClickHouse.QueryString(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := chhttp.FormatTSVStrings(out, 4)
+	if err != nil {
+		return nil, err
+	}
+	partitions := make([]PartPartitionStats, 0, len(rows))
+	for _, row := range rows {
+		count, err := chhttp.ParseUInt(row[1])
+		if err != nil {
+			return nil, err
+		}
+		partRows, err := chhttp.ParseUInt(row[2])
+		if err != nil {
+			return nil, err
+		}
+		bytes, err := chhttp.ParseUInt(row[3])
+		if err != nil {
+			return nil, err
+		}
+		partitions = append(partitions, PartPartitionStats{
+			PartitionID: row[0],
+			Parts:       count,
+			Rows:        partRows,
+			Bytes:       bytes,
+		})
+	}
+	return partitions, nil
+}
+
+func summarizePartPartitions(partitions []PartPartitionStats) metrics.PartStats {
+	var stats metrics.PartStats
+	for _, partition := range partitions {
+		stats.Count += partition.Parts
+		stats.Rows += partition.Rows
+		stats.Bytes += partition.Bytes
+	}
+	return stats
+}
+
 func (p Processor) destinationFailedMergeCount(ctx context.Context, target mergeWaitTarget) (uint64, error) {
 	if err := p.ClickHouse.Exec(ctx, "SYSTEM FLUSH LOGS"); err != nil {
 		return 0, fmt.Errorf("flush ClickHouse logs before measuring destination failed merges: %w", err)
@@ -1309,6 +1384,7 @@ type mergeWaitResult struct {
 	LargestPartBytes uint64
 	ZeroMergesIdle   time.Duration
 	Timeout          time.Duration
+	MaxTimeout       time.Duration
 }
 
 type mergeWaitTarget struct {
@@ -1335,6 +1411,16 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 	if timeout < 0 {
 		return mergeWaitResult{}, fmt.Errorf("merge timeout must be non-negative, got %s", timeout)
 	}
+	maxTimeout := p.MergeMaxTimeout
+	if maxTimeout == 0 {
+		maxTimeout = DefaultMergeMaxTimeout
+	}
+	if maxTimeout < 0 {
+		return mergeWaitResult{}, fmt.Errorf("merge max timeout must be non-negative, got %s", maxTimeout)
+	}
+	if maxTimeout < timeout {
+		maxTimeout = timeout
+	}
 	minWait := p.MergeSettleMinWait
 	if minWait == 0 {
 		minWait = DefaultMergeSettleMinWait
@@ -1354,9 +1440,13 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 		return mergeWaitResult{}, fmt.Errorf("merge poll interval must be non-negative, got %s", pollInterval)
 	}
 	startedAt := time.Now()
-	baseDeadline := startedAt.Add(timeout)
+	lastActivityAt := startedAt
+	baseDeadline := lastActivityAt.Add(timeout)
+	maxDeadline := startedAt.Add(maxTimeout)
 	var zeroMergesStableSnapshotSince time.Time
 	var zeroMergesSnapshot mergePartSnapshot
+	var previousSnapshot mergePartSnapshot
+	havePreviousSnapshot := false
 	logState := mergeWaitLogState{}
 	for {
 		count, err := p.destinationMergeCount(ctx, target)
@@ -1367,6 +1457,26 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 		snapshot, err := p.mergePartSnapshot(ctx, target)
 		if err != nil {
 			return mergeWaitResult{}, err
+		}
+		if !havePreviousSnapshot || !sameMergePartSnapshot(snapshot, previousSnapshot) || count > 0 {
+			lastActivityAt = now
+			baseDeadline = lastActivityAt.Add(timeout)
+			previousSnapshot = snapshot
+			havePreviousSnapshot = true
+		}
+		if p.mergeWaitHook != nil {
+			changed, err := p.mergeWaitHook(ctx, target, snapshot, count)
+			if err != nil {
+				return mergeWaitResult{}, err
+			}
+			if changed {
+				lastActivityAt = now
+				baseDeadline = lastActivityAt.Add(timeout)
+				zeroMergesStableSnapshotSince = time.Time{}
+				zeroMergesSnapshot = mergePartSnapshot{}
+				havePreviousSnapshot = false
+				continue
+			}
 		}
 
 		zeroMergesIdle := time.Duration(0)
@@ -1380,6 +1490,7 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 					TotalBytes:       snapshot.TotalBytes,
 					LargestPartBytes: snapshot.LargestPartBytes,
 					Timeout:          timeout,
+					MaxTimeout:       maxTimeout,
 				}, nil
 			}
 			if zeroMergesStableSnapshotSince.IsZero() || !sameMergePartSnapshot(snapshot, zeroMergesSnapshot) {
@@ -1396,6 +1507,18 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 					LargestPartBytes: snapshot.LargestPartBytes,
 					ZeroMergesIdle:   zeroMergesIdle,
 					Timeout:          timeout,
+					MaxTimeout:       maxTimeout,
+				}, nil
+			}
+			if !now.Before(maxDeadline) {
+				return mergeWaitResult{
+					Reason:           "merge_max_timeout_no_destination_merges",
+					ActiveParts:      snapshot.ActiveParts,
+					TotalBytes:       snapshot.TotalBytes,
+					LargestPartBytes: snapshot.LargestPartBytes,
+					ZeroMergesIdle:   zeroMergesIdle,
+					Timeout:          maxTimeout,
+					MaxTimeout:       maxTimeout,
 				}, nil
 			}
 			if !now.Before(baseDeadline) {
@@ -1406,12 +1529,24 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 					LargestPartBytes: snapshot.LargestPartBytes,
 					ZeroMergesIdle:   zeroMergesIdle,
 					Timeout:          timeout,
+					MaxTimeout:       maxTimeout,
 				}, nil
 			}
 			reason = "waiting_for_destination_merge_selection"
 		} else {
 			zeroMergesStableSnapshotSince = time.Time{}
 			zeroMergesSnapshot = mergePartSnapshot{}
+		}
+		if !now.Before(maxDeadline) {
+			return mergeWaitResult{
+				Reason:           "merge_max_timeout",
+				ActiveMerges:     count,
+				ActiveParts:      snapshot.ActiveParts,
+				TotalBytes:       snapshot.TotalBytes,
+				LargestPartBytes: snapshot.LargestPartBytes,
+				Timeout:          maxTimeout,
+				MaxTimeout:       maxTimeout,
+			}, nil
 		}
 		if !now.Before(baseDeadline) {
 			return mergeWaitResult{
@@ -1421,9 +1556,10 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 				TotalBytes:       snapshot.TotalBytes,
 				LargestPartBytes: snapshot.LargestPartBytes,
 				Timeout:          timeout,
+				MaxTimeout:       maxTimeout,
 			}, nil
 		}
-		sleep := mergeWaitSleepDuration(now, pollInterval, baseDeadline)
+		sleep := mergeWaitSleepDuration(now, pollInterval, baseDeadline, maxDeadline)
 		logState.maybeLog(
 			now,
 			target,
@@ -1432,9 +1568,11 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 			snapshot,
 			zeroMergesIdle,
 			timeout,
+			maxTimeout,
 			minWait,
 			startedAt,
 			baseDeadline,
+			maxDeadline,
 			sleep,
 		)
 		select {
@@ -1473,9 +1611,11 @@ func (s *mergeWaitLogState) maybeLog(
 	snapshot mergePartSnapshot,
 	zeroMergesIdle time.Duration,
 	timeout time.Duration,
+	maxTimeout time.Duration,
 	minWait time.Duration,
 	startedAt time.Time,
 	baseDeadline time.Time,
+	maxDeadline time.Time,
 	nextPollIn time.Duration,
 ) {
 	if !s.lastAt.IsZero() && reason == s.lastReason && now.Sub(s.lastAt) < defaultMergeWaitLogInterval {
@@ -1494,6 +1634,8 @@ func (s *mergeWaitLogState) maybeLog(
 		"elapsed", nonNegativeDuration(now.Sub(startedAt)),
 		"timeout", timeout,
 		"base_timeout_remaining", nonNegativeDuration(baseDeadline.Sub(now)),
+		"max_timeout", maxTimeout,
+		"max_timeout_remaining", nonNegativeDuration(maxDeadline.Sub(now)),
 		"active_destination_merges", activeMerges,
 		"active_parts", snapshot.ActiveParts,
 		"total_bytes_on_disk", snapshot.TotalBytes,

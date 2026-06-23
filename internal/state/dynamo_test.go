@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 )
@@ -69,6 +70,7 @@ func TestProgressRemoveExpressionCoversRewriteMetadata(t *testing.T) {
 		"destination_active_part_count",
 		"destination_active_part_rows",
 		"destination_active_part_bytes",
+		"destination_active_partition_counts",
 		"destination_failed_merges",
 		"rewrite_stage",
 		"rewrite_stage_started_at",
@@ -79,5 +81,203 @@ func TestProgressRemoveExpressionCoversRewriteMetadata(t *testing.T) {
 		if !strings.Contains(expr, attr) {
 			t.Fatalf("progress remove expression %q missing %s", expr, attr)
 		}
+	}
+}
+
+func TestSelectCompactBatchPartsAllowsSingleMultiPartArtifact(t *testing.T) {
+	selected := selectCompactBatchParts(compactGroup{parts: []Part{
+		{
+			PartID:                     "part-1",
+			DestinationActivePartCount: 4,
+			DestinationActivePartBytes: 1024,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"202606": 4,
+			},
+		},
+	}}, CompactClaimOptions{MinInputParts: 2, MaxBytes: 2048})
+
+	if len(selected) != 1 || selected[0].PartID != "part-1" {
+		t.Fatalf("selected = %+v, want part-1", selected)
+	}
+}
+
+func TestCompactCandidateGroupsSkipsCooldown(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	groups := compactCandidateGroups([]Part{
+		{
+			JobID:                      "job-1",
+			PartID:                     "part-cooldown",
+			Bucket:                     "bucket",
+			DestinationDatabase:        "db",
+			DestinationTable:           "table",
+			DestinationSchema:          "schema",
+			DestinationActivePartCount: 2,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"202606": 2,
+			},
+			CompactCooldownUntil: formatTime(now.Add(time.Hour)),
+		},
+		{
+			JobID:                      "job-1",
+			PartID:                     "part-ready",
+			Bucket:                     "bucket",
+			DestinationDatabase:        "db",
+			DestinationTable:           "table",
+			DestinationSchema:          "schema",
+			DestinationActivePartCount: 2,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"202606": 2,
+			},
+		},
+	}, nil, now, CompactClaimOptions{})
+	if len(groups) != 1 || len(groups[0].parts) != 1 || groups[0].parts[0].PartID != "part-ready" {
+		t.Fatalf("groups = %+v, want only part-ready", groups)
+	}
+}
+
+func TestSelectCompactBatchPartsRequiresSamePartition(t *testing.T) {
+	selected := selectCompactBatchParts(compactGroup{parts: []Part{
+		{
+			PartID:                     "part-a",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-a": 1,
+			},
+		},
+		{
+			PartID:                     "part-b",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-b": 1,
+			},
+		},
+	}}, CompactClaimOptions{MinInputParts: 2})
+
+	if len(selected) != 0 {
+		t.Fatalf("selected = %+v, want no cross-partition batch", selected)
+	}
+}
+
+func TestSelectCompactBatchPartsUsesSharedPartition(t *testing.T) {
+	selected := selectCompactBatchParts(compactGroup{parts: []Part{
+		{
+			PartID:                     "part-a",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-a": 1,
+			},
+		},
+		{
+			PartID:                     "part-b",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-a": 1,
+			},
+		},
+	}}, CompactClaimOptions{MinInputParts: 2})
+
+	if len(selected) != 2 || selected[0].PartID != "part-a" || selected[1].PartID != "part-b" {
+		t.Fatalf("selected = %+v, want part-a and part-b", selected)
+	}
+}
+
+func TestSelectCompactBatchPartsHonorsRequiredPartitions(t *testing.T) {
+	selected := selectCompactBatchParts(compactGroup{parts: []Part{
+		{
+			PartID:                     "part-a",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-a": 1,
+			},
+		},
+		{
+			PartID:                     "part-b",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-b": 1,
+			},
+		},
+	}}, CompactClaimOptions{MinInputParts: 1, RequiredPartitionIDs: []string{"partition-b"}})
+
+	if len(selected) != 1 || selected[0].PartID != "part-b" {
+		t.Fatalf("selected = %+v, want only part-b", selected)
+	}
+}
+
+func TestSelectCompactBatchPartsPrefersPartitionNotAlreadyCompacting(t *testing.T) {
+	selected := selectCompactBatchParts(compactGroup{
+		compactingPartitionIDs: []string{"partition-a"},
+		parts: []Part{
+			{
+				PartID:                     "part-a1",
+				DestinationActivePartCount: 1,
+				DestinationActivePartBytes: 100,
+				DestinationActivePartitionCounts: map[string]uint64{
+					"partition-a": 1,
+				},
+			},
+			{
+				PartID:                     "part-a2",
+				DestinationActivePartCount: 1,
+				DestinationActivePartBytes: 100,
+				DestinationActivePartitionCounts: map[string]uint64{
+					"partition-a": 1,
+				},
+			},
+			{
+				PartID:                     "part-b1",
+				DestinationActivePartCount: 1,
+				DestinationActivePartBytes: 100,
+				DestinationActivePartitionCounts: map[string]uint64{
+					"partition-b": 1,
+				},
+			},
+			{
+				PartID:                     "part-b2",
+				DestinationActivePartCount: 1,
+				DestinationActivePartBytes: 100,
+				DestinationActivePartitionCounts: map[string]uint64{
+					"partition-b": 1,
+				},
+			},
+		},
+	}, CompactClaimOptions{MinInputParts: 2})
+
+	if len(selected) != 2 || selected[0].PartID != "part-b1" || selected[1].PartID != "part-b2" {
+		t.Fatalf("selected = %+v, want idle partition-b parts", selected)
+	}
+}
+
+func TestSelectCompactBatchPartsFallsBackToAlreadyCompactingPartition(t *testing.T) {
+	selected := selectCompactBatchParts(compactGroup{
+		compactingPartitionIDs: []string{"partition-a"},
+		parts: []Part{
+			{
+				PartID:                     "part-a1",
+				DestinationActivePartCount: 1,
+				DestinationActivePartBytes: 100,
+				DestinationActivePartitionCounts: map[string]uint64{
+					"partition-a": 1,
+				},
+			},
+			{
+				PartID:                     "part-a2",
+				DestinationActivePartCount: 1,
+				DestinationActivePartBytes: 100,
+				DestinationActivePartitionCounts: map[string]uint64{
+					"partition-a": 1,
+				},
+			},
+		},
+	}, CompactClaimOptions{MinInputParts: 2})
+
+	if len(selected) != 2 || selected[0].PartID != "part-a1" || selected[1].PartID != "part-a2" {
+		t.Fatalf("selected = %+v, want busy partition-a fallback", selected)
 	}
 }

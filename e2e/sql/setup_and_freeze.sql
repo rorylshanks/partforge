@@ -22,8 +22,8 @@ INSERT INTO src.events VALUES
     (2, 'bravo', 20, '2024-01-02');
 
 INSERT INTO src.events VALUES
-    (3, 'charlie', 30, '2024-02-01'),
-    (4, 'delta', 40, '2024-02-02');
+    (3, 'charlie', 30, '2024-01-03'),
+    (4, 'delta', 40, '2024-01-04');
 
 ALTER TABLE src.events FREEZE WITH NAME 'e2e_freeze';
 

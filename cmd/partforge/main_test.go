@@ -166,6 +166,99 @@ func TestSelectImportFinishedParts(t *testing.T) {
 	}
 }
 
+func TestFinalizableCompactReadyPartsRequiresNoActiveWork(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	compactReady := state.Part{
+		PartID:    "part-compact",
+		Status:    state.StatusCompactReady,
+		UpdatedAt: now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
+	}
+
+	_, ok, err := finalizableCompactReadyParts([]state.Part{
+		compactReady,
+		{PartID: "part-ready", Status: state.StatusReady},
+	}, 2*time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected active source work to block finalization")
+	}
+
+	selected, ok, err := finalizableCompactReadyParts([]state.Part{compactReady}, 2*time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || len(selected) != 1 || selected[0].PartID != compactReady.PartID {
+		t.Fatalf("selected = %+v, ok=%t; want compact-ready part", selected, ok)
+	}
+}
+
+func TestFinalizableCompactReadyPartsWaitsForThreshold(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	_, ok, err := finalizableCompactReadyParts([]state.Part{
+		{
+			PartID:    "part-compact",
+			Status:    state.StatusCompactReady,
+			UpdatedAt: now.Add(-30 * time.Minute).Format(time.RFC3339Nano),
+		},
+	}, time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected recent compact-ready part to wait for threshold")
+	}
+}
+
+func TestCompactRetryCooldownDerivedFromCompactWindow(t *testing.T) {
+	if got := compactRetryCooldown(2 * time.Hour); got != 30*time.Minute {
+		t.Fatalf("compactRetryCooldown(2h) = %s, want 30m", got)
+	}
+	if got := compactRetryCooldown(20 * time.Minute); got != 5*time.Minute {
+		t.Fatalf("compactRetryCooldown(20m) = %s, want 5m", got)
+	}
+	if got := compactRetryCooldown(0); got != time.Minute {
+		t.Fatalf("compactRetryCooldown(0) = %s, want 1m", got)
+	}
+	if got := compactRetryCooldown(12 * time.Hour); got != 30*time.Minute {
+		t.Fatalf("compactRetryCooldown(12h) = %s, want 30m cap", got)
+	}
+}
+
+func TestCompactLoadMoreIntervalDerivedFromCompactWindow(t *testing.T) {
+	if got := compactLoadMoreInterval(2 * time.Hour); got != 30*time.Second {
+		t.Fatalf("compactLoadMoreInterval(2h) = %s, want 30s", got)
+	}
+	if got := compactLoadMoreInterval(0); got != 5*time.Second {
+		t.Fatalf("compactLoadMoreInterval(0) = %s, want 5s", got)
+	}
+}
+
+func TestCompactClaimSplayMaxDerivedFromCompactWindow(t *testing.T) {
+	if got := compactClaimSplayMax(2 * time.Hour); got != 5*time.Second {
+		t.Fatalf("compactClaimSplayMax(2h) = %s, want 5s", got)
+	}
+	if got := compactClaimSplayMax(0); got != 0 {
+		t.Fatalf("compactClaimSplayMax(0) = %s, want 0", got)
+	}
+	if got := compactClaimSplayMax(time.Minute); got != 250*time.Millisecond {
+		t.Fatalf("compactClaimSplayMax(1m) = %s, want 250ms", got)
+	}
+}
+
+func TestDerivedMergeSettleMinWait(t *testing.T) {
+	if got := derivedMergeSettleMinWait(5*time.Minute, time.Minute); got != time.Minute {
+		t.Fatalf("derivedMergeSettleMinWait(5m, 1m) = %s, want 1m", got)
+	}
+	if got := derivedMergeSettleMinWait(15*time.Second, 2*time.Minute); got != 3750*time.Millisecond {
+		t.Fatalf("derivedMergeSettleMinWait(15s, 2m) = %s, want 3.75s", got)
+	}
+	if got := derivedMergeSettleMinWait(0, time.Minute); got != 0 {
+		t.Fatalf("derivedMergeSettleMinWait(0, 1m) = %s, want 0", got)
+	}
+}
+
 func TestSelectRetryPartsStale(t *testing.T) {
 	now := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
 	parts := []state.Part{

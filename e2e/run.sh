@@ -187,6 +187,42 @@ for i in $(seq 1 "$part_count"); do
   assert_worker_insert_memory_settings "$worker_log"
 done
 
+for i in $(seq 1 6); do
+  compact_log="$ROOT/.e2e/compact-${i}.log"
+  CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+    worker \
+    -s3-endpoint=http://localstack:4566 \
+    -dynamodb-endpoint=http://localstack:4566 \
+    -compact-window=0s \
+    -compact-merge-idle-timeout=15s \
+    -compact-merge-max-runtime=30s \
+    -once 2>&1 | tee "$compact_log"
+
+  status="$(
+    CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
+      job-status \
+      -job-id="$JOB_ID" \
+      -dynamodb-endpoint=http://localstack:4566 |
+      sed -n 's/^status: //p'
+  )"
+  if [[ "$status" == "READY_FOR_IMPORT" ]]; then
+    break
+  fi
+done
+
+if [[ "${status:-}" != "READY_FOR_IMPORT" ]]; then
+  echo "job did not reach READY_FOR_IMPORT; status=${status:-<empty>}" >&2
+  exit 1
+fi
+if ! grep -h "claimed compact-ready batch" "$ROOT"/.e2e/compact-*.log >/dev/null; then
+  echo "expected compact worker to claim a compact-ready batch" >&2
+  exit 1
+fi
+if ! grep -Eh "completed compact batch|compact batch did not reduce active part count" "$ROOT"/.e2e/compact-*.log >/dev/null; then
+  echo "expected compact worker to finish a compact attempt" >&2
+  exit 1
+fi
+
 CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm --user "$clickhouse_owner" \
   -v "$DATA_DIR:/var/lib/clickhouse" \
   worker \

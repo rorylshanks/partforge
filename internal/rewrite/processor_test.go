@@ -250,10 +250,10 @@ func TestMergePoolByteSettingsForActiveBytes(t *testing.T) {
 			wantMin: 1024 * 1024 * 1024,
 		},
 		{
-			name:    "tiny output can still merge to one part",
+			name:    "tiny output keeps enough headroom for merge selection",
 			bytes:   64 * 1024 * 1024,
-			wantMax: 64 * 1024 * 1024,
-			wantMin: 64 * 1024 * 1024,
+			wantMax: 16 * 1024 * 1024 * 1024,
+			wantMin: 1024 * 1024 * 1024,
 		},
 		{
 			name:    "medium output targets four large parts",
@@ -494,6 +494,7 @@ func TestWaitForDestinationMergesReturnsFalseAfterTimeout(t *testing.T) {
 	settled, err := (Processor{
 		ClickHouse:        chhttp.Client{URL: server.URL},
 		MergeTimeout:      time.Nanosecond,
+		MergeMaxTimeout:   time.Nanosecond,
 		MergePollInterval: time.Nanosecond,
 	}).waitForDestinationMerges(context.Background(), manifest.Manifest{JobID: "job-1", PartID: "part-1"}, tracker, testMergeWaitTarget(), "test")
 	if err != nil {
@@ -529,8 +530,9 @@ func TestWaitForMergesReturnsUnsettledAfterTimeout(t *testing.T) {
 
 	timeout := time.Nanosecond
 	result, err := (Processor{
-		ClickHouse:   chhttp.Client{URL: server.URL},
-		MergeTimeout: timeout,
+		ClickHouse:      chhttp.Client{URL: server.URL},
+		MergeTimeout:    timeout,
+		MergeMaxTimeout: timeout,
 	}).waitForMerges(context.Background(), testMergeWaitTarget())
 	if err != nil {
 		t.Fatal(err)
@@ -582,6 +584,9 @@ func TestWaitForMergesUsesDefaultTimeout(t *testing.T) {
 	if result.Timeout != DefaultMergeTimeout {
 		t.Fatalf("timeout = %s, want %s", result.Timeout, DefaultMergeTimeout)
 	}
+	if result.MaxTimeout != DefaultMergeMaxTimeout {
+		t.Fatalf("max timeout = %s, want %s", result.MaxTimeout, DefaultMergeMaxTimeout)
+	}
 }
 
 func TestWaitForMergesSettlesLargeTailPartsAfterIdleWindow(t *testing.T) {
@@ -626,7 +631,7 @@ func TestWaitForMergesSettlesLargeTailPartsAfterIdleWindow(t *testing.T) {
 	}
 }
 
-func TestWaitForMergesStopsAtMergeTimeoutForActiveMerges(t *testing.T) {
+func TestWaitForMergesStopsAtMergeMaxTimeoutForActiveMerges(t *testing.T) {
 	var mergeRequests int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -650,9 +655,11 @@ func TestWaitForMergesStopsAtMergeTimeoutForActiveMerges(t *testing.T) {
 	defer server.Close()
 
 	baseTimeout := time.Millisecond
+	maxTimeout := 5 * time.Millisecond
 	result, err := (Processor{
 		ClickHouse:        chhttp.Client{URL: server.URL},
 		MergeTimeout:      baseTimeout,
+		MergeMaxTimeout:   maxTimeout,
 		MergePollInterval: time.Millisecond,
 	}).waitForMerges(context.Background(), testMergeWaitTarget())
 	if err != nil {
@@ -661,11 +668,11 @@ func TestWaitForMergesStopsAtMergeTimeoutForActiveMerges(t *testing.T) {
 	if result.Settled {
 		t.Fatal("expected merge timeout before settling")
 	}
-	if result.Reason != "merge_timeout" {
-		t.Fatalf("reason = %q, want merge_timeout", result.Reason)
+	if result.Reason != "merge_max_timeout" {
+		t.Fatalf("reason = %q, want merge_max_timeout", result.Reason)
 	}
-	if result.Timeout != baseTimeout {
-		t.Fatalf("timeout = %s, want %s", result.Timeout, baseTimeout)
+	if result.Timeout != maxTimeout {
+		t.Fatalf("timeout = %s, want %s", result.Timeout, maxTimeout)
 	}
 	if mergeRequests == 0 {
 		t.Fatal("expected system.merges to be queried")
@@ -901,11 +908,23 @@ func testMergeWaitTarget() mergeWaitTarget {
 }
 
 func TestDefaultMergeTimeout(t *testing.T) {
-	if DefaultMergeTimeout != time.Hour {
-		t.Fatalf("DefaultMergeTimeout = %s, want 1h", DefaultMergeTimeout)
+	if DefaultMergeTimeout != 5*time.Minute {
+		t.Fatalf("DefaultMergeTimeout = %s, want 5m", DefaultMergeTimeout)
 	}
-	if DefaultMergeSettleMinWait != 2*time.Minute {
-		t.Fatalf("DefaultMergeSettleMinWait = %s, want 2m", DefaultMergeSettleMinWait)
+	if DefaultMergeMaxTimeout != time.Hour {
+		t.Fatalf("DefaultMergeMaxTimeout = %s, want 1h", DefaultMergeMaxTimeout)
+	}
+	if DefaultMergeSettleMinWait != time.Minute {
+		t.Fatalf("DefaultMergeSettleMinWait = %s, want 1m", DefaultMergeSettleMinWait)
+	}
+	if DefaultCompactMergeTimeout != 15*time.Minute {
+		t.Fatalf("DefaultCompactMergeTimeout = %s, want 15m", DefaultCompactMergeTimeout)
+	}
+	if DefaultCompactMergeMaxTimeout != 2*time.Hour {
+		t.Fatalf("DefaultCompactMergeMaxTimeout = %s, want 2h", DefaultCompactMergeMaxTimeout)
+	}
+	if DefaultCompactMergeSettleMinWait != 2*time.Minute {
+		t.Fatalf("DefaultCompactMergeSettleMinWait = %s, want 2m", DefaultCompactMergeSettleMinWait)
 	}
 	if DefaultMergeSettleMinParts != 1 {
 		t.Fatalf("DefaultMergeSettleMinParts = %d, want 1", DefaultMergeSettleMinParts)

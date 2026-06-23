@@ -1,6 +1,6 @@
 # Rewrite Flow
 
-This document describes the current part rewrite procedure. There is one worker path; `optimize_final` is an optional step inside that path.
+This document describes the current part rewrite procedure. Source rewrites produce compact-ready artifacts first. Workers then opportunistically compact those artifacts when no source rewrite work is ready, or finalize the remaining compact-ready artifacts after the configured compaction window.
 
 `OPTIMIZE TABLE ... FINAL` only runs inside the local worker ClickHouse process. PartForge never runs `OPTIMIZE FINAL` on the source/upload host or the final import host.
 
@@ -17,11 +17,22 @@ graph TD
     F --> G
     G --> H[Rewrite part in local ClickHouse]
     H --> I[Upload finished destination part tarballs to S3]
-    I --> J[Mark DynamoDB record FINISHED]
-    J --> K[import-finished downloads finished artifacts]
-    K --> L[Move parts into final table detached directory]
-    L --> M[ALTER TABLE ... ATTACH PART]
-    M --> N[Mark DynamoDB record IMPORTED]
+    I --> J[Mark DynamoDB record COMPACT_READY]
+    J --> K{Worker compaction available?}
+    K -- Yes --> L[Attach multiple finished artifacts locally]
+    L --> M[Let ClickHouse merge compacted destination parts]
+    M --> N{Output active parts fewer than input active parts?}
+    N -- Yes --> O[Upload compacted artifact]
+    O --> P[Mark compact inputs SUPERSEDED and output COMPACT_READY]
+    N -- No --> Q[Release compact inputs with derived cooldown]
+    K -- No --> R[Finalize COMPACT_READY artifacts past compact window]
+    P --> K
+    Q --> K
+    R --> S[Mark DynamoDB records FINISHED]
+    S --> T[import-finished downloads finished artifacts]
+    T --> U[Move parts into final table detached directory]
+    U --> V[ALTER TABLE ... ATTACH PART]
+    V --> W[Mark DynamoDB record IMPORTED]
 ```
 
 `upload-freeze -optimize-final` stores `optimize_final: true` in each manifest and affects the derived job and part IDs. `worker -optimize-final` ignores the manifest option and enables the same optional optimize step for every part processed by that worker.
@@ -52,7 +63,7 @@ graph TD
     Q -- Yes --> S[ALTER TABLE destination FREEZE]
     S --> T[Build finished part tarballs]
     T --> U[Upload finished artifact prefix]
-    U --> V[Mark part FINISHED]
+    U --> V[Mark part COMPACT_READY]
 ```
 
 The insert-select step has its own resource retry loop. The worker caps query memory at 70% of detected memory, then initially sets `max_threads` and `max_insert_threads` to the lower of about one quarter of the detected CPU count and a memory-derived limit that targets at least 2 GiB insert blocks when memory allows. It derives `min_insert_block_size_bytes` from the insert memory cap divided by six times the insert thread count, then derives `min_insert_block_size_rows` from that byte target using a 1 KiB average-row estimate. If ClickHouse returns a retryable resource error such as memory pressure or too many threads, the worker halves `max_insert_threads` and, when present, `max_threads`; drops and recreates the destination table; reapplies only the destination compression codec; waits with a short backoff; and retries the insert-select. Destination merge settings are applied only after the insert-select succeeds.
@@ -74,7 +85,7 @@ graph TD
     A[Poll system.merges and system.parts] --> B{Merge inspection failed?}
     B -- Yes --> C[Warn and continue with current parts]
     B -- No --> D{No active destination merges?}
-    D -- No --> E{Merge timeout reached?}
+    D -- No --> E{Hard merge timeout reached?}
     E -- No --> A
     E -- Yes --> F[Stop waiting and continue with current parts]
     D -- Yes --> G{Active parts <= settle min?}
@@ -84,7 +95,19 @@ graph TD
     I -- Yes --> H
 ```
 
-If the merge wait times out or merge-wait inspection fails, that is not a rewrite failure. The worker logs the reason and continues with whatever active destination parts exist. Any destination with more active parts than `-merge-settle-min-parts` must keep the same part snapshot idle for `-merge-settle-min-wait` before the worker treats merges as settled.
+`-merge-idle-timeout` is an inactivity timeout. It is extended when ClickHouse has active destination merges, when the destination part snapshot changes, or when compaction attaches more input artifacts. `-merge-max-runtime` is the hard cap for the whole wait. The compaction path uses `-compact-merge-idle-timeout` and `-compact-merge-max-runtime` with the same semantics.
+
+If the merge wait times out or merge-wait inspection fails, that is not a rewrite failure. The worker logs the reason and continues with whatever active destination parts exist. Any destination with more than one active output part must keep the same part snapshot idle for the derived settle wait before the worker treats merges as settled.
+
+## Worker Compaction
+
+When `worker -compact=true` finds no `READY` source part, it waits for a small derived random splay and then tries to claim `COMPACT_READY` artifacts for the same job, bucket, destination table, and destination schema. The claim picker is partition-aware: it only claims an initial batch when the selected artifacts have enough active parts in at least one shared destination partition. It does not count unrelated one-part partitions as compactable work. If other workers are already compacting some partitions for the same destination, the picker tries partitions that are not currently compacting first, then falls back to those busy partitions when no other compactable partition exists.
+
+The compactor downloads and attaches one finished artifact group at a time. ClickHouse assigns attached part names, so the worker does not rename parts before attach. Compaction does not run `OPTIMIZE FINAL`; it configures MergeTree merge settings, restarts the local ClickHouse with merge tuning, and lets normal background merges choose what to merge.
+
+While waiting for compact destination merges, the compactor can poll for more compatible artifacts. Additional claims require overlap with partitions already active on the local compacting table, so the worker avoids downloading a new artifact that only adds an isolated new partition. The load-more cadence is derived from `-compact-window`.
+
+The compact output is uploaded only if the final active output part count is lower than the active input part count. If compaction does not reduce the count, the worker releases the inputs back to `COMPACT_READY` with a cooldown derived from `-compact-window`. Remaining compact-ready artifacts are promoted to `FINISHED` after the same compact window once there is no source work, in-progress rewrite, failed work, or active compaction for that job.
 
 ## Optional optimize_final Step
 

@@ -18,12 +18,15 @@ import (
 )
 
 const (
-	StatusReady      Status = "READY"
-	StatusInProgress Status = "IN_PROGRESS"
-	StatusFinished   Status = "FINISHED"
-	StatusImporting  Status = "IMPORTING"
-	StatusImported   Status = "IMPORTED"
-	StatusFailed     Status = "FAILED"
+	StatusReady        Status = "READY"
+	StatusInProgress   Status = "IN_PROGRESS"
+	StatusCompactReady Status = "COMPACT_READY"
+	StatusCompacting   Status = "COMPACTING"
+	StatusSuperseded   Status = "SUPERSEDED"
+	StatusFinished     Status = "FINISHED"
+	StatusImporting    Status = "IMPORTING"
+	StatusImported     Status = "IMPORTED"
+	StatusFailed       Status = "FAILED"
 
 	readyIndexName = "gsi1"
 	timeFormat     = "2006-01-02T15:04:05.000000000Z"
@@ -44,44 +47,55 @@ type Store struct {
 }
 
 type Part struct {
-	PK          string `dynamodbav:"pk"`
-	SK          string `dynamodbav:"sk"`
-	GSI1PK      string `dynamodbav:"gsi1pk"`
-	GSI1SK      string `dynamodbav:"gsi1sk"`
-	JobID       string `dynamodbav:"job_id"`
-	PartID      string `dynamodbav:"part_id"`
-	Status      Status `dynamodbav:"status"`
-	Bucket      string `dynamodbav:"bucket"`
-	SourceKey   string `dynamodbav:"source_key"`
-	FinishedKey string `dynamodbav:"finished_key"`
-	CreatedAt   string `dynamodbav:"created_at"`
-	UpdatedAt   string `dynamodbav:"updated_at"`
-	StartedAt   string `dynamodbav:"started_at,omitempty"`
-	FinishedAt  string `dynamodbav:"finished_at,omitempty"`
-	ImportingAt string `dynamodbav:"importing_at,omitempty"`
-	ImportedAt  string `dynamodbav:"imported_at,omitempty"`
-	FailedAt    string `dynamodbav:"failed_at,omitempty"`
-	WorkerID    string `dynamodbav:"worker_id,omitempty"`
-	Attempts    int    `dynamodbav:"attempts"`
-	Error       string `dynamodbav:"error,omitempty"`
+	PK           string `dynamodbav:"pk"`
+	SK           string `dynamodbav:"sk"`
+	GSI1PK       string `dynamodbav:"gsi1pk"`
+	GSI1SK       string `dynamodbav:"gsi1sk"`
+	JobID        string `dynamodbav:"job_id"`
+	PartID       string `dynamodbav:"part_id"`
+	Status       Status `dynamodbav:"status"`
+	Bucket       string `dynamodbav:"bucket"`
+	SourceKey    string `dynamodbav:"source_key"`
+	FinishedKey  string `dynamodbav:"finished_key"`
+	CreatedAt    string `dynamodbav:"created_at"`
+	UpdatedAt    string `dynamodbav:"updated_at"`
+	StartedAt    string `dynamodbav:"started_at,omitempty"`
+	FinishedAt   string `dynamodbav:"finished_at,omitempty"`
+	CompactingAt string `dynamodbav:"compacting_at,omitempty"`
+	SupersededAt string `dynamodbav:"superseded_at,omitempty"`
+	ImportingAt  string `dynamodbav:"importing_at,omitempty"`
+	ImportedAt   string `dynamodbav:"imported_at,omitempty"`
+	FailedAt     string `dynamodbav:"failed_at,omitempty"`
+	WorkerID     string `dynamodbav:"worker_id,omitempty"`
+	Attempts     int    `dynamodbav:"attempts"`
+	Error        string `dynamodbav:"error,omitempty"`
 
-	ProgressUpdatedAt          string           `dynamodbav:"progress_updated_at,omitempty"`
-	ReadRows                   uint64           `dynamodbav:"read_rows,omitempty"`
-	ReadBytes                  uint64           `dynamodbav:"read_bytes,omitempty"`
-	WrittenRows                uint64           `dynamodbav:"written_rows,omitempty"`
-	WrittenBytes               uint64           `dynamodbav:"written_bytes,omitempty"`
-	SourceActivePartCount      uint64           `dynamodbav:"source_active_part_count,omitempty"`
-	SourceActivePartRows       uint64           `dynamodbav:"source_active_part_rows,omitempty"`
-	SourceActivePartBytes      uint64           `dynamodbav:"source_active_part_bytes,omitempty"`
-	DestinationActivePartCount uint64           `dynamodbav:"destination_active_part_count,omitempty"`
-	DestinationActivePartRows  uint64           `dynamodbav:"destination_active_part_rows,omitempty"`
-	DestinationActivePartBytes uint64           `dynamodbav:"destination_active_part_bytes,omitempty"`
-	DestinationFailedMerges    uint64           `dynamodbav:"destination_failed_merges,omitempty"`
-	RewriteStage               string           `dynamodbav:"rewrite_stage,omitempty"`
-	RewriteStageStartedAt      string           `dynamodbav:"rewrite_stage_started_at,omitempty"`
-	RewriteStageElapsedMs      int64            `dynamodbav:"rewrite_stage_elapsed_ms,omitempty"`
-	RewriteTotalElapsedMs      int64            `dynamodbav:"rewrite_total_elapsed_ms,omitempty"`
-	RewriteStageDurationsMs    map[string]int64 `dynamodbav:"rewrite_stage_durations_ms,omitempty"`
+	DestinationDatabase  string   `dynamodbav:"destination_database,omitempty"`
+	DestinationTable     string   `dynamodbav:"destination_table,omitempty"`
+	DestinationSchema    string   `dynamodbav:"destination_schema,omitempty"`
+	CompactGeneration    int      `dynamodbav:"compact_generation,omitempty"`
+	CompactInputPartIDs  []string `dynamodbav:"compact_input_part_ids,omitempty"`
+	CompactCooldownUntil string   `dynamodbav:"compact_cooldown_until,omitempty"`
+	SupersededBy         string   `dynamodbav:"superseded_by,omitempty"`
+
+	ProgressUpdatedAt                string            `dynamodbav:"progress_updated_at,omitempty"`
+	ReadRows                         uint64            `dynamodbav:"read_rows,omitempty"`
+	ReadBytes                        uint64            `dynamodbav:"read_bytes,omitempty"`
+	WrittenRows                      uint64            `dynamodbav:"written_rows,omitempty"`
+	WrittenBytes                     uint64            `dynamodbav:"written_bytes,omitempty"`
+	SourceActivePartCount            uint64            `dynamodbav:"source_active_part_count,omitempty"`
+	SourceActivePartRows             uint64            `dynamodbav:"source_active_part_rows,omitempty"`
+	SourceActivePartBytes            uint64            `dynamodbav:"source_active_part_bytes,omitempty"`
+	DestinationActivePartCount       uint64            `dynamodbav:"destination_active_part_count,omitempty"`
+	DestinationActivePartRows        uint64            `dynamodbav:"destination_active_part_rows,omitempty"`
+	DestinationActivePartBytes       uint64            `dynamodbav:"destination_active_part_bytes,omitempty"`
+	DestinationActivePartitionCounts map[string]uint64 `dynamodbav:"destination_active_partition_counts,omitempty"`
+	DestinationFailedMerges          uint64            `dynamodbav:"destination_failed_merges,omitempty"`
+	RewriteStage                     string            `dynamodbav:"rewrite_stage,omitempty"`
+	RewriteStageStartedAt            string            `dynamodbav:"rewrite_stage_started_at,omitempty"`
+	RewriteStageElapsedMs            int64             `dynamodbav:"rewrite_stage_elapsed_ms,omitempty"`
+	RewriteTotalElapsedMs            int64             `dynamodbav:"rewrite_total_elapsed_ms,omitempty"`
+	RewriteStageDurationsMs          map[string]int64  `dynamodbav:"rewrite_stage_durations_ms,omitempty"`
 }
 
 type QueryProgress struct {
@@ -95,6 +109,44 @@ type PartStats struct {
 	Count uint64
 	Rows  uint64
 	Bytes uint64
+}
+
+func clonePartitionCounts(counts map[string]uint64) map[string]uint64 {
+	if len(counts) == 0 {
+		return nil
+	}
+	out := make(map[string]uint64, len(counts))
+	for partitionID, count := range counts {
+		if strings.TrimSpace(partitionID) == "" || count == 0 {
+			continue
+		}
+		out[partitionID] = count
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+type CompactClaimOptions struct {
+	MaxArtifacts         int
+	MaxBytes             uint64
+	MinInputParts        uint64
+	JobID                string
+	Bucket               string
+	DestinationDatabase  string
+	DestinationTable     string
+	DestinationSchema    string
+	RequiredPartitionIDs []string
+}
+
+type CompactBatch struct {
+	JobID          string
+	Parts          []Part
+	InputPartCount uint64
+	InputRows      uint64
+	InputBytes     uint64
+	Generation     int
 }
 
 type RewriteProgress struct {
@@ -186,6 +238,33 @@ func NewPart(jobID, partID, bucket, sourceKey, finishedKey string, now time.Time
 	}
 }
 
+func NewCompactPart(jobID, partID, bucket, finishedKey, database, table, destinationSchema string, inputPartIDs []string, generation int, stats PartStats, partitionCounts map[string]uint64, now time.Time) Part {
+	createdAt := formatTime(now)
+	return Part{
+		PK:                               jobKey(jobID),
+		SK:                               partKey(partID),
+		GSI1PK:                           statusKey(StatusCompactReady),
+		GSI1SK:                           statusSortKey(createdAt, jobID, partID),
+		JobID:                            jobID,
+		PartID:                           partID,
+		Status:                           StatusCompactReady,
+		Bucket:                           bucket,
+		SourceKey:                        finishedKey,
+		FinishedKey:                      finishedKey,
+		CreatedAt:                        createdAt,
+		UpdatedAt:                        createdAt,
+		DestinationDatabase:              database,
+		DestinationTable:                 table,
+		DestinationSchema:                destinationSchema,
+		CompactGeneration:                generation,
+		CompactInputPartIDs:              append([]string(nil), inputPartIDs...),
+		DestinationActivePartCount:       stats.Count,
+		DestinationActivePartRows:        stats.Rows,
+		DestinationActivePartBytes:       stats.Bytes,
+		DestinationActivePartitionCounts: clonePartitionCounts(partitionCounts),
+	}
+}
+
 func (s *Store) CreatePart(ctx context.Context, part Part) error {
 	if err := validatePart(part); err != nil {
 		return err
@@ -201,6 +280,64 @@ func (s *Store) CreatePart(ctx context.Context, part Part) error {
 	})
 	if err != nil {
 		return fmt.Errorf("create state item for %s/%s: %w", part.JobID, part.PartID, err)
+	}
+	return nil
+}
+
+func (s *Store) MarkCompactReady(ctx context.Context, part Part, workerID, finishedKey, database, table, destinationSchema string, stats PartStats, partitionCounts map[string]uint64, now time.Time) error {
+	if strings.TrimSpace(workerID) == "" {
+		return errors.New("worker id is required")
+	}
+	if strings.TrimSpace(finishedKey) == "" {
+		return errors.New("finished key is required")
+	}
+	if strings.TrimSpace(database) == "" || strings.TrimSpace(table) == "" || strings.TrimSpace(destinationSchema) == "" {
+		return errors.New("destination database, table, and schema are required")
+	}
+	if stats.Count > 0 && len(partitionCounts) == 0 {
+		return fmt.Errorf("destination partition counts are required when destination active part count is %d", stats.Count)
+	}
+	partitionCountsValue, err := attributevalue.Marshal(clonePartitionCounts(partitionCounts))
+	if err != nil {
+		return fmt.Errorf("marshal destination partition counts: %w", err)
+	}
+	_, err = s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.table),
+		Key:       part.key(),
+		ConditionExpression: aws.String(
+			"#status = :from AND #worker_id = :worker",
+		),
+		UpdateExpression: aws.String(
+			"SET #status = :to, gsi1pk = :gsi1pk, updated_at = :now, finished_key = :finished_key, " +
+				"destination_database = :destination_database, destination_table = :destination_table, destination_schema = :destination_schema, compact_generation = :compact_generation, " +
+				"destination_active_part_count = :destination_active_part_count, destination_active_part_rows = :destination_active_part_rows, destination_active_part_bytes = :destination_active_part_bytes, " +
+				"destination_active_partition_counts = :destination_active_partition_counts " +
+				"REMOVE #worker_id, #error, compact_cooldown_until",
+		),
+		ExpressionAttributeNames: map[string]string{
+			"#error":     "error",
+			"#status":    "status",
+			"#worker_id": "worker_id",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":compact_generation":                  numberAttr("0"),
+			":destination_active_part_count":       uintAttr(stats.Count),
+			":destination_active_part_rows":        uintAttr(stats.Rows),
+			":destination_active_part_bytes":       uintAttr(stats.Bytes),
+			":destination_active_partition_counts": partitionCountsValue,
+			":destination_database":                stringAttr(database),
+			":destination_schema":                  stringAttr(destinationSchema),
+			":destination_table":                   stringAttr(table),
+			":finished_key":                        stringAttr(finishedKey),
+			":from":                                stringAttr(string(StatusInProgress)),
+			":gsi1pk":                              stringAttr(statusKey(StatusCompactReady)),
+			":now":                                 stringAttr(formatTime(now)),
+			":to":                                  stringAttr(string(StatusCompactReady)),
+			":worker":                              stringAttr(workerID),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("mark part %s/%s compact ready: %w", part.JobID, part.PartID, err)
 	}
 	return nil
 }
@@ -243,6 +380,496 @@ func (s *Store) ClaimNextReady(ctx context.Context, workerID string, now time.Ti
 		}
 	}
 	return nil, nil
+}
+
+func (s *Store) ClaimNextCompactBatch(ctx context.Context, workerID string, now time.Time, opts CompactClaimOptions) (*CompactBatch, error) {
+	if strings.TrimSpace(workerID) == "" {
+		return nil, errors.New("worker id is required")
+	}
+	if opts.MaxArtifacts < 0 {
+		return nil, fmt.Errorf("compact max artifacts must be non-negative, got %d", opts.MaxArtifacts)
+	}
+
+	candidates, err := s.listPartsByStatusIndex(ctx, StatusCompactReady)
+	if err != nil {
+		return nil, fmt.Errorf("query compact-ready parts: %w", err)
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	compacting, err := s.listPartsByStatusIndex(ctx, StatusCompacting)
+	if err != nil {
+		return nil, fmt.Errorf("query compacting parts: %w", err)
+	}
+
+	groups := compactCandidateGroups(candidates, compacting, now, opts)
+	for _, group := range groups {
+		selected := selectCompactBatchParts(group, opts)
+		if len(selected) == 0 {
+			continue
+		}
+		claimed, err := s.claimCompactParts(ctx, selected, workerID, now)
+		if IsConditionalCheckFailed(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		return compactBatchFromParts(claimed), nil
+	}
+	return nil, nil
+}
+
+func (s *Store) listPartsByStatusIndex(ctx context.Context, status Status) ([]Part, error) {
+	paginator := dynamodb.NewQueryPaginator(s.client, &dynamodb.QueryInput{
+		TableName:              aws.String(s.table),
+		IndexName:              aws.String(readyIndexName),
+		KeyConditionExpression: aws.String("#gsi1pk = :status"),
+		ExpressionAttributeNames: map[string]string{
+			"#gsi1pk": "gsi1pk",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":status": stringAttr(statusKey(status)),
+		},
+		Limit: aws.Int32(100),
+	})
+
+	var parts []Part
+	for paginator.HasMorePages() {
+		out, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range out.Items {
+			part, err := unmarshalPart(item)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, *part)
+		}
+	}
+	return parts, nil
+}
+
+func (s *Store) ReleaseCompactBatch(ctx context.Context, batch CompactBatch, workerID string, cooldownUntil time.Time, now time.Time) error {
+	if strings.TrimSpace(workerID) == "" {
+		return errors.New("worker id is required")
+	}
+	for _, part := range batch.Parts {
+		names := map[string]string{
+			"#error":     "error",
+			"#status":    "status",
+			"#worker_id": "worker_id",
+		}
+		values := map[string]types.AttributeValue{
+			":compact_ready": stringAttr(string(StatusCompactReady)),
+			":compacting":    stringAttr(string(StatusCompacting)),
+			":gsi1pk":        stringAttr(statusKey(StatusCompactReady)),
+			":now":           stringAttr(formatTime(now)),
+			":worker":        stringAttr(workerID),
+		}
+		updateExpression := "SET #status = :compact_ready, gsi1pk = :gsi1pk, updated_at = :now"
+		remove := []string{"#worker_id", "compacting_at", "#error"}
+		if !cooldownUntil.IsZero() {
+			updateExpression += ", compact_cooldown_until = :cooldown_until"
+			values[":cooldown_until"] = stringAttr(formatTime(cooldownUntil))
+		} else {
+			remove = append(remove, "compact_cooldown_until")
+		}
+		updateExpression += " REMOVE " + strings.Join(remove, ", ")
+
+		_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName:                 aws.String(s.table),
+			Key:                       part.key(),
+			ConditionExpression:       aws.String("#status = :compacting AND #worker_id = :worker"),
+			UpdateExpression:          aws.String(updateExpression),
+			ExpressionAttributeNames:  names,
+			ExpressionAttributeValues: values,
+		})
+		if err != nil {
+			return fmt.Errorf("release compacting part %s/%s: %w", part.JobID, part.PartID, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) CompleteCompaction(ctx context.Context, batch CompactBatch, output Part, workerID string, now time.Time) error {
+	if strings.TrimSpace(workerID) == "" {
+		return errors.New("worker id is required")
+	}
+	if len(batch.Parts) == 0 {
+		return errors.New("compact batch has no input parts")
+	}
+	if len(batch.Parts) > 99 {
+		return fmt.Errorf("compact batch has %d input parts, exceeds DynamoDB transaction limit", len(batch.Parts))
+	}
+	if err := validatePart(output); err != nil {
+		return err
+	}
+	if output.Status != StatusCompactReady {
+		return fmt.Errorf("compact output %s/%s is %s, expected %s", output.JobID, output.PartID, output.Status, StatusCompactReady)
+	}
+
+	outputItem, err := attributevalue.MarshalMap(output)
+	if err != nil {
+		return err
+	}
+	items := []types.TransactWriteItem{
+		{
+			Put: &types.Put{
+				TableName:           aws.String(s.table),
+				Item:                outputItem,
+				ConditionExpression: aws.String("attribute_not_exists(pk) AND attribute_not_exists(sk)"),
+			},
+		},
+	}
+	for _, part := range batch.Parts {
+		items = append(items, types.TransactWriteItem{
+			Update: &types.Update{
+				TableName: aws.String(s.table),
+				Key:       part.key(),
+				ConditionExpression: aws.String(
+					"#status = :compacting AND #worker_id = :worker",
+				),
+				UpdateExpression: aws.String(
+					"SET #status = :superseded, gsi1pk = :gsi1pk, updated_at = :now, superseded_at = :now, superseded_by = :superseded_by REMOVE #worker_id, compacting_at, #error, compact_cooldown_until",
+				),
+				ExpressionAttributeNames: map[string]string{
+					"#error":     "error",
+					"#status":    "status",
+					"#worker_id": "worker_id",
+				},
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":compacting":    stringAttr(string(StatusCompacting)),
+					":gsi1pk":        stringAttr(statusKey(StatusSuperseded)),
+					":now":           stringAttr(formatTime(now)),
+					":superseded":    stringAttr(string(StatusSuperseded)),
+					":superseded_by": stringAttr(output.PartID),
+					":worker":        stringAttr(workerID),
+				},
+			},
+		})
+	}
+	_, err = s.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: items,
+	})
+	if err != nil {
+		return fmt.Errorf("complete compaction for %s/%s: %w", batch.JobID, output.PartID, err)
+	}
+	return nil
+}
+
+func (s *Store) MarkCompactReadyFinished(ctx context.Context, part Part, now time.Time) error {
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.table),
+		Key:       part.key(),
+		ConditionExpression: aws.String(
+			"#status = :compact_ready",
+		),
+		UpdateExpression: aws.String(
+			"SET #status = :finished, gsi1pk = :gsi1pk, updated_at = :now, finished_at = :now REMOVE #error, compact_cooldown_until",
+		),
+		ExpressionAttributeNames: map[string]string{
+			"#error":  "error",
+			"#status": "status",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":compact_ready": stringAttr(string(StatusCompactReady)),
+			":finished":      stringAttr(string(StatusFinished)),
+			":gsi1pk":        stringAttr(statusKey(StatusFinished)),
+			":now":           stringAttr(formatTime(now)),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("mark compact-ready part %s/%s finished: %w", part.JobID, part.PartID, err)
+	}
+	return nil
+}
+
+type compactGroup struct {
+	key                    string
+	parts                  []Part
+	compactingPartitionIDs []string
+}
+
+func compactCandidateGroups(parts, compacting []Part, now time.Time, opts CompactClaimOptions) []compactGroup {
+	groupsByKey := map[string][]Part{}
+	var order []string
+	for _, part := range parts {
+		if strings.TrimSpace(part.DestinationDatabase) == "" ||
+			strings.TrimSpace(part.DestinationTable) == "" ||
+			strings.TrimSpace(part.DestinationSchema) == "" ||
+			part.DestinationActivePartCount == 0 ||
+			len(part.DestinationActivePartitionCounts) == 0 ||
+			!matchesCompactClaimOptions(part, opts) ||
+			compactCooldownActive(part, now) {
+			continue
+		}
+		key := compactGroupKey(part)
+		if _, ok := groupsByKey[key]; !ok {
+			order = append(order, key)
+		}
+		groupsByKey[key] = append(groupsByKey[key], part)
+	}
+	compactingPartitionsByKey := compactingPartitionIDsByGroup(compacting)
+	groups := make([]compactGroup, 0, len(order))
+	for _, key := range order {
+		groupParts := groupsByKey[key]
+		sort.SliceStable(groupParts, func(i, j int) bool {
+			if groupParts[i].CompactGeneration != groupParts[j].CompactGeneration {
+				return groupParts[i].CompactGeneration < groupParts[j].CompactGeneration
+			}
+			if groupParts[i].UpdatedAt != groupParts[j].UpdatedAt {
+				return groupParts[i].UpdatedAt < groupParts[j].UpdatedAt
+			}
+			return groupParts[i].PartID < groupParts[j].PartID
+		})
+		groups = append(groups, compactGroup{
+			key:                    key,
+			parts:                  groupParts,
+			compactingPartitionIDs: compactingPartitionsByKey[key],
+		})
+	}
+	return groups
+}
+
+func compactGroupKey(part Part) string {
+	return strings.Join([]string{part.JobID, part.Bucket, part.DestinationDatabase, part.DestinationTable, part.DestinationSchema}, "\x00")
+}
+
+func compactingPartitionIDsByGroup(parts []Part) map[string][]string {
+	sets := map[string]map[string]struct{}{}
+	for _, part := range parts {
+		if part.Status != StatusCompacting ||
+			strings.TrimSpace(part.DestinationDatabase) == "" ||
+			strings.TrimSpace(part.DestinationTable) == "" ||
+			strings.TrimSpace(part.DestinationSchema) == "" {
+			continue
+		}
+		key := compactGroupKey(part)
+		if _, ok := sets[key]; !ok {
+			sets[key] = map[string]struct{}{}
+		}
+		for _, partitionID := range partPartitionIDs(part) {
+			sets[key][partitionID] = struct{}{}
+		}
+	}
+	out := make(map[string][]string, len(sets))
+	for key, set := range sets {
+		partitionIDs := make([]string, 0, len(set))
+		for partitionID := range set {
+			partitionIDs = append(partitionIDs, partitionID)
+		}
+		sort.Strings(partitionIDs)
+		out[key] = partitionIDs
+	}
+	return out
+}
+
+func matchesCompactClaimOptions(part Part, opts CompactClaimOptions) bool {
+	if opts.JobID != "" && part.JobID != opts.JobID {
+		return false
+	}
+	if opts.Bucket != "" && part.Bucket != opts.Bucket {
+		return false
+	}
+	if opts.DestinationDatabase != "" && part.DestinationDatabase != opts.DestinationDatabase {
+		return false
+	}
+	if opts.DestinationTable != "" && part.DestinationTable != opts.DestinationTable {
+		return false
+	}
+	if opts.DestinationSchema != "" && part.DestinationSchema != opts.DestinationSchema {
+		return false
+	}
+	if len(opts.RequiredPartitionIDs) > 0 && !partOverlapsRequiredPartitions(part, opts.RequiredPartitionIDs) {
+		return false
+	}
+	return true
+}
+
+func compactCooldownActive(part Part, now time.Time) bool {
+	if strings.TrimSpace(part.CompactCooldownUntil) == "" {
+		return false
+	}
+	until, err := time.Parse(timeFormat, part.CompactCooldownUntil)
+	if err != nil {
+		return false
+	}
+	return now.Before(until)
+}
+
+func selectCompactBatchParts(group compactGroup, opts CompactClaimOptions) []Part {
+	minParts := opts.MinInputParts
+	if minParts == 0 {
+		minParts = 2
+	}
+	partitions := orderedCandidatePartitions(group.parts, opts.RequiredPartitionIDs)
+	preferredPartitions := partitionsWithout(partitions, group.compactingPartitionIDs)
+	orderedPartitions := append(preferredPartitions, partitionsWithout(partitions, preferredPartitions)...)
+	for _, partitionID := range orderedPartitions {
+		selected := selectCompactBatchPartsForPartition(group.parts, partitionID, minParts, opts)
+		if len(selected) > 0 {
+			return selected
+		}
+	}
+	return nil
+}
+
+func partitionsWithout(partitions, excluded []string) []string {
+	excludedSet := partitionSet(excluded)
+	if len(excludedSet) == 0 {
+		return append([]string(nil), partitions...)
+	}
+	out := make([]string, 0, len(partitions))
+	for _, partitionID := range partitions {
+		if _, ok := excludedSet[partitionID]; ok {
+			continue
+		}
+		out = append(out, partitionID)
+	}
+	return out
+}
+
+func orderedCandidatePartitions(parts []Part, required []string) []string {
+	requiredSet := partitionSet(required)
+	seen := map[string]struct{}{}
+	var partitions []string
+	for _, part := range parts {
+		ids := partPartitionIDs(part)
+		for _, partitionID := range ids {
+			if len(requiredSet) > 0 {
+				if _, ok := requiredSet[partitionID]; !ok {
+					continue
+				}
+			}
+			if _, ok := seen[partitionID]; ok {
+				continue
+			}
+			seen[partitionID] = struct{}{}
+			partitions = append(partitions, partitionID)
+		}
+	}
+	return partitions
+}
+
+func selectCompactBatchPartsForPartition(parts []Part, partitionID string, minParts uint64, opts CompactClaimOptions) []Part {
+	var selected []Part
+	var inputParts, inputBytes uint64
+	for _, part := range parts {
+		partitionParts := part.DestinationActivePartitionCounts[partitionID]
+		if partitionParts == 0 {
+			continue
+		}
+		if opts.MaxArtifacts > 0 && len(selected) >= opts.MaxArtifacts {
+			break
+		}
+		partBytes := part.DestinationActivePartBytes
+		if opts.MaxBytes > 0 && inputBytes+partBytes > opts.MaxBytes {
+			if len(selected) > 0 {
+				break
+			}
+			continue
+		}
+		selected = append(selected, part)
+		inputParts += partitionParts
+		inputBytes += partBytes
+		if inputParts >= minParts {
+			return selected
+		}
+	}
+	return nil
+}
+
+func partitionSet(partitionIDs []string) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, partitionID := range partitionIDs {
+		if strings.TrimSpace(partitionID) == "" {
+			continue
+		}
+		out[partitionID] = struct{}{}
+	}
+	return out
+}
+
+func partOverlapsRequiredPartitions(part Part, required []string) bool {
+	for partitionID := range partitionSet(required) {
+		if part.DestinationActivePartitionCounts[partitionID] > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func partPartitionIDs(part Part) []string {
+	ids := make([]string, 0, len(part.DestinationActivePartitionCounts))
+	for partitionID, count := range part.DestinationActivePartitionCounts {
+		if strings.TrimSpace(partitionID) == "" || count == 0 {
+			continue
+		}
+		ids = append(ids, partitionID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func (s *Store) claimCompactParts(ctx context.Context, parts []Part, workerID string, now time.Time) ([]Part, error) {
+	claimed := make([]Part, 0, len(parts))
+	for _, part := range parts {
+		out, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName: aws.String(s.table),
+			Key:       part.key(),
+			ConditionExpression: aws.String(
+				"#status = :compact_ready",
+			),
+			UpdateExpression: aws.String(
+				"SET #status = :compacting, gsi1pk = :gsi1pk, updated_at = :now, compacting_at = :now, worker_id = :worker REMOVE #error, compact_cooldown_until",
+			),
+			ExpressionAttributeNames: map[string]string{
+				"#error":  "error",
+				"#status": "status",
+			},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":compact_ready": stringAttr(string(StatusCompactReady)),
+				":compacting":    stringAttr(string(StatusCompacting)),
+				":gsi1pk":        stringAttr(statusKey(StatusCompacting)),
+				":now":           stringAttr(formatTime(now)),
+				":worker":        stringAttr(workerID),
+			},
+			ReturnValues: types.ReturnValueAllNew,
+		})
+		if err != nil {
+			if len(claimed) > 0 {
+				_ = s.ReleaseCompactBatch(ctx, CompactBatch{JobID: part.JobID, Parts: claimed}, workerID, time.Time{}, now)
+			}
+			return nil, fmt.Errorf("claim compact-ready part %s/%s: %w", part.JobID, part.PartID, err)
+		}
+		claimedPart, err := unmarshalPart(out.Attributes)
+		if err != nil {
+			return nil, err
+		}
+		claimed = append(claimed, *claimedPart)
+	}
+	return claimed, nil
+}
+
+func compactBatchFromParts(parts []Part) *CompactBatch {
+	if len(parts) == 0 {
+		return nil
+	}
+	batch := &CompactBatch{
+		JobID: parts[0].JobID,
+		Parts: append([]Part(nil), parts...),
+	}
+	for _, part := range parts {
+		batch.InputPartCount += part.DestinationActivePartCount
+		batch.InputRows += part.DestinationActivePartRows
+		batch.InputBytes += part.DestinationActivePartBytes
+		if part.CompactGeneration >= batch.Generation {
+			batch.Generation = part.CompactGeneration + 1
+		}
+	}
+	return batch
 }
 
 func (s *Store) MarkFinished(ctx context.Context, part Part, workerID, finishedKey string, now time.Time) error {
@@ -822,7 +1449,7 @@ func partStateKey(jobID, partID string) map[string]types.AttributeValue {
 }
 
 func progressRemoveExpression() string {
-	return ", progress_updated_at, read_rows, read_bytes, written_rows, written_bytes, source_active_part_count, source_active_part_rows, source_active_part_bytes, destination_active_part_count, destination_active_part_rows, destination_active_part_bytes, destination_failed_merges, rewrite_stage, rewrite_stage_started_at, rewrite_stage_elapsed_ms, rewrite_total_elapsed_ms, rewrite_stage_durations_ms"
+	return ", progress_updated_at, read_rows, read_bytes, written_rows, written_bytes, source_active_part_count, source_active_part_rows, source_active_part_bytes, destination_active_part_count, destination_active_part_rows, destination_active_part_bytes, destination_active_partition_counts, destination_failed_merges, rewrite_stage, rewrite_stage_started_at, rewrite_stage_elapsed_ms, rewrite_total_elapsed_ms, rewrite_stage_durations_ms"
 }
 
 func jobKey(jobID string) string {

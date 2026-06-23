@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -110,6 +111,11 @@ func SourcePartPrefix(prefix, jobID, partID string) string {
 
 func FinishedPartPrefix(prefix, jobID, partID string) string {
 	return cleanKey(prefix, "jobs", jobID, "finished", partID)
+}
+
+func DeriveCompactPartID(inputPartIDs []string, generation int) string {
+	values := append([]string{strconv.Itoa(generation)}, inputPartIDs...)
+	return "compact-" + shortHash(values...)
 }
 
 func FinishedPrefix(prefix, jobID string) string {
