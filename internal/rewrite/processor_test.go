@@ -358,53 +358,6 @@ func TestRestartClickHouseRequiresCallback(t *testing.T) {
 	}
 }
 
-func TestOptimizeFinal(t *testing.T) {
-	var queries []string
-	var optimizeSettings url.Values
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read request body: %v", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		queries = append(queries, string(body))
-		optimizeSettings = r.URL.Query()
-	}))
-	defer server.Close()
-
-	err := (Processor{ClickHouse: chhttp.Client{URL: server.URL}}).optimizeFinal(context.Background(), manifest.Manifest{
-		Dest: manifest.TableRef{Database: "db", Table: "query_log_archive_temp"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "OPTIMIZE TABLE `db`.`query_log_archive_temp` FINAL"
-	if len(queries) != 1 || queries[0] != want {
-		t.Fatalf("queries = %#v, want %q", queries, want)
-	}
-	for key, want := range map[string]string{
-		"receive_timeout": "0",
-		"send_timeout":    "0",
-	} {
-		if got := optimizeSettings.Get(key); got != want {
-			t.Fatalf("%s = %q, want %q", key, got, want)
-		}
-	}
-}
-
-func TestShouldOptimizeFinal(t *testing.T) {
-	if (Processor{}).shouldOptimizeFinal(manifest.Manifest{}) {
-		t.Fatal("expected optimize final to be disabled by default")
-	}
-	if !(Processor{}).shouldOptimizeFinal(manifest.Manifest{Options: manifest.Options{OptimizeFinal: true}}) {
-		t.Fatal("expected manifest option to enable optimize final")
-	}
-	if !(Processor{ForceOptimizeFinal: true}).shouldOptimizeFinal(manifest.Manifest{}) {
-		t.Fatal("expected worker override to enable optimize final")
-	}
-}
-
 func TestDestinationFailedMergeCount(t *testing.T) {
 	var queries []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -42,6 +42,7 @@ const defaultWorkerShutdownGracePeriod = 90 * time.Second
 const defaultCompactWindow = 2 * time.Hour
 const defaultCompactMaxArtifacts = 8
 const defaultCompactMaxBytes uint64 = 150 * 1024 * 1024 * 1024
+const compactSourceMergeWaitCap = 5 * time.Minute
 const compactMinInputParts uint64 = 2
 const defaultRetryStaleAfter = 5 * time.Minute
 const workerStateUpdateTimeout = 30 * time.Second
@@ -155,9 +156,8 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		s5cmdNumWorkers       = fs.Int("s5cmd-numworkers", 0, "s5cmd --numworkers per upload process; <=0 auto-scales from upload-concurrency")
 		uploadConcurrency     = fs.Int("upload-concurrency", 0, "number of source parts to upload concurrently; <=0 uses detected CPU count")
 		dynamoEndpoint        = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
-		optimizeFinal         = fs.Bool("optimize-final", false, "record that workers should run one OPTIMIZE TABLE ... FINAL on their local destination table after merges settle")
 	)
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if err := applyConfigDefaults(fs, *configPath, "upload-freeze"); err != nil {
@@ -184,7 +184,6 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		"freeze", *freezeName,
 		"bucket", *bucket,
 		"prefix", *prefix,
-		"optimize_final", *optimizeFinal,
 	)
 
 	slog.Info("reading SQL files", "stage", "read_sql_files", "destination_schema_file", *destinationSchemaFile, "insert_select_file", *insertSelectFile)
@@ -236,9 +235,8 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 	slog.Info("found frozen parts", "stage", "scan_freeze", "parts", len(scannedParts), "parts_by_disk", formatPartCountsByDisk(disks, scannedParts))
 
 	resolvedJobID := *jobID
-	options := manifest.Options{OptimizeFinal: *optimizeFinal}
 	if resolvedJobID == "" {
-		resolvedJobID = manifest.DeriveJobIDWithOptions(*database, *table, *freezeName, sourceSchema, destinationSchema, insertSelect, options)
+		resolvedJobID = manifest.DeriveJobID(*database, *table, *freezeName, sourceSchema, destinationSchema, insertSelect)
 	}
 	slog.Info("resolved job id", "stage", "resolve_job", "job_id", resolvedJobID)
 
@@ -279,7 +277,6 @@ func runUploadFreeze(ctx context.Context, args []string) error {
 		SourceSchema:      sourceSchema,
 		DestinationSchema: destinationSchema,
 		InsertSelect:      insertSelect,
-		Options:           options,
 		Bucket:            *bucket,
 		Prefix:            *prefix,
 		PartsTotal:        len(scannedParts),
@@ -349,7 +346,6 @@ type uploadFreezePartParams struct {
 	SourceSchema      string
 	DestinationSchema string
 	InsertSelect      string
-	Options           manifest.Options
 	Bucket            string
 	Prefix            string
 	PartsTotal        int
@@ -463,7 +459,7 @@ func uploadPartsInParallel(ctx context.Context, tasks []uploadPartTask, concurre
 
 func uploadFreezePart(ctx context.Context, workerID int, task uploadPartTask, params uploadFreezePartParams) (uploadPartResult, error) {
 	sourcePart := task.SourcePart
-	partID := manifest.DerivePartIDWithOptions(sourcePart.Disk, sourcePart.RelativePath, sourcePart.Name, params.SourceSchema, params.DestinationSchema, params.InsertSelect, params.Options)
+	partID := manifest.DerivePartID(sourcePart.Disk, sourcePart.RelativePath, sourcePart.Name, params.SourceSchema, params.DestinationSchema, params.InsertSelect)
 	sourceKey := manifest.SourcePartPrefix(params.Prefix, params.JobID, partID)
 	finishedKey := manifest.FinishedPartPrefix(params.Prefix, params.JobID, partID)
 	createdAt := time.Now().UTC()
@@ -477,7 +473,6 @@ func uploadFreezePart(ctx context.Context, workerID int, task uploadPartTask, pa
 		Dest:      params.Dest,
 		Part:      manifest.SourcePart{Disk: sourcePart.Disk, Name: sourcePart.Name, RelativePath: sourcePart.RelativePath},
 		SQL:       manifest.SQLBundle{SourceSchema: params.SourceSchema, DestinationSchema: params.DestinationSchema, InsertSelect: params.InsertSelect},
-		Options:   params.Options,
 		S3:        manifest.S3Refs{Bucket: params.Bucket, SourceKey: sourceKey, FinishedKey: finishedKey},
 		CreatedAt: createdAt,
 	}
@@ -659,9 +654,8 @@ func runWorker(ctx context.Context, args []string) error {
 		metricsPath             = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
 		stateProgressInterval   = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress heartbeats to DynamoDB; <=0 disables progress writes")
 		shutdownGracePeriod     = fs.Duration("shutdown-grace-period", defaultWorkerShutdownGracePeriod, "how long to let an active part finish after shutdown is requested before canceling it and returning it to READY; <=0 cancels immediately")
-		optimizeFinal           = fs.Bool("optimize-final", false, "run one OPTIMIZE TABLE ... FINAL inside the local worker after merges settle, regardless of manifest")
 	)
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if err := applyConfigDefaults(fs, *configPath, "worker"); err != nil {
@@ -696,7 +690,6 @@ func runWorker(ctx context.Context, args []string) error {
 		"work_dir", *workDir,
 		"clickhouse_url", *clickHouseURL,
 		"shutdown_grace_period", *shutdownGracePeriod,
-		"optimize_final", *optimizeFinal,
 		"compact", *compact,
 	)
 	slog.Info("initializing DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
@@ -732,6 +725,8 @@ func runWorker(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("derive clickhouse merge background pool size: %w", err)
 	}
+	sourceMergeIdleTimeout, sourceMergeMaxRuntime := sourceMergeWaitTimeouts(*mergeIdleTimeout, *mergeMaxRuntime, *compact)
+	sourceMergeSettleMinWait := derivedMergeSettleMinWait(sourceMergeIdleTimeout, rewrite.DefaultMergeSettleMinWait)
 	slog.Info(
 		"configured clickhouse resource settings",
 		"cpus", workerLimits.CPUs,
@@ -750,9 +745,10 @@ func runWorker(ctx context.Context, args []string) error {
 		"merge_max_block_size_bytes", mergeTreeSettings.MergeMaxBlockSizeBytes,
 		"merge_selecting_sleep_ms", mergeTreeSettings.MergeSelectingSleepMS,
 		"background_merges_mutations_scheduling_policy", mergeTreeSettings.MergeSchedulingPolicy,
-		"merge_idle_timeout", *mergeIdleTimeout,
-		"merge_max_runtime", *mergeMaxRuntime,
-		"merge_settle_min_wait", derivedMergeSettleMinWait(*mergeIdleTimeout, rewrite.DefaultMergeSettleMinWait),
+		"merge_idle_timeout", sourceMergeIdleTimeout,
+		"merge_max_runtime", sourceMergeMaxRuntime,
+		"merge_settle_min_wait", sourceMergeSettleMinWait,
+		"source_merge_compact_cap", compactSourceMergeWaitCap,
 		"compact_window", *compactWindow,
 		"compact_retry_cooldown", compactRetryCooldown(*compactWindow),
 		"compact_claim_splay_max", compactClaimSplayMax(*compactWindow),
@@ -908,14 +904,13 @@ func runWorker(ctx context.Context, args []string) error {
 				S3Copy:              s3copy.Copier{Binary: *s5cmdBinary, Endpoint: *s3Endpoint},
 				ClickHouse:          ch,
 				WorkDir:             runDirs.Scratch,
-				MergeTimeout:        *mergeIdleTimeout,
-				MergeMaxTimeout:     *mergeMaxRuntime,
-				MergeSettleMinWait:  derivedMergeSettleMinWait(*mergeIdleTimeout, rewrite.DefaultMergeSettleMinWait),
+				MergeTimeout:        sourceMergeIdleTimeout,
+				MergeMaxTimeout:     sourceMergeMaxRuntime,
+				MergeSettleMinWait:  sourceMergeSettleMinWait,
 				MergeSettleMinParts: rewrite.DefaultMergeSettleMinParts,
 				Metrics:             recorder,
 				InsertSettings:      insertSettings,
 				ProgressInterval:    *stateProgressInterval,
-				ForceOptimizeFinal:  *optimizeFinal,
 				MergeTreeSettings: rewrite.MergeTreeSettings{
 					MergeMaxBlockSize:       mergeTreeSettings.MergeMaxBlockSize,
 					MergeMaxBlockSizeBytes:  mergeTreeSettings.MergeMaxBlockSizeBytes,
@@ -1378,6 +1373,27 @@ func derivedMergeSettleMinWait(idleTimeout, maxWait time.Duration) time.Duration
 	return wait
 }
 
+func sourceMergeWaitTimeouts(idleTimeout, maxRuntime time.Duration, compactEnabled bool) (time.Duration, time.Duration) {
+	if idleTimeout == 0 {
+		idleTimeout = rewrite.DefaultMergeTimeout
+	}
+	if maxRuntime == 0 {
+		maxRuntime = rewrite.DefaultMergeMaxTimeout
+	}
+	if compactEnabled {
+		if idleTimeout > compactSourceMergeWaitCap {
+			idleTimeout = compactSourceMergeWaitCap
+		}
+		if maxRuntime > compactSourceMergeWaitCap {
+			maxRuntime = compactSourceMergeWaitCap
+		}
+	}
+	if maxRuntime < idleTimeout {
+		maxRuntime = idleTimeout
+	}
+	return idleTimeout, maxRuntime
+}
+
 func compactRetryCooldown(compactWindow time.Duration) time.Duration {
 	if compactWindow <= 0 {
 		return time.Minute
@@ -1502,7 +1518,7 @@ func runImportFinished(ctx context.Context, args []string) error {
 		workDir            = fs.String("work-dir", "", "import scratch directory; empty uses the destination ClickHouse disk")
 		requireEmpty       = fs.Bool("require-empty", true, "fail if the destination table already has active parts")
 	)
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if err := applyConfigDefaults(fs, *configPath, "import-finished"); err != nil {
@@ -1600,7 +1616,7 @@ func runListJobs(ctx context.Context, args []string) error {
 		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
 		jsonOutput     = fs.Bool("json", false, "print JSON output")
 	)
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if err := applyConfigDefaults(fs, *configPath, "list-jobs"); err != nil {
@@ -1639,7 +1655,7 @@ func runJobStatus(ctx context.Context, args []string) error {
 		showParts      = fs.Bool("parts", false, "include per-part state rows")
 		showDetails    = fs.Bool("details", false, "include per-part rewrite stage timing details")
 	)
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if err := applyConfigDefaults(fs, *configPath, "job-status"); err != nil {
@@ -1708,7 +1724,7 @@ func runRetryFailed(ctx context.Context, args []string) error {
 		dynamoEndpoint    = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
 		jsonOutput        = fs.Bool("json", false, "print JSON output")
 	)
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if err := applyConfigDefaults(fs, *configPath, "retry-failed"); err != nil {
@@ -1817,7 +1833,7 @@ func runDeleteParts(ctx context.Context, args []string) error {
 		jsonOutput     = fs.Bool("json", false, "print JSON output")
 	)
 	fs.Var(&partIDs, "part-id", "specific part id to delete; may be repeated")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if err := applyConfigDefaults(fs, *configPath, "delete-parts"); err != nil {
@@ -1902,7 +1918,7 @@ func runDeleteJob(ctx context.Context, args []string) error {
 		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
 		jsonOutput     = fs.Bool("json", false, "print JSON output")
 	)
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if err := applyConfigDefaults(fs, *configPath, "delete-job"); err != nil {
@@ -1988,6 +2004,48 @@ func destinationTableRefFromSchema(schema string) (manifest.TableRef, error) {
 		return manifest.TableRef{}, fmt.Errorf("destination schema CREATE TABLE must include a database-qualified table name")
 	}
 	return manifest.TableRef{Database: schemaDatabase, Table: schemaTable}, nil
+}
+
+func parseFlags(fs *flag.FlagSet, args []string) error {
+	return fs.Parse(filterUnknownFlags(fs, args))
+}
+
+func filterUnknownFlags(fs *flag.FlagSet, args []string) []string {
+	known := map[string]struct{}{}
+	fs.VisitAll(func(f *flag.Flag) {
+		known[f.Name] = struct{}{}
+	})
+
+	filtered := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			filtered = append(filtered, args[i:]...)
+			break
+		}
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			filtered = append(filtered, arg)
+			continue
+		}
+
+		name, hasInlineValue := flagNameAndValue(arg)
+		if _, ok := known[name]; ok {
+			filtered = append(filtered, arg)
+			continue
+		}
+
+		fmt.Fprintf(os.Stderr, "warning: flag is not recognised; continuing anyway: %s\n", arg)
+		if !hasInlineValue && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+			i++
+		}
+	}
+	return filtered
+}
+
+func flagNameAndValue(arg string) (string, bool) {
+	trimmed := strings.TrimLeft(arg, "-")
+	name, _, hasValue := strings.Cut(trimmed, "=")
+	return name, hasValue
 }
 
 func applyConfigDefaults(fs *flag.FlagSet, path, command string) error {

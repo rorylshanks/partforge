@@ -308,6 +308,40 @@ func TestDerivedMergeSettleMinWait(t *testing.T) {
 	}
 }
 
+func TestSourceMergeWaitTimeoutsCapWhenCompactEnabled(t *testing.T) {
+	idleTimeout, maxRuntime := sourceMergeWaitTimeouts(time.Hour, 2*time.Hour, true)
+	if idleTimeout != compactSourceMergeWaitCap || maxRuntime != compactSourceMergeWaitCap {
+		t.Fatalf("source merge timeouts = %s/%s, want %s/%s", idleTimeout, maxRuntime, compactSourceMergeWaitCap, compactSourceMergeWaitCap)
+	}
+
+	idleTimeout, maxRuntime = sourceMergeWaitTimeouts(time.Hour, 2*time.Hour, false)
+	if idleTimeout != time.Hour || maxRuntime != 2*time.Hour {
+		t.Fatalf("source merge timeouts without compact = %s/%s, want 1h/2h", idleTimeout, maxRuntime)
+	}
+
+	idleTimeout, maxRuntime = sourceMergeWaitTimeouts(time.Minute, 30*time.Second, true)
+	if idleTimeout != time.Minute || maxRuntime != time.Minute {
+		t.Fatalf("source merge timeouts with short max = %s/%s, want 1m/1m", idleTimeout, maxRuntime)
+	}
+}
+
+func TestParseFlagsIgnoresUnknownFlags(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	known := fs.String("known", "", "")
+	enabled := fs.Bool("enabled", false, "")
+
+	err := parseFlags(fs, []string{"-unknown", "discarded", "-known", "value", "--old-bool", "-enabled", "--inline=ignored"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *known != "value" {
+		t.Fatalf("known = %q, want value", *known)
+	}
+	if !*enabled {
+		t.Fatal("expected enabled flag to be parsed")
+	}
+}
+
 func TestSelectRetryPartsStale(t *testing.T) {
 	now := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
 	parts := []state.Part{

@@ -55,7 +55,6 @@ const (
 	stageInsertSelect            = "insert_select"
 	stageConfigureMergeSettings  = "configure_merge_settings"
 	stageRestartClickHouse       = "restart_clickhouse"
-	stageOptimizeFinal           = "optimize_final"
 	stageWaitMerges              = "wait_merges"
 	stageMeasureDestinationParts = "measure_destination_parts"
 	stageFreezeDestinationParts  = "freeze_destination_parts"
@@ -76,7 +75,6 @@ var stageOrder = []string{
 	stageInsertSelect,
 	stageConfigureMergeSettings,
 	stageRestartClickHouse,
-	stageOptimizeFinal,
 	stageWaitMerges,
 	stageMeasureDestinationParts,
 	stageFreezeDestinationParts,
@@ -106,7 +104,6 @@ type Processor struct {
 	MergeSettleMinParts uint64
 	MergePollInterval   time.Duration
 	RestartClickHouse   func(context.Context) error
-	ForceOptimizeFinal  bool
 	mergeWaitHook       func(context.Context, mergeWaitTarget, mergePartSnapshot, uint64) (bool, error)
 }
 
@@ -336,7 +333,6 @@ func (p Processor) ProcessPart(ctx context.Context, item WorkItem) (result Proce
 		"destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table),
 		"part", m.Part.RelativePath,
 		"disk", m.Part.Disk,
-		"optimize_final", m.Options.OptimizeFinal,
 	)
 	if m.JobID != item.JobID || m.PartID != item.PartID {
 		return ProcessResult{}, fmt.Errorf("work item references %s/%s but manifest contains %s/%s", item.JobID, item.PartID, m.JobID, m.PartID)
@@ -499,31 +495,8 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 		Database: m.Dest.Database,
 		Table:    m.Dest.Table,
 	}
-	mergesSettled, err := p.waitForDestinationMerges(ctx, m, stageTracker, mergeTarget, "after_restart")
-	if err != nil {
+	if _, err := p.waitForDestinationMerges(ctx, m, stageTracker, mergeTarget, "after_restart"); err != nil {
 		return rewriteResult{}, err
-	}
-	if p.shouldOptimizeFinal(m) {
-		if mergesSettled {
-			if err := p.reportStageProgress(ctx, m, stageTracker, stageOptimizeFinal); err != nil {
-				return rewriteResult{}, err
-			}
-			optimizeStartedAt := time.Now()
-			slog.Info("running destination table final optimize", "stage", stageOptimizeFinal, "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table), "manifest_optimize_final", m.Options.OptimizeFinal, "worker_force_optimize_final", p.ForceOptimizeFinal)
-			if err := p.optimizeFinal(ctx, m); err != nil {
-				if ctx.Err() != nil {
-					return rewriteResult{}, fmt.Errorf("optimize destination table final: %w", err)
-				}
-				slog.Warn("destination table final optimize failed; continuing to destination merge wait", "stage", stageOptimizeFinal, "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table), "error", err, "elapsed", time.Since(optimizeStartedAt))
-			} else {
-				slog.Info("destination table final optimize finished", "stage", stageOptimizeFinal, "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table), "elapsed", time.Since(optimizeStartedAt))
-			}
-			if _, err := p.waitForDestinationMerges(ctx, m, stageTracker, mergeTarget, "after_optimize_final"); err != nil {
-				return rewriteResult{}, err
-			}
-		} else {
-			slog.Warn("skipping destination table final optimize because destination merges did not settle", "stage", stageWaitMerges, "job_id", m.JobID, "part_id", m.PartID, "destination_table", mergeTarget.tableSQL(), "manifest_optimize_final", m.Options.OptimizeFinal, "worker_force_optimize_final", p.ForceOptimizeFinal)
-		}
 	}
 	if err := p.reportStageProgress(ctx, m, stageTracker, stageMeasureDestinationParts); err != nil {
 		return rewriteResult{}, err
@@ -768,19 +741,6 @@ func clampUint64(value, minValue, maxValue uint64) uint64 {
 		return maxValue
 	}
 	return value
-}
-
-func (p Processor) shouldOptimizeFinal(m manifest.Manifest) bool {
-	return p.ForceOptimizeFinal || m.Options.OptimizeFinal
-}
-
-func (p Processor) optimizeFinal(ctx context.Context, m manifest.Manifest) error {
-	return p.ClickHouse.ExecWithOptions(ctx, "OPTIMIZE TABLE "+chhttp.TableSQL(m.Dest.Database, m.Dest.Table)+" FINAL", chhttp.QueryOptions{
-		Settings: chhttp.QuerySettings{
-			"receive_timeout": "0",
-			"send_timeout":    "0",
-		},
-	})
 }
 
 func (p Processor) waitForDestinationMerges(ctx context.Context, m manifest.Manifest, stageTracker *rewriteStageTracker, target mergeWaitTarget, waitContext string) (bool, error) {
