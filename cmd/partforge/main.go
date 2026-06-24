@@ -94,6 +94,8 @@ func run() error {
 		return runJobStatus(ctx, os.Args[2:])
 	case "retry-failed":
 		return runRetryFailed(ctx, os.Args[2:])
+	case "set-part-state":
+		return runSetPartState(ctx, os.Args[2:])
 	case "reset-job":
 		return runResetJob(ctx, os.Args[2:])
 	case "reset-compaction":
@@ -122,6 +124,7 @@ func usage() {
   partforge list-jobs       [flags]
   partforge job-status      [flags]
   partforge retry-failed    [flags]
+  partforge set-part-state  [flags]
   partforge reset-job       [flags]
   partforge reset-compaction [flags]
   partforge delete-parts    [flags]
@@ -134,6 +137,7 @@ Commands:
   list-jobs         List job IDs found in the DynamoDB state table.
   job-status        Show part state counts, progress, and failed part errors for one job.
   retry-failed      Move failed parts back to their retryable state.
+  set-part-state    Force selected part rows into a stable state for admin recovery.
   reset-job         Delete generated compact rows and move original job parts back to READY.
   reset-compaction  Delete generated compact rows and move original rewritten parts back to COMPACT_READY.
   delete-parts      Force delete selected DynamoDB part rows from one job.
@@ -1576,15 +1580,12 @@ func finalizableCompactReadyParts(parts []state.Part, compactWindow time.Duratio
 	if compactWindow <= 0 {
 		return compactReady, true, nil
 	}
-	cutoff := now.Add(-compactWindow)
-	for _, part := range compactReady {
-		compactReadyAt, err := compactReadySince(part)
-		if err != nil {
-			return nil, false, err
-		}
-		if compactReadyAt.After(cutoff) {
-			return nil, false, nil
-		}
+	finalizeAfter, ok, reason := compactFinalizeAfter(parts, compactWindow, now)
+	if !ok {
+		return nil, false, errors.New(reason)
+	}
+	if now.Before(finalizeAfter) {
+		return nil, false, nil
 	}
 	return compactReady, true, nil
 }
@@ -1938,6 +1939,100 @@ func runRetryFailed(ctx context.Context, args []string) error {
 
 func runResetJob(ctx context.Context, args []string) error {
 	return runResetState(ctx, args, resetModeJob)
+}
+
+func runSetPartState(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("set-part-state", flag.ExitOnError)
+	var (
+		configPath     = fs.String("config", defaultConfigPath, "JSON config file path")
+		jobID          = fs.String("job-id", "", "job id containing parts to update")
+		partIDs        partIDListFlag
+		status         = fs.String("status", "", "update parts currently in this exact state, e.g. COMPACTING")
+		toStatus       = fs.String("to-status", "", "target stable state: READY, COMPACT_READY, or FINISHED")
+		force          = fs.Bool("force", false, "required to update selected part rows")
+		stateTable     = fs.String("state-table", defaultStateTable, "DynamoDB state table")
+		region         = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
+		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
+		jsonOutput     = fs.Bool("json", false, "print JSON output")
+	)
+	fs.Var(&partIDs, "part-id", "specific part id to update; may be repeated")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := applyConfigDefaults(fs, *configPath, "set-part-state"); err != nil {
+		return err
+	}
+	if *jobID == "" {
+		return errors.New("job-id is required")
+	}
+	target := state.Status(strings.TrimSpace(*toStatus))
+	if target == "" {
+		return errors.New("to-status is required")
+	}
+	if !adminSettableStatus(target) {
+		return fmt.Errorf("to-status must be one of READY, COMPACT_READY, or FINISHED, got %q", target)
+	}
+	if !*force {
+		return errors.New("set-part-state requires -force")
+	}
+	selectors := 0
+	if strings.TrimSpace(*status) != "" {
+		selectors++
+	}
+	if len(partIDs) > 0 {
+		selectors++
+	}
+	if selectors != 1 {
+		return errors.New("exactly one of -status or -part-id is required")
+	}
+
+	stateStore, err := state.New(ctx, state.Config{
+		Region:   *region,
+		Endpoint: *dynamoEndpoint,
+		Table:    *stateTable,
+	})
+	if err != nil {
+		return err
+	}
+	jobParts, err := stateStore.ListJobParts(ctx, *jobID)
+	if err != nil {
+		return err
+	}
+	selectedParts, err := selectSetPartStateParts(jobParts, setPartStateSelection{
+		PartIDs: []string(partIDs),
+		Status:  state.Status(strings.TrimSpace(*status)),
+	})
+	if err != nil {
+		return err
+	}
+	if len(selectedParts) == 0 {
+		return fmt.Errorf("no parts matched set-part-state selection for job %s", *jobID)
+	}
+
+	results := make([]setPartStateResult, 0, len(selectedParts))
+	now := time.Now().UTC()
+	for _, part := range selectedParts {
+		if err := stateStore.ForceSetPartStatus(ctx, part, target, now); err != nil {
+			return err
+		}
+		results = append(results, setPartStateResult{
+			PartID: part.PartID,
+			From:   string(part.Status),
+			To:     string(target),
+		})
+	}
+
+	out := setPartStateOutput{
+		JobID:    *jobID,
+		ToStatus: string(target),
+		Updated:  len(results),
+		Parts:    results,
+	}
+	if *jsonOutput {
+		return writeJSON(os.Stdout, out)
+	}
+	printSetPartStateResult(os.Stdout, out)
+	return nil
 }
 
 func runResetCompaction(ctx context.Context, args []string) error {
@@ -2639,7 +2734,7 @@ type jobSummaryOptions struct {
 type compactJobSummary struct {
 	ReadyParts       int           `json:"ready_parts"`
 	CompactingParts  int           `json:"compacting_parts"`
-	CooldownParts    int           `json:"cooldown_parts"`
+	CooldownParts    int           `json:"cooldown_seed_only_parts"`
 	Window           string        `json:"window"`
 	FinalizeStatus   string        `json:"finalize_status"`
 	FinalizeAfter    string        `json:"finalize_after,omitempty"`
@@ -2690,6 +2785,19 @@ type retryFailedOutput struct {
 }
 
 type retryResult struct {
+	PartID string `json:"part_id"`
+	From   string `json:"from"`
+	To     string `json:"to"`
+}
+
+type setPartStateOutput struct {
+	JobID    string               `json:"job_id"`
+	ToStatus string               `json:"to_status"`
+	Updated  int                  `json:"updated"`
+	Parts    []setPartStateResult `json:"parts"`
+}
+
+type setPartStateResult struct {
 	PartID string `json:"part_id"`
 	From   string `json:"from"`
 	To     string `json:"to"`
@@ -2949,7 +3057,7 @@ func compactSummary(parts []state.Part, counts map[state.Status]int, opts jobSum
 	}
 	if now.Before(finalizeAfter) {
 		summary.FinalizeStatus = "waiting"
-		summary.Reason = "compact window has not elapsed for all compact-ready parts"
+		summary.Reason = "job compact window has not elapsed"
 		return summary
 	}
 	summary.FinalizeStatus = "ready"
@@ -2972,24 +3080,32 @@ func compactFinalizeAfter(parts []state.Part, compactWindow time.Duration, now t
 	if compactWindow <= 0 {
 		return now, true, ""
 	}
-	var finalizeAfter time.Time
+	var compactStartedAt time.Time
 	for _, part := range parts {
-		if part.Status != state.StatusCompactReady {
+		if !compactPhaseStatus(part.Status) {
 			continue
 		}
 		readyAt, err := compactReadySince(part)
 		if err != nil {
 			return time.Time{}, false, err.Error()
 		}
-		partFinalizeAfter := readyAt.Add(compactWindow)
-		if finalizeAfter.IsZero() || partFinalizeAfter.After(finalizeAfter) {
-			finalizeAfter = partFinalizeAfter
+		if compactStartedAt.IsZero() || readyAt.Before(compactStartedAt) {
+			compactStartedAt = readyAt
 		}
 	}
-	if finalizeAfter.IsZero() {
-		return time.Time{}, false, "no compact-ready timestamp found"
+	if compactStartedAt.IsZero() {
+		return time.Time{}, false, "no compact phase timestamp found"
 	}
-	return finalizeAfter, true, ""
+	return compactStartedAt.Add(compactWindow), true, ""
+}
+
+func compactPhaseStatus(status state.Status) bool {
+	switch status {
+	case state.StatusCompactReady, state.StatusCompacting, state.StatusSuperseded, state.StatusFinished, state.StatusImporting, state.StatusImported:
+		return true
+	default:
+		return false
+	}
 }
 
 func compactCooldownUntil(part state.Part) (time.Time, bool) {
@@ -3136,7 +3252,7 @@ func printJobSummary(out *os.File, summary jobSummary) {
 func printCompactSummary(out *os.File, compact *compactJobSummary) {
 	fmt.Fprintf(
 		out,
-		"compact: ready=%d compacting=%d cooldown=%d window=%s\n",
+		"compact: ready=%d compacting=%d cooldown_seed_only=%d window=%s\n",
 		compact.ReadyParts,
 		compact.CompactingParts,
 		compact.CooldownParts,
@@ -3317,6 +3433,11 @@ type deletePartSelection struct {
 	Status  state.Status
 }
 
+type setPartStateSelection struct {
+	PartIDs []string
+	Status  state.Status
+}
+
 type partIDListFlag []string
 
 func (f *partIDListFlag) String() string {
@@ -3354,6 +3475,25 @@ func selectDeleteParts(parts []state.Part, selection deletePartSelection) ([]sta
 	return nil, errors.New("delete part selection is empty")
 }
 
+func selectSetPartStateParts(parts []state.Part, selection setPartStateSelection) ([]state.Part, error) {
+	if len(selection.PartIDs) > 0 {
+		return selectDeletePartsByID(parts, selection.PartIDs)
+	}
+	if selection.Status != "" {
+		if !knownStatus(selection.Status) {
+			return nil, fmt.Errorf("unknown status %q", selection.Status)
+		}
+		selected := make([]state.Part, 0)
+		for _, part := range parts {
+			if part.Status == selection.Status {
+				selected = append(selected, part)
+			}
+		}
+		return selected, nil
+	}
+	return nil, errors.New("set-part-state selection is empty")
+}
+
 func selectDeletePartsByID(parts []state.Part, partIDs []string) ([]state.Part, error) {
 	byID := make(map[string]state.Part, len(parts))
 	for _, part := range parts {
@@ -3386,6 +3526,15 @@ func knownStatus(status state.Status) bool {
 		}
 	}
 	return false
+}
+
+func adminSettableStatus(status state.Status) bool {
+	switch status {
+	case state.StatusReady, state.StatusCompactReady, state.StatusFinished:
+		return true
+	default:
+		return false
+	}
 }
 
 func selectRetryParts(parts []state.Part, selection retryPartSelection) ([]state.Part, error) {
@@ -3724,6 +3873,21 @@ func printRetryResults(out *os.File, result retryFailedOutput) {
 		fmt.Fprintf(out, "stale_after: %s\n", result.StaleAfter)
 	}
 	fmt.Fprintf(out, "retried: %d\n", result.Retried)
+	if len(result.Parts) == 0 {
+		return
+	}
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "\nPART_ID\tFROM\tTO")
+	for _, part := range result.Parts {
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", part.PartID, part.From, part.To)
+	}
+	_ = tw.Flush()
+}
+
+func printSetPartStateResult(out *os.File, result setPartStateOutput) {
+	fmt.Fprintf(out, "job_id: %s\n", result.JobID)
+	fmt.Fprintf(out, "to_status: %s\n", result.ToStatus)
+	fmt.Fprintf(out, "updated: %d\n", result.Updated)
 	if len(result.Parts) == 0 {
 		return
 	}

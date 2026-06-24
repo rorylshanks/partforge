@@ -76,7 +76,7 @@ Large worker data should live on the same local filesystem. In production, mount
 
 Workers run insert-select queries with an insert memory cap of 70% of detected memory. Initial insert concurrency is the lower of about one quarter of the detected CPU count and a memory-derived limit that targets at least 2 GiB insert blocks when memory allows, so CPU-rich workers with limited memory start less aggressively while high-memory workers can still use more than eight insert threads. The worker derives `min_insert_block_size_bytes` from the insert memory cap divided by six times the insert thread count, then derives `min_insert_block_size_rows` from that byte target using a 1 KiB average-row estimate. This gives larger insert blocks while leaving about half of the query memory cap for read, decompression, and expression overhead. Before the insert starts, the worker applies `default_compression_codec` to the worker destination table; the default is `ZSTD(5)` and can be changed with `-default-compression-codec`. After the insert completes, the worker applies memory-derived `merge_max_block_size` and `merge_max_block_size_bytes`, a lower local `merge_selecting_sleep_ms`, and output-size-derived `max_bytes_to_merge_at_max_space_in_pool` and `max_bytes_to_merge_at_min_space_in_pool` to the worker destination table. The max-space merge cap targets about four large output parts up to 150 GiB per automatic merge, while the min-space cap stays between 1 GiB and 32 GiB so small and medium parts can still compact when merge disk reservations are tight. The worker then restarts its local ClickHouse child process with `background_pool_size` set to the larger of the detected CPU count and ClickHouse's minimum valid pool size for default MergeTree mutation settings and `background_merges_mutations_scheduling_policy = 'shortest_task_first'`. It then lets destination merges run until they settle, `-merge-idle-timeout` elapses without progress, or `-merge-max-runtime` is reached. When compaction is enabled, this initial source rewrite merge wait is capped at 5 minutes; deeper merge waiting is handled by the compaction path. If no merge is active but more than one active output part remains, the worker keeps polling until merges have stayed idle and the active output part count has stayed unchanged for a derived settle wait before treating merges as settled.
 
-Compaction workers heartbeat claimed `COMPACTING` rows and automatically release stale compaction claims after the derived lease timeout, based on `-compact-merge-max-runtime` plus `-shutdown-grace-period`. Finalization uses each artifact's stable `compact_ready_at` timestamp, so compaction retries and no-reduction releases do not restart the `-compact-window` clock.
+Compaction workers heartbeat claimed `COMPACTING` rows and automatically release stale compaction claims after the derived lease timeout, based on `-compact-merge-max-runtime` plus `-shutdown-grace-period`. Finalization uses the oldest compact-phase timestamp in the job, so fresh compact outputs, compaction retries, and no-reduction releases do not restart the `-compact-window` clock.
 
 ```sh
 docker compose build worker
@@ -123,7 +123,7 @@ partforge job-status \
   -job-id=job-123
 ```
 
-Use `-json` on either command for machine-readable output. `job-status` includes physical ClickHouse part counters: `input_clickhouse_parts` is the original source part count, and `current_output_clickhouse_parts` is the active output part count represented by non-superseded in-flight or finished rows. During compaction, it also reports compact-ready/compacting counts, cooldown count, and when compact-ready parts can finalize. Use `job-status -parts` to include one row per PartForge state row with latest persisted rewrite counters, compact-ready age/cooldown, active physical part stats, and `FAILED_MERGES`, or `job-status -details` to include each part's current rewrite stage and per-stage timings. `list-jobs` scans the state table, so admin IAM needs `dynamodb:Scan`; normal worker/import paths do not.
+Use `-json` on either command for machine-readable output. `job-status` includes physical ClickHouse part counters: `input_clickhouse_parts` is the original source part count, and `current_output_clickhouse_parts` is the active output part count represented by non-superseded in-flight or finished rows. During compaction, it also reports compact-ready/compacting counts, seed-only cooldown count, and when compact-ready parts can finalize. Use `job-status -parts` to include one row per PartForge state row with latest persisted rewrite counters, compact-ready age/cooldown, active physical part stats, and `FAILED_MERGES`, or `job-status -details` to include each part's current rewrite stage and per-stage timings. `list-jobs` scans the state table, so admin IAM needs `dynamodb:Scan`; normal worker/import paths do not.
 
 Retry one failed part:
 
@@ -181,6 +181,29 @@ partforge retry-failed \
 ```
 
 Use `-force` only when the selected part or whole job should be rewritten from the worker stage.
+
+Force all compacting rows in a job back to compact-ready after stopped workers have left them claimed:
+
+```sh
+partforge set-part-state \
+  -job-id=job-123 \
+  -status=COMPACTING \
+  -to-status=COMPACT_READY \
+  -force
+```
+
+Force specific rows to a stable state:
+
+```sh
+partforge set-part-state \
+  -job-id=job-123 \
+  -part-id=part-abc \
+  -part-id=part-def \
+  -to-status=COMPACT_READY \
+  -force
+```
+
+`set-part-state` is an admin recovery command. It can select rows by repeated `-part-id` or by current `-status`, and it can target `READY`, `COMPACT_READY`, or `FINISHED`. It clears stale worker ownership, error, cooldown, and compaction-progress fields; targeting `READY` also clears persisted rewrite progress and metrics. The command preserves rewritten artifact metadata when targeting `COMPACT_READY` or `FINISHED`. It uses conditional updates and requires `dynamodb:Query` and `dynamodb:UpdateItem`.
 
 Reset a job back to its original uploaded source parts:
 

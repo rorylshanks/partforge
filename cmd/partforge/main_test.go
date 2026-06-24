@@ -154,10 +154,10 @@ func TestSummarizeJobCompactFinalizationETA(t *testing.T) {
 	if summary.Compact.FinalizeStatus != "waiting" {
 		t.Fatalf("finalize status = %q, want waiting", summary.Compact.FinalizeStatus)
 	}
-	if summary.Compact.FinalizeIn != "1h30m0s" {
-		t.Fatalf("finalize in = %q, want 1h30m0s", summary.Compact.FinalizeIn)
+	if summary.Compact.FinalizeIn != "30m0s" {
+		t.Fatalf("finalize in = %q, want 30m0s", summary.Compact.FinalizeIn)
 	}
-	if summary.Compact.FinalizeAfter != now.Add(90*time.Minute).Format(time.RFC3339Nano) {
+	if summary.Compact.FinalizeAfter != now.Add(30*time.Minute).Format(time.RFC3339Nano) {
 		t.Fatalf("finalize after = %q", summary.Compact.FinalizeAfter)
 	}
 }
@@ -171,8 +171,9 @@ func TestSummarizeJobCompactFinalizationBlockers(t *testing.T) {
 			CompactReadyAt: now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
 		},
 		{
-			PartID: "part-2",
-			Status: state.StatusCompacting,
+			PartID:    "part-2",
+			Status:    state.StatusCompacting,
+			UpdatedAt: now.Add(-time.Hour).Format(time.RFC3339Nano),
 		},
 		{
 			PartID: "part-3",
@@ -339,6 +340,59 @@ func TestSelectDeletePartsRejectsMissingPartID(t *testing.T) {
 	}, deletePartSelection{PartIDs: []string{"part-missing"}})
 	if err == nil {
 		t.Fatal("expected missing part error")
+	}
+}
+
+func TestSelectSetPartStatePartsByStatus(t *testing.T) {
+	parts := []state.Part{
+		{PartID: "part-1", Status: state.StatusCompacting},
+		{PartID: "part-2", Status: state.StatusCompactReady},
+		{PartID: "part-3", Status: state.StatusCompacting},
+	}
+
+	selected, err := selectSetPartStateParts(parts, setPartStateSelection{Status: state.StatusCompacting})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 2 || selected[0].PartID != "part-1" || selected[1].PartID != "part-3" {
+		t.Fatalf("selected = %+v, want compacting parts", selected)
+	}
+}
+
+func TestSelectSetPartStatePartsByRepeatedPartID(t *testing.T) {
+	parts := []state.Part{
+		{PartID: "part-1", Status: state.StatusCompacting},
+		{PartID: "part-2", Status: state.StatusCompactReady},
+	}
+
+	selected, err := selectSetPartStateParts(parts, setPartStateSelection{PartIDs: []string{"part-2", "part-2", "part-1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 2 || selected[0].PartID != "part-2" || selected[1].PartID != "part-1" {
+		t.Fatalf("selected = %+v, want selected ids in request order without duplicates", selected)
+	}
+}
+
+func TestSelectSetPartStatePartsRejectsUnknownStatus(t *testing.T) {
+	_, err := selectSetPartStateParts([]state.Part{
+		{PartID: "part-1", Status: state.StatusCompacting},
+	}, setPartStateSelection{Status: state.Status("NOT_A_STATUS")})
+	if err == nil {
+		t.Fatal("expected unknown status error")
+	}
+}
+
+func TestAdminSettableStatusRejectsWorkerOwnedStates(t *testing.T) {
+	for _, status := range []state.Status{state.StatusReady, state.StatusCompactReady, state.StatusFinished} {
+		if !adminSettableStatus(status) {
+			t.Fatalf("expected %s to be admin settable", status)
+		}
+	}
+	for _, status := range []state.Status{state.StatusInProgress, state.StatusCompacting, state.StatusImporting, state.StatusImported, state.StatusSuperseded, state.StatusFailed} {
+		if adminSettableStatus(status) {
+			t.Fatalf("expected %s to be rejected as admin settable", status)
+		}
 	}
 }
 
@@ -541,6 +595,28 @@ func TestFinalizableCompactReadyPartsUsesStableCompactReadyTime(t *testing.T) {
 	}
 	if !ok || len(selected) != 1 {
 		t.Fatalf("selected = %+v, ok=%t; want finalized compact-ready part", selected, ok)
+	}
+}
+
+func TestFinalizableCompactReadyPartsUsesOldestCompactPhaseTime(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	selected, ok, err := finalizableCompactReadyParts([]state.Part{
+		{
+			PartID:         "part-original",
+			Status:         state.StatusSuperseded,
+			CompactReadyAt: now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
+		},
+		{
+			PartID:         "compact-fresh",
+			Status:         state.StatusCompactReady,
+			CompactReadyAt: now.Add(-30 * time.Minute).Format(time.RFC3339Nano),
+		},
+	}, 2*time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || len(selected) != 1 || selected[0].PartID != "compact-fresh" {
+		t.Fatalf("selected = %+v, ok=%t; want fresh compact output finalized by old job deadline", selected, ok)
 	}
 }
 
@@ -983,7 +1059,7 @@ func TestPrintJobSummaryIncludesCompactETA(t *testing.T) {
 	})
 
 	for _, want := range []string{
-		"compact: ready=1 compacting=1 cooldown=1 window=2h0m0s",
+		"compact: ready=1 compacting=1 cooldown_seed_only=1 window=2h0m0s",
 		"compact_finalize: blocked by COMPACTING=1; eligible after 2026-06-24T13:30:00Z (in 30m0s)",
 	} {
 		if !strings.Contains(got, want) {

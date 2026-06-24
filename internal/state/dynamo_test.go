@@ -118,7 +118,58 @@ func TestSelectCompactBatchPartsAllowsOversizedSingleMultiPartArtifact(t *testin
 	}
 }
 
-func TestCompactCandidateGroupsSkipsCooldown(t *testing.T) {
+func TestSelectCompactBatchPartsSkipsOnlyCooldownCandidates(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	selected := selectCompactBatchParts(compactGroup{
+		now: now,
+		parts: []Part{
+			{
+				PartID:                     "part-cooldown",
+				DestinationActivePartCount: 2,
+				DestinationActivePartBytes: 1024,
+				DestinationActivePartitionCounts: map[string]uint64{
+					"202606": 2,
+				},
+				CompactCooldownUntil: formatTime(now.Add(time.Hour)),
+			},
+		},
+	}, CompactClaimOptions{MinInputParts: 2})
+	if len(selected) != 0 {
+		t.Fatalf("selected = %+v, want cooldown-only part skipped", selected)
+	}
+}
+
+func TestSelectCompactBatchPartsAllowsCooldownWithFreshCompanion(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	selected := selectCompactBatchParts(compactGroup{
+		now: now,
+		parts: []Part{
+			{
+				PartID:                     "part-fresh",
+				DestinationActivePartCount: 1,
+				DestinationActivePartBytes: 100,
+				DestinationActivePartitionCounts: map[string]uint64{
+					"202606": 1,
+				},
+			},
+			{
+				PartID:                     "part-cooldown",
+				DestinationActivePartCount: 1,
+				DestinationActivePartBytes: 100,
+				DestinationActivePartitionCounts: map[string]uint64{
+					"202606": 1,
+				},
+				CompactCooldownUntil: formatTime(now.Add(time.Hour)),
+			},
+		},
+	}, CompactClaimOptions{MinInputParts: 2})
+
+	if len(selected) != 2 || selected[0].PartID != "part-fresh" || selected[1].PartID != "part-cooldown" {
+		t.Fatalf("selected = %+v, want fresh part with cooldown companion", selected)
+	}
+}
+
+func TestCompactCandidateGroupsIncludesCooldown(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	groups := compactCandidateGroups([]Part{
 		{
@@ -147,8 +198,8 @@ func TestCompactCandidateGroupsSkipsCooldown(t *testing.T) {
 			},
 		},
 	}, nil, now, CompactClaimOptions{})
-	if len(groups) != 1 || len(groups[0].parts) != 1 || groups[0].parts[0].PartID != "part-ready" {
-		t.Fatalf("groups = %+v, want only part-ready", groups)
+	if len(groups) != 1 || len(groups[0].parts) != 2 || groups[0].parts[0].PartID != "part-cooldown" || groups[0].parts[1].PartID != "part-ready" {
+		t.Fatalf("groups = %+v, want cooldown and ready parts", groups)
 	}
 }
 

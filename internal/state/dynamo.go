@@ -746,6 +746,7 @@ type compactGroup struct {
 	key                    string
 	parts                  []Part
 	compactingPartitionIDs []string
+	now                    time.Time
 }
 
 func compactCandidateGroups(parts, compacting []Part, now time.Time, opts CompactClaimOptions) []compactGroup {
@@ -757,8 +758,7 @@ func compactCandidateGroups(parts, compacting []Part, now time.Time, opts Compac
 			strings.TrimSpace(part.DestinationSchema) == "" ||
 			part.DestinationActivePartCount == 0 ||
 			len(part.DestinationActivePartitionCounts) == 0 ||
-			!matchesCompactClaimOptions(part, opts) ||
-			compactCooldownActive(part, now) {
+			!matchesCompactClaimOptions(part, opts) {
 			continue
 		}
 		key := compactGroupKey(part)
@@ -784,6 +784,7 @@ func compactCandidateGroups(parts, compacting []Part, now time.Time, opts Compac
 			key:                    key,
 			parts:                  groupParts,
 			compactingPartitionIDs: compactingPartitionsByKey[key],
+			now:                    now,
 		})
 	}
 	return groups
@@ -887,7 +888,7 @@ func selectCompactBatchParts(group compactGroup, opts CompactClaimOptions) []Par
 	preferredPartitions := partitionsWithout(partitions, group.compactingPartitionIDs)
 	orderedPartitions := append(preferredPartitions, partitionsWithout(partitions, preferredPartitions)...)
 	for _, partitionID := range orderedPartitions {
-		selected := selectCompactBatchPartsForPartition(group.parts, partitionID, minParts, opts)
+		selected := selectCompactBatchPartsForPartition(group.parts, partitionID, minParts, opts, group.now)
 		if len(selected) > 0 {
 			return selected
 		}
@@ -932,27 +933,55 @@ func orderedCandidatePartitions(parts []Part, required []string) []string {
 	return partitions
 }
 
-func selectCompactBatchPartsForPartition(parts []Part, partitionID string, minParts uint64, opts CompactClaimOptions) []Part {
+func selectCompactBatchPartsForPartition(parts []Part, partitionID string, minParts uint64, opts CompactClaimOptions, now time.Time) []Part {
 	var selected []Part
 	var inputParts, inputBytes uint64
-	for _, part := range parts {
+	appendCandidate := func(part Part) (bool, bool) {
 		partitionParts := part.DestinationActivePartitionCounts[partitionID]
 		if partitionParts == 0 {
-			continue
+			return false, false
 		}
 		if opts.MaxArtifacts > 0 && len(selected) >= opts.MaxArtifacts {
-			break
+			return false, true
 		}
 		partBytes := part.DestinationActivePartBytes
 		if opts.MaxBytes > 0 && inputBytes+partBytes > opts.MaxBytes && len(selected) > 0 {
-			break
+			return false, true
 		}
 		selected = append(selected, part)
 		inputParts += partitionParts
 		inputBytes += partBytes
-		if inputParts >= minParts {
+		return inputParts >= minParts, false
+	}
+	for _, part := range parts {
+		if compactCooldownActive(part, now) {
+			continue
+		}
+		done, stop := appendCandidate(part)
+		if done {
 			return selected
 		}
+		if stop {
+			break
+		}
+	}
+	if len(selected) == 0 {
+		return nil
+	}
+	for _, part := range parts {
+		if !compactCooldownActive(part, now) {
+			continue
+		}
+		done, stop := appendCandidate(part)
+		if done {
+			return selected
+		}
+		if stop {
+			break
+		}
+	}
+	if inputParts >= minParts {
+		return selected
 	}
 	return nil
 }
@@ -1476,6 +1505,87 @@ func (s *Store) ForceRetryPart(ctx context.Context, part Part, now time.Time) (S
 	return StatusReady, nil
 }
 
+func (s *Store) ForceSetPartStatus(ctx context.Context, part Part, to Status, now time.Time) error {
+	if err := validatePart(part); err != nil {
+		return err
+	}
+	if strings.TrimSpace(part.UpdatedAt) == "" {
+		return fmt.Errorf("part %s/%s is missing updated_at", part.JobID, part.PartID)
+	}
+
+	set := []string{"#status = :to", "gsi1pk = :gsi1pk", "updated_at = :now"}
+	remove := []string{
+		"#error",
+		"started_at",
+		"compacting_at",
+		"importing_at",
+		"imported_at",
+		"failed_at",
+		"worker_id",
+		"compact_cooldown_until",
+	}
+	removeRewriteProgress := false
+	switch to {
+	case StatusReady:
+		remove = append(remove,
+			"finished_at",
+			"compact_ready_at",
+			"superseded_at",
+			"superseded_by",
+		)
+		remove = append(remove, compactProgressRemoveAttributes()...)
+		removeRewriteProgress = true
+	case StatusCompactReady:
+		set = append(set, "compact_ready_at = if_not_exists(compact_ready_at, :now)")
+		remove = append(remove,
+			"finished_at",
+			"superseded_at",
+			"superseded_by",
+		)
+		remove = append(remove, compactProgressRemoveAttributes()...)
+	case StatusFinished:
+		set = append(set, "finished_at = if_not_exists(finished_at, :now)")
+		remove = append(remove,
+			"superseded_at",
+			"superseded_by",
+		)
+		remove = append(remove, compactProgressRemoveAttributes()...)
+	default:
+		return fmt.Errorf("cannot force set part %s/%s to %s", part.JobID, part.PartID, to)
+	}
+
+	updateExpression := "SET " + strings.Join(set, ", ") + " REMOVE " + strings.Join(uniqueStrings(remove), ", ")
+	if removeRewriteProgress {
+		updateExpression += progressRemoveExpression()
+	}
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.table),
+		Key:       part.key(),
+		ConditionExpression: aws.String(
+			"#job_id = :job_id AND #part_id = :part_id AND updated_at = :updated_at",
+		),
+		UpdateExpression: aws.String(updateExpression),
+		ExpressionAttributeNames: map[string]string{
+			"#error":   "error",
+			"#job_id":  "job_id",
+			"#part_id": "part_id",
+			"#status":  "status",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":gsi1pk":     stringAttr(statusKey(to)),
+			":job_id":     stringAttr(part.JobID),
+			":now":        stringAttr(formatTime(now)),
+			":part_id":    stringAttr(part.PartID),
+			":to":         stringAttr(string(to)),
+			":updated_at": stringAttr(part.UpdatedAt),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("force set part %s/%s to %s: %w", part.JobID, part.PartID, to, err)
+	}
+	return nil
+}
+
 func (s *Store) ResetOriginalPartToReady(ctx context.Context, part Part, now time.Time) error {
 	if err := validateOriginalResetPart(part); err != nil {
 		return err
@@ -1755,6 +1865,19 @@ func compactProgressRemoveAttributes() []string {
 		"compact_output_rows",
 		"compact_output_bytes",
 	}
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func jobKey(jobID string) string {
