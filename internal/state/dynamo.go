@@ -944,11 +944,8 @@ func selectCompactBatchPartsForPartition(parts []Part, partitionID string, minPa
 			break
 		}
 		partBytes := part.DestinationActivePartBytes
-		if opts.MaxBytes > 0 && inputBytes+partBytes > opts.MaxBytes {
-			if len(selected) > 0 {
-				break
-			}
-			continue
+		if opts.MaxBytes > 0 && inputBytes+partBytes > opts.MaxBytes && len(selected) > 0 {
+			break
 		}
 		selected = append(selected, part)
 		inputParts += partitionParts

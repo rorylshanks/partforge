@@ -143,11 +143,14 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		return CompactResult{}, err
 	}
 
+	var inputStats metrics.PartStats
 	for idx, input := range item.Inputs {
 		workDir := filepath.Join(root, "inputs", fmt.Sprintf("%06d", idx))
-		if err := c.attachFinishedArtifact(ctx, item, input, detached, workDir); err != nil {
+		stats, err := c.attachFinishedArtifact(ctx, item, input, detached, workDir)
+		if err != nil {
 			return CompactResult{}, err
 		}
+		inputStats = addPartStats(inputStats, stats)
 	}
 
 	actualInputPartitions, err := p.activePartPartitionStats(ctx, item.DestinationDatabase, item.DestinationTable)
@@ -155,13 +158,12 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		return CompactResult{}, fmt.Errorf("measure compact input active part partitions: %w", err)
 	}
 	actualInputStats := summarizePartPartitions(actualInputPartitions)
-	inputStats := compactInputStats(attachedInputs, actualInputStats)
 	slog.Info("attached compact input artifacts", "stage", "compact_attach_inputs", "job_id", item.JobID, "part_id", item.OutputPartID, "input_artifacts", len(item.Inputs), "active_parts", actualInputStats.Count, "active_rows", actualInputStats.Rows, "active_bytes_on_disk", actualInputStats.Bytes)
 	if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: actualInputStats}); err != nil {
 		return CompactResult{}, err
 	}
 	if inputStats.Count < 2 {
-		return CompactResult{OutputPartID: item.OutputPartID, InputStats: inputStats, DestinationStats: inputStats, DestinationPartitions: actualInputPartitions, Inputs: attachedInputs}, nil
+		return CompactResult{OutputPartID: item.OutputPartID, InputStats: inputStats, DestinationStats: actualInputStats, DestinationPartitions: actualInputPartitions, Inputs: attachedInputs}, nil
 	}
 
 	if err := c.configureCompactMergeSettings(ctx, item, actualInputStats.Bytes); err != nil {
@@ -186,7 +188,7 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 			return false, fmt.Errorf("measure compact active part partitions before loading more inputs: %w", err)
 		}
 		stats := summarizePartPartitions(partitions)
-		if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: compactInputStats(attachedInputs, stats), DestinationStats: stats}); err != nil {
+		if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: stats}); err != nil {
 			return false, err
 		}
 		if c.LoadMoreInputs == nil {
@@ -207,9 +209,11 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		}
 		for _, input := range inputs {
 			workDir := filepath.Join(root, "inputs", fmt.Sprintf("%06d", len(attachedInputs)))
-			if err := c.attachFinishedArtifact(ctx, item, input, detached, workDir); err != nil {
+			attachedStats, err := c.attachFinishedArtifact(ctx, item, input, detached, workDir)
+			if err != nil {
 				return false, err
 			}
+			inputStats = addPartStats(inputStats, attachedStats)
 			attachedInputs = append(attachedInputs, input)
 		}
 		partitions, err = p.activePartPartitionStats(ctx, item.DestinationDatabase, item.DestinationTable)
@@ -220,7 +224,7 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		if err := c.configureCompactMergeSettings(ctx, item, stats.Bytes); err != nil {
 			return false, err
 		}
-		if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: compactInputStats(attachedInputs, stats), DestinationStats: stats}); err != nil {
+		if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: stats}); err != nil {
 			return false, err
 		}
 		slog.Info("loaded more compact input artifacts", "stage", "compact_load_more_inputs", "job_id", item.JobID, "output_part_id", item.OutputPartID, "loaded_inputs", len(inputs), "total_inputs", len(attachedInputs), "active_parts", stats.Count, "active_bytes_on_disk", stats.Bytes)
@@ -241,7 +245,6 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		return CompactResult{}, fmt.Errorf("measure compact output active part partitions: %w", err)
 	}
 	destStats := summarizePartPartitions(destPartitions)
-	inputStats = compactInputStats(attachedInputs, inputStats)
 	slog.Info("measured compact output parts", "stage", "compact_measure_output", "job_id", item.JobID, "part_id", item.OutputPartID, "input_parts", inputStats.Count, "output_parts", destStats.Count, "active_rows", destStats.Rows, "active_bytes_on_disk", destStats.Bytes)
 	if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: destStats}); err != nil {
 		return CompactResult{}, err
@@ -278,6 +281,9 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 }
 
 func (c Compactor) reportProgress(ctx context.Context, item CompactWorkItem, snapshot CompactProgressSnapshot) error {
+	if snapshot.DestinationStats.Count > snapshot.InputStats.Count {
+		return fmt.Errorf("compact output active parts (%d) exceeds attached input parts (%d) for %s/%s", snapshot.DestinationStats.Count, snapshot.InputStats.Count, item.JobID, item.OutputPartID)
+	}
 	if c.ReportProgress == nil {
 		return nil
 	}
@@ -348,60 +354,55 @@ func (c Compactor) configureCompactMergeSettings(ctx context.Context, item Compa
 	return nil
 }
 
-func (c Compactor) attachFinishedArtifact(ctx context.Context, item CompactWorkItem, input CompactInput, detachedPath, workDir string) error {
+func (c Compactor) attachFinishedArtifact(ctx context.Context, item CompactWorkItem, input CompactInput, detachedPath, workDir string) (metrics.PartStats, error) {
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
-		return err
+		return metrics.PartStats{}, err
 	}
 	downloadRoot := filepath.Join(workDir, "data")
 	extractRoot := filepath.Join(workDir, "extracted")
 	slog.Info("downloading compact input artifact", "stage", "compact_download_input", "job_id", item.JobID, "output_part_id", item.OutputPartID, "input_part_id", input.PartID, "bucket", input.Bucket, "key", input.FinishedKey)
 	downloadStartedAt := time.Now()
 	if err := c.S3Copy.DownloadPrefix(ctx, input.Bucket, input.FinishedKey, downloadRoot); err != nil {
-		return fmt.Errorf("download compact input artifact s3://%s/%s: %w", input.Bucket, input.FinishedKey, err)
+		return metrics.PartStats{}, fmt.Errorf("download compact input artifact s3://%s/%s: %w", input.Bucket, input.FinishedKey, err)
 	}
 	downloadStats, err := fileutil.StatDir(downloadRoot)
 	if err != nil {
-		return fmt.Errorf("stat compact input artifact s3://%s/%s: %w", input.Bucket, input.FinishedKey, err)
+		return metrics.PartStats{}, fmt.Errorf("stat compact input artifact s3://%s/%s: %w", input.Bucket, input.FinishedKey, err)
 	}
 	slog.Info("downloaded compact input artifact", "stage", "compact_download_input", "job_id", item.JobID, "output_part_id", item.OutputPartID, "input_part_id", input.PartID, "files", downloadStats.Files, "bytes", downloadStats.Bytes, "elapsed", time.Since(downloadStartedAt), "bytes_per_second", ratePerSecond(downloadStats.Bytes, time.Since(downloadStartedAt)))
 
 	partNames, err := extractFinishedTarballs(downloadRoot, extractRoot)
 	if err != nil {
-		return fmt.Errorf("extract compact input artifact s3://%s/%s: %w", input.Bucket, input.FinishedKey, err)
+		return metrics.PartStats{}, fmt.Errorf("extract compact input artifact s3://%s/%s: %w", input.Bucket, input.FinishedKey, err)
 	}
 	if len(partNames) == 0 {
-		return fmt.Errorf("compact input artifact s3://%s/%s contains no part tarballs", input.Bucket, input.FinishedKey)
+		return metrics.PartStats{}, fmt.Errorf("compact input artifact s3://%s/%s contains no part tarballs", input.Bucket, input.FinishedKey)
 	}
 	for _, partName := range partNames {
 		src := filepath.Join(extractRoot, partName)
 		dst := filepath.Join(detachedPath, partName)
 		if _, err := os.Stat(dst); err == nil {
-			return fmt.Errorf("detached compact part destination already exists: %s", dst)
+			return metrics.PartStats{}, fmt.Errorf("detached compact part destination already exists: %s", dst)
 		} else if !os.IsNotExist(err) {
-			return err
+			return metrics.PartStats{}, err
 		}
 		if err := fileutil.MoveDir(src, dst); err != nil {
-			return fmt.Errorf("move compact input part %s into detached directory: %w", partName, err)
+			return metrics.PartStats{}, fmt.Errorf("move compact input part %s into detached directory: %w", partName, err)
 		}
 		if err := c.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable)+" ATTACH PART "+chhttp.StringLiteral(partName)); err != nil {
-			return fmt.Errorf("attach compact input part %s: %w", partName, err)
+			return metrics.PartStats{}, fmt.Errorf("attach compact input part %s: %w", partName, err)
 		}
 	}
 	slog.Info("attached compact input artifact", "stage", "compact_attach_input", "job_id", item.JobID, "output_part_id", item.OutputPartID, "input_part_id", input.PartID, "parts", len(partNames))
-	return nil
+	return metrics.PartStats{Count: uint64(len(partNames)), Rows: input.Rows, Bytes: input.Bytes}, nil
 }
 
-func compactInputStats(inputs []CompactInput, fallback metrics.PartStats) metrics.PartStats {
-	var stats metrics.PartStats
-	for _, input := range inputs {
-		stats.Count += input.Parts
-		stats.Rows += input.Rows
-		stats.Bytes += input.Bytes
+func addPartStats(left, right metrics.PartStats) metrics.PartStats {
+	return metrics.PartStats{
+		Count: left.Count + right.Count,
+		Rows:  left.Rows + right.Rows,
+		Bytes: left.Bytes + right.Bytes,
 	}
-	if stats.Count == 0 {
-		return fallback
-	}
-	return stats
 }
 
 func extractFinishedTarballs(root, extractRoot string) ([]string, error) {

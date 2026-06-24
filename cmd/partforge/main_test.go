@@ -93,6 +93,10 @@ func TestSummarizeJobPartCounts(t *testing.T) {
 	if inProgress.InputClickHouseParts != 1 || inProgress.OutputClickHouseParts != 5 {
 		t.Fatalf("in-progress part stats = %+v, want input=1 output=5", inProgress)
 	}
+	superseded := findStatusPartStats(summary.StatePartStats, state.StatusSuperseded)
+	if superseded.InputClickHouseParts != 0 || superseded.OutputClickHouseParts != 0 {
+		t.Fatalf("superseded part stats = %+v, want input=0 output=0", superseded)
+	}
 }
 
 func TestSummarizeJobCompactingProgressCountsBatchOnce(t *testing.T) {
@@ -123,6 +127,70 @@ func TestSummarizeJobCompactingProgressCountsBatchOnce(t *testing.T) {
 	compacting := findStatusPartStats(summary.StatePartStats, state.StatusCompacting)
 	if compacting.Count != 2 || compacting.InputClickHouseParts != 9 || compacting.OutputClickHouseParts != 4 {
 		t.Fatalf("compacting part stats = %+v, want count=2 input=9 output=4", compacting)
+	}
+}
+
+func TestSummarizeJobCompactFinalizationETA(t *testing.T) {
+	now := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
+	summary := summarizeJobWithOptions("job-1", []state.Part{
+		{
+			PartID:         "part-1",
+			Status:         state.StatusCompactReady,
+			CompactReadyAt: now.Add(-90 * time.Minute).Format(time.RFC3339Nano),
+		},
+		{
+			PartID:         "part-2",
+			Status:         state.StatusCompactReady,
+			CompactReadyAt: now.Add(-30 * time.Minute).Format(time.RFC3339Nano),
+		},
+	}, jobSummaryOptions{
+		Now:           now,
+		CompactWindow: 2 * time.Hour,
+	})
+
+	if summary.Compact == nil {
+		t.Fatal("expected compact summary")
+	}
+	if summary.Compact.FinalizeStatus != "waiting" {
+		t.Fatalf("finalize status = %q, want waiting", summary.Compact.FinalizeStatus)
+	}
+	if summary.Compact.FinalizeIn != "1h30m0s" {
+		t.Fatalf("finalize in = %q, want 1h30m0s", summary.Compact.FinalizeIn)
+	}
+	if summary.Compact.FinalizeAfter != now.Add(90*time.Minute).Format(time.RFC3339Nano) {
+		t.Fatalf("finalize after = %q", summary.Compact.FinalizeAfter)
+	}
+}
+
+func TestSummarizeJobCompactFinalizationBlockers(t *testing.T) {
+	now := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
+	summary := summarizeJobWithOptions("job-1", []state.Part{
+		{
+			PartID:         "part-1",
+			Status:         state.StatusCompactReady,
+			CompactReadyAt: now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
+		},
+		{
+			PartID: "part-2",
+			Status: state.StatusCompacting,
+		},
+		{
+			PartID: "part-3",
+			Status: state.StatusFailed,
+		},
+	}, jobSummaryOptions{
+		Now:           now,
+		CompactWindow: 2 * time.Hour,
+	})
+
+	if summary.Compact == nil {
+		t.Fatal("expected compact summary")
+	}
+	if summary.Compact.FinalizeStatus != "blocked" {
+		t.Fatalf("finalize status = %q, want blocked", summary.Compact.FinalizeStatus)
+	}
+	if summary.Compact.BlockedByMessage != "COMPACTING=1, FAILED=1" {
+		t.Fatalf("blocked by = %q", summary.Compact.BlockedByMessage)
 	}
 }
 
@@ -879,6 +947,44 @@ func TestPrintJobSummaryIncludesInProgressStages(t *testing.T) {
 		"IN_PROGRESS STAGES",
 		"insert_select",
 		"wait_merges",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("printJobSummary output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "INPUT_CH_PARTS") || strings.Contains(got, "OUTPUT_CH_PARTS") {
+		t.Fatalf("printJobSummary output should not include detailed part counters:\n%s", got)
+	}
+}
+
+func TestPrintJobSummaryIncludesCompactETA(t *testing.T) {
+	summary := jobSummary{
+		JobID:  "job-1",
+		Status: "COMPACTING",
+		Total:  2,
+		Counts: map[state.Status]int{
+			state.StatusCompactReady: 1,
+			state.StatusCompacting:   1,
+		},
+		Compact: &compactJobSummary{
+			ReadyParts:       1,
+			CompactingParts:  1,
+			CooldownParts:    1,
+			Window:           "2h0m0s",
+			FinalizeStatus:   "blocked",
+			FinalizeAfter:    "2026-06-24T13:30:00Z",
+			FinalizeIn:       "30m0s",
+			BlockedByMessage: "COMPACTING=1",
+		},
+	}
+
+	got := captureFileOutput(t, func(out *os.File) {
+		printJobSummary(out, summary)
+	})
+
+	for _, want := range []string{
+		"compact: ready=1 compacting=1 cooldown=1 window=2h0m0s",
+		"compact_finalize: blocked by COMPACTING=1; eligible after 2026-06-24T13:30:00Z (in 30m0s)",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("printJobSummary output missing %q:\n%s", want, got)

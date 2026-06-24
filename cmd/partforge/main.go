@@ -1762,6 +1762,7 @@ func runJobStatus(ctx context.Context, args []string) error {
 		stateTable     = fs.String("state-table", defaultStateTable, "DynamoDB state table")
 		region         = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
 		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
+		compactWindow  = fs.Duration("compact-window", defaultCompactWindow, "worker compact window used to report compact finalization ETA")
 		jsonOutput     = fs.Bool("json", false, "print JSON output")
 		showParts      = fs.Bool("parts", false, "include per-part state rows")
 		showDetails    = fs.Bool("details", false, "include per-part rewrite stage timing details")
@@ -1774,6 +1775,9 @@ func runJobStatus(ctx context.Context, args []string) error {
 	}
 	if *jobID == "" {
 		return errors.New("job-id is required")
+	}
+	if *compactWindow < 0 {
+		return fmt.Errorf("compact-window must be non-negative, got %s", *compactWindow)
 	}
 
 	stateStore, err := state.New(ctx, state.Config{
@@ -1788,7 +1792,10 @@ func runJobStatus(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	summary := summarizeJob(*jobID, jobParts)
+	summary := summarizeJobWithOptions(*jobID, jobParts, jobSummaryOptions{
+		Now:           time.Now().UTC(),
+		CompactWindow: *compactWindow,
+	})
 	if *jsonOutput {
 		out := jobStatusOutput{Summary: summary}
 		if *showParts || *showDetails {
@@ -2607,8 +2614,9 @@ type jobSummary struct {
 	Status                       string                 `json:"status"`
 	Total                        int                    `json:"total"`
 	Counts                       map[state.Status]int   `json:"counts"`
-	StatePartStats               []statusPartStats      `json:"state_part_stats"`
+	StatePartStats               []statusPartStats      `json:"-"`
 	InProgressStages             []inProgressStageCount `json:"in_progress_stages,omitempty"`
+	Compact                      *compactJobSummary     `json:"compact,omitempty"`
 	RewriteCompleted             int                    `json:"rewrite_completed"`
 	RewritePercent               float64                `json:"rewrite_percent"`
 	ImportCompleted              int                    `json:"import_completed"`
@@ -2623,11 +2631,34 @@ type jobSummary struct {
 	FailedParts                  []failedPart           `json:"failed_parts,omitempty"`
 }
 
+type jobSummaryOptions struct {
+	Now           time.Time
+	CompactWindow time.Duration
+}
+
+type compactJobSummary struct {
+	ReadyParts       int           `json:"ready_parts"`
+	CompactingParts  int           `json:"compacting_parts"`
+	CooldownParts    int           `json:"cooldown_parts"`
+	Window           string        `json:"window"`
+	FinalizeStatus   string        `json:"finalize_status"`
+	FinalizeAfter    string        `json:"finalize_after,omitempty"`
+	FinalizeIn       string        `json:"finalize_in,omitempty"`
+	BlockedBy        []statusCount `json:"blocked_by,omitempty"`
+	BlockedByMessage string        `json:"blocked_by_message,omitempty"`
+	Reason           string        `json:"reason,omitempty"`
+}
+
+type statusCount struct {
+	Status state.Status `json:"status"`
+	Count  int          `json:"count"`
+}
+
 type inProgressStageCount struct {
 	Stage                 string `json:"stage"`
 	Count                 int    `json:"count"`
-	InputClickHouseParts  uint64 `json:"input_clickhouse_parts"`
-	OutputClickHouseParts uint64 `json:"output_clickhouse_parts"`
+	InputClickHouseParts  uint64 `json:"-"`
+	OutputClickHouseParts uint64 `json:"-"`
 }
 
 type statusPartStats struct {
@@ -2721,6 +2752,13 @@ type jobS3Prefix struct {
 }
 
 func summarizeJob(jobID string, parts []state.Part) jobSummary {
+	return summarizeJobWithOptions(jobID, parts, jobSummaryOptions{
+		Now:           time.Now().UTC(),
+		CompactWindow: defaultCompactWindow,
+	})
+}
+
+func summarizeJobWithOptions(jobID string, parts []state.Part, opts jobSummaryOptions) jobSummary {
 	counts := make(map[state.Status]int, len(statusOrder()))
 	for _, status := range statusOrder() {
 		counts[status] = 0
@@ -2795,6 +2833,7 @@ func summarizeJob(jobID string, parts []state.Part) jobSummary {
 		Counts:                       counts,
 		StatePartStats:               statePartStats(counts, stateInputParts, stateOutputParts),
 		InProgressStages:             inProgressStageCounts(stageCounts, stageInputParts, stageOutputParts),
+		Compact:                      compactSummary(parts, counts, opts),
 		RewriteCompleted:             rewriteCompleted,
 		RewritePercent:               percent(rewriteCompleted, total),
 		ImportCompleted:              importCompleted,
@@ -2860,6 +2899,137 @@ func inProgressStageCounts(counts map[string]int, inputParts, outputParts map[st
 	return stages
 }
 
+func compactSummary(parts []state.Part, counts map[state.Status]int, opts jobSummaryOptions) *compactJobSummary {
+	readyParts := counts[state.StatusCompactReady]
+	compactingParts := counts[state.StatusCompacting]
+	if readyParts == 0 && compactingParts == 0 {
+		return nil
+	}
+	now := opts.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	compactWindow := opts.CompactWindow
+	if compactWindow < 0 {
+		compactWindow = 0
+	}
+	summary := &compactJobSummary{
+		ReadyParts:      readyParts,
+		CompactingParts: compactingParts,
+		Window:          compactWindow.String(),
+	}
+	for _, part := range parts {
+		if part.Status != state.StatusCompactReady {
+			continue
+		}
+		if until, ok := compactCooldownUntil(part); ok && until.After(now) {
+			summary.CooldownParts++
+		}
+	}
+	blockers := compactFinalizationBlockers(counts)
+	summary.BlockedBy = blockers
+	summary.BlockedByMessage = formatStatusCounts(blockers)
+	if readyParts == 0 {
+		summary.FinalizeStatus = "waiting_for_compacting"
+		summary.Reason = "waiting for compacting work to return compact-ready or finish"
+		return summary
+	}
+	finalizeAfter, ok, reason := compactFinalizeAfter(parts, compactWindow, now)
+	if !ok {
+		summary.FinalizeStatus = "unknown"
+		summary.Reason = reason
+		return summary
+	}
+	summary.FinalizeAfter = finalizeAfter.UTC().Format(time.RFC3339Nano)
+	summary.FinalizeIn = formatRemaining(finalizeAfter, now)
+	if len(blockers) > 0 {
+		summary.FinalizeStatus = "blocked"
+		summary.Reason = "active work must finish before compact-ready parts can be finalized"
+		return summary
+	}
+	if now.Before(finalizeAfter) {
+		summary.FinalizeStatus = "waiting"
+		summary.Reason = "compact window has not elapsed for all compact-ready parts"
+		return summary
+	}
+	summary.FinalizeStatus = "ready"
+	summary.FinalizeIn = "0s"
+	summary.Reason = "next idle worker can finalize compact-ready parts"
+	return summary
+}
+
+func compactFinalizationBlockers(counts map[state.Status]int) []statusCount {
+	var blockers []statusCount
+	for _, status := range []state.Status{state.StatusReady, state.StatusInProgress, state.StatusCompacting, state.StatusFailed} {
+		if counts[status] > 0 {
+			blockers = append(blockers, statusCount{Status: status, Count: counts[status]})
+		}
+	}
+	return blockers
+}
+
+func compactFinalizeAfter(parts []state.Part, compactWindow time.Duration, now time.Time) (time.Time, bool, string) {
+	if compactWindow <= 0 {
+		return now, true, ""
+	}
+	var finalizeAfter time.Time
+	for _, part := range parts {
+		if part.Status != state.StatusCompactReady {
+			continue
+		}
+		readyAt, err := compactReadySince(part)
+		if err != nil {
+			return time.Time{}, false, err.Error()
+		}
+		partFinalizeAfter := readyAt.Add(compactWindow)
+		if finalizeAfter.IsZero() || partFinalizeAfter.After(finalizeAfter) {
+			finalizeAfter = partFinalizeAfter
+		}
+	}
+	if finalizeAfter.IsZero() {
+		return time.Time{}, false, "no compact-ready timestamp found"
+	}
+	return finalizeAfter, true, ""
+}
+
+func compactCooldownUntil(part state.Part) (time.Time, bool) {
+	if strings.TrimSpace(part.CompactCooldownUntil) == "" {
+		return time.Time{}, false
+	}
+	until, err := time.Parse(time.RFC3339Nano, part.CompactCooldownUntil)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return until, true
+}
+
+func formatStatusCounts(counts []statusCount) string {
+	if len(counts) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(counts))
+	for _, count := range counts {
+		parts = append(parts, fmt.Sprintf("%s=%d", count.Status, count.Count))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func formatRemaining(until, now time.Time) string {
+	remaining := until.Sub(now)
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining.Round(time.Second).String()
+}
+
+func formatElapsedSince(since, now time.Time) string {
+	elapsed := now.Sub(since)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	return elapsed.Round(time.Second).String()
+}
+
 func originalInputPartCount(part state.Part) uint64 {
 	if part.SourceActivePartCount > 0 {
 		return part.SourceActivePartCount
@@ -2868,6 +3038,9 @@ func originalInputPartCount(part state.Part) uint64 {
 }
 
 func partInputOutputPartCounts(part state.Part, partsByID map[string]state.Part) (uint64, uint64) {
+	if part.Status == state.StatusSuperseded {
+		return 0, 0
+	}
 	if part.Status == state.StatusCompacting && part.CompactInputPartCount > 0 {
 		return part.CompactInputPartCount, part.CompactOutputPartCount
 	}
@@ -2928,24 +3101,23 @@ func printJobSummary(out *os.File, summary jobSummary) {
 	fmt.Fprintf(out, "read: %d rows %s\n", summary.ReadRows, formatBytes(summary.ReadBytes))
 	fmt.Fprintf(out, "written: %d rows %s\n", summary.WrittenRows, formatBytes(summary.WrittenBytes))
 	fmt.Fprintf(out, "failed_merges: %d\n", summary.FailedMerges)
+	if summary.Compact != nil {
+		printCompactSummary(out, summary.Compact)
+	}
 
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "\nSTATE\tCOUNT\tINPUT_CH_PARTS\tOUTPUT_CH_PARTS")
-	stateStats := summary.StatePartStats
-	if len(stateStats) == 0 {
-		stateStats = statePartStats(summary.Counts, nil, nil)
-	}
-	for _, statusStats := range stateStats {
-		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\n", statusStats.Status, statusStats.Count, statusStats.InputClickHouseParts, statusStats.OutputClickHouseParts)
+	fmt.Fprintln(tw, "\nSTATE\tCOUNT")
+	for _, status := range statusOrder() {
+		fmt.Fprintf(tw, "%s\t%d\n", status, summary.Counts[status])
 	}
 	_ = tw.Flush()
 
 	if len(summary.InProgressStages) > 0 {
 		fmt.Fprintln(out, "\nIN_PROGRESS STAGES")
 		tw = tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "STAGE\tCOUNT\tINPUT_CH_PARTS\tOUTPUT_CH_PARTS")
+		fmt.Fprintln(tw, "STAGE\tCOUNT")
 		for _, stage := range summary.InProgressStages {
-			fmt.Fprintf(tw, "%s\t%d\t%d\t%d\n", stage.Stage, stage.Count, stage.InputClickHouseParts, stage.OutputClickHouseParts)
+			fmt.Fprintf(tw, "%s\t%d\n", stage.Stage, stage.Count)
 		}
 		_ = tw.Flush()
 	}
@@ -2961,6 +3133,44 @@ func printJobSummary(out *os.File, summary jobSummary) {
 	}
 }
 
+func printCompactSummary(out *os.File, compact *compactJobSummary) {
+	fmt.Fprintf(
+		out,
+		"compact: ready=%d compacting=%d cooldown=%d window=%s\n",
+		compact.ReadyParts,
+		compact.CompactingParts,
+		compact.CooldownParts,
+		compact.Window,
+	)
+	switch compact.FinalizeStatus {
+	case "blocked":
+		fmt.Fprintf(out, "compact_finalize: blocked by %s", compact.BlockedByMessage)
+		if compact.FinalizeAfter != "" {
+			fmt.Fprintf(out, "; eligible after %s", compact.FinalizeAfter)
+			if compact.FinalizeIn != "" {
+				fmt.Fprintf(out, " (in %s)", compact.FinalizeIn)
+			}
+		}
+		fmt.Fprintln(out)
+	case "waiting":
+		fmt.Fprintf(out, "compact_finalize: waiting until %s", compact.FinalizeAfter)
+		if compact.FinalizeIn != "" {
+			fmt.Fprintf(out, " (in %s)", compact.FinalizeIn)
+		}
+		fmt.Fprintln(out)
+	case "ready":
+		fmt.Fprintln(out, "compact_finalize: ready now")
+	case "waiting_for_compacting":
+		fmt.Fprintln(out, "compact_finalize: waiting for compacting work to finish")
+	case "unknown":
+		fmt.Fprintf(out, "compact_finalize: unknown")
+		if compact.Reason != "" {
+			fmt.Fprintf(out, " (%s)", compact.Reason)
+		}
+		fmt.Fprintln(out)
+	}
+}
+
 func printPartRows(out *os.File, parts []state.Part) {
 	if len(parts) == 0 {
 		return
@@ -2969,14 +3179,15 @@ func printPartRows(out *os.File, parts []state.Part) {
 	for _, part := range parts {
 		partsByID[part.PartID] = part
 	}
+	now := time.Now().UTC()
 	fmt.Fprintln(out, "\nPARTS")
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "PART_ID\tSTATUS\tATTEMPTS\tWORKER\tREAD_ROWS\tREAD_SIZE\tWRITTEN_ROWS\tWRITTEN_SIZE\tSOURCE_ROWS\tDEST_ROWS\tINPUT_CH_PARTS\tOUTPUT_CH_PARTS\tFAILED_MERGES\tSETTLE_WAIT\tPROGRESS_AT\tUPDATED_AT\tERROR")
+	fmt.Fprintln(tw, "PART_ID\tSTATUS\tATTEMPTS\tWORKER\tREAD_ROWS\tREAD_SIZE\tWRITTEN_ROWS\tWRITTEN_SIZE\tSOURCE_ROWS\tDEST_ROWS\tINPUT_CH_PARTS\tOUTPUT_CH_PARTS\tFAILED_MERGES\tSETTLE_WAIT\tCOMPACT_READY_FOR\tCOMPACT_COOLDOWN\tPROGRESS_AT\tUPDATED_AT\tERROR")
 	for _, part := range parts {
 		inputParts, outputParts := partInputOutputPartCounts(part, partsByID)
 		fmt.Fprintf(
 			tw,
-			"%s\t%s\t%d\t%s\t%d\t%s\t%d\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n",
+			"%s\t%s\t%d\t%s\t%d\t%s\t%d\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			part.PartID,
 			part.Status,
 			part.Attempts,
@@ -2991,6 +3202,8 @@ func printPartRows(out *os.File, parts []state.Part) {
 			outputParts,
 			part.DestinationFailedMerges,
 			formatSettleWait(part),
+			formatCompactReadyFor(part, now),
+			formatCompactCooldown(part, now),
 			part.ProgressUpdatedAt,
 			part.UpdatedAt,
 			part.Error,
@@ -3007,6 +3220,28 @@ func formatSettleWait(part state.Part) string {
 		return formatDurationMs(part.RewriteStageElapsedMs)
 	}
 	return ""
+}
+
+func formatCompactReadyFor(part state.Part, now time.Time) string {
+	if part.Status != state.StatusCompactReady {
+		return ""
+	}
+	readyAt, err := compactReadySince(part)
+	if err != nil {
+		return "unknown"
+	}
+	return formatElapsedSince(readyAt, now)
+}
+
+func formatCompactCooldown(part state.Part, now time.Time) string {
+	if part.Status != state.StatusCompactReady {
+		return ""
+	}
+	until, ok := compactCooldownUntil(part)
+	if !ok || !until.After(now) {
+		return ""
+	}
+	return formatRemaining(until, now)
 }
 
 func printPartDetails(out *os.File, parts []state.Part) {

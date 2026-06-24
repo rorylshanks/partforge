@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/partforge/partforge/internal/chhttp"
+	"github.com/partforge/partforge/internal/metrics"
 )
 
 func TestConfigureCompactMergeSettingsDisablesVerticalMerges(t *testing.T) {
@@ -45,5 +46,32 @@ func TestConfigureCompactMergeSettingsDisablesVerticalMerges(t *testing.T) {
 	}
 	if !strings.Contains(queries[0], "enable_vertical_merge_algorithm = 0") {
 		t.Fatalf("query = %q, want vertical merge disabled", queries[0])
+	}
+}
+
+func TestCompactProgressRejectsOutputMoreThanAttachedInput(t *testing.T) {
+	err := (Compactor{}).reportProgress(context.Background(), CompactWorkItem{
+		JobID:        "job-1",
+		OutputPartID: "compact-1",
+	}, CompactProgressSnapshot{
+		InputStats:       metrics.PartStats{Count: 2},
+		DestinationStats: metrics.PartStats{Count: 3},
+	})
+	if err == nil {
+		t.Fatal("expected compact part accounting error")
+	}
+	if !strings.Contains(err.Error(), "exceeds attached input parts") {
+		t.Fatalf("error = %v, want attached input accounting error", err)
+	}
+}
+
+func TestAddPartStats(t *testing.T) {
+	got := addPartStats(
+		metrics.PartStats{Count: 1, Rows: 2, Bytes: 3},
+		metrics.PartStats{Count: 4, Rows: 5, Bytes: 6},
+	)
+	want := metrics.PartStats{Count: 5, Rows: 7, Bytes: 9}
+	if got != want {
+		t.Fatalf("addPartStats = %+v, want %+v", got, want)
 	}
 }
