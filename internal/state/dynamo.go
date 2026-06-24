@@ -940,47 +940,44 @@ func orderedCandidatePartitions(parts []Part, required []string) []string {
 func selectCompactBatchPartsForPartition(parts []Part, partitionID string, minParts uint64, opts CompactClaimOptions, now time.Time) []Part {
 	var selected []Part
 	var inputParts, inputBytes uint64
-	appendCandidate := func(part Part) (bool, bool) {
+	appendCandidate := func(part Part) bool {
 		partitionParts := part.DestinationActivePartitionCounts[partitionID]
 		if partitionParts == 0 {
-			return false, false
+			return false
 		}
 		if opts.MaxArtifacts > 0 && len(selected) >= opts.MaxArtifacts {
-			return false, true
+			return true
 		}
 		partBytes := part.DestinationActivePartBytes
 		if opts.MaxBytes > 0 && inputBytes+partBytes > opts.MaxBytes && len(selected) > 0 {
-			return false, true
+			return true
 		}
 		selected = append(selected, part)
 		inputParts += partitionParts
 		inputBytes += partBytes
-		return inputParts >= minParts, false
+		return opts.MaxArtifacts > 0 && len(selected) >= opts.MaxArtifacts
 	}
+	stopped := false
 	for _, part := range parts {
 		if compactCooldownActive(part, now) {
 			continue
 		}
-		done, stop := appendCandidate(part)
-		if done {
-			return selected
-		}
-		if stop {
+		if appendCandidate(part) {
+			stopped = true
 			break
 		}
 	}
-	if len(selected) == 0 {
+	if stopped || len(selected) == 0 {
+		if inputParts >= minParts {
+			return selected
+		}
 		return nil
 	}
 	for _, part := range parts {
 		if !compactCooldownActive(part, now) {
 			continue
 		}
-		done, stop := appendCandidate(part)
-		if done {
-			return selected
-		}
-		if stop {
+		if appendCandidate(part) {
 			break
 		}
 	}
@@ -1244,6 +1241,7 @@ func (s *Store) UpdateRewriteProgress(ctx context.Context, jobID, partID, worker
 func (s *Store) ListJobIDs(ctx context.Context) ([]string, error) {
 	paginator := dynamodb.NewScanPaginator(s.client, &dynamodb.ScanInput{
 		TableName:            aws.String(s.table),
+		ConsistentRead:       aws.Bool(true),
 		ProjectionExpression: aws.String("#job_id"),
 		ExpressionAttributeNames: map[string]string{
 			"#job_id": "job_id",
@@ -1285,6 +1283,7 @@ func (s *Store) ListJobParts(ctx context.Context, jobID string) ([]Part, error) 
 	}
 	paginator := dynamodb.NewQueryPaginator(s.client, &dynamodb.QueryInput{
 		TableName:              aws.String(s.table),
+		ConsistentRead:         aws.Bool(true),
 		KeyConditionExpression: aws.String("#pk = :pk AND begins_with(#sk, :part_prefix)"),
 		ExpressionAttributeNames: map[string]string{
 			"#pk": "pk",

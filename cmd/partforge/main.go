@@ -1643,7 +1643,7 @@ func compactWindowExpired(parts []state.Part, compactWindow time.Duration, now t
 	}
 	finalizeAfter, ok, reason := compactFinalizeAfter(parts, compactWindow, now)
 	if !ok {
-		if reason == "no compact phase timestamp found" {
+		if reason == "no current compact-ready or compacting timestamp found" {
 			return false, nil
 		}
 		return false, errors.New(reason)
@@ -3206,28 +3206,28 @@ func compactFinalizeAfter(parts []state.Part, compactWindow time.Duration, now t
 	if compactWindow <= 0 {
 		return now, true, ""
 	}
-	var compactStartedAt time.Time
+	var compactActivityAt time.Time
 	for _, part := range parts {
-		if !compactPhaseStatus(part.Status) {
+		if !compactWindowAnchorStatus(part.Status) {
 			continue
 		}
 		readyAt, err := compactReadySince(part)
 		if err != nil {
 			return time.Time{}, false, err.Error()
 		}
-		if compactStartedAt.IsZero() || readyAt.Before(compactStartedAt) {
-			compactStartedAt = readyAt
+		if compactActivityAt.IsZero() || readyAt.After(compactActivityAt) {
+			compactActivityAt = readyAt
 		}
 	}
-	if compactStartedAt.IsZero() {
-		return time.Time{}, false, "no compact phase timestamp found"
+	if compactActivityAt.IsZero() {
+		return time.Time{}, false, "no current compact-ready or compacting timestamp found"
 	}
-	return compactStartedAt.Add(compactWindow), true, ""
+	return compactActivityAt.Add(compactWindow), true, ""
 }
 
-func compactPhaseStatus(status state.Status) bool {
+func compactWindowAnchorStatus(status state.Status) bool {
 	switch status {
-	case state.StatusCompactReady, state.StatusCompacting, state.StatusSuperseded, state.StatusFinished, state.StatusImporting, state.StatusImported:
+	case state.StatusCompactReady, state.StatusCompacting:
 		return true
 	default:
 		return false

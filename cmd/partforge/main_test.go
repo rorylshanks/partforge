@@ -154,10 +154,10 @@ func TestSummarizeJobCompactFinalizationETA(t *testing.T) {
 	if summary.Compact.FinalizeStatus != "waiting" {
 		t.Fatalf("finalize status = %q, want waiting", summary.Compact.FinalizeStatus)
 	}
-	if summary.Compact.FinalizeIn != "30m0s" {
-		t.Fatalf("finalize in = %q, want 30m0s", summary.Compact.FinalizeIn)
+	if summary.Compact.FinalizeIn != "1h30m0s" {
+		t.Fatalf("finalize in = %q, want 1h30m0s", summary.Compact.FinalizeIn)
 	}
-	if summary.Compact.FinalizeAfter != now.Add(30*time.Minute).Format(time.RFC3339Nano) {
+	if summary.Compact.FinalizeAfter != now.Add(90*time.Minute).Format(time.RFC3339Nano) {
 		t.Fatalf("finalize after = %q", summary.Compact.FinalizeAfter)
 	}
 }
@@ -598,7 +598,7 @@ func TestFinalizableCompactReadyPartsUsesStableCompactReadyTime(t *testing.T) {
 	}
 }
 
-func TestFinalizableCompactReadyPartsUsesOldestCompactPhaseTime(t *testing.T) {
+func TestFinalizableCompactReadyPartsUsesCurrentCompactReadyTime(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	selected, ok, err := finalizableCompactReadyParts([]state.Part{
 		{
@@ -615,8 +615,8 @@ func TestFinalizableCompactReadyPartsUsesOldestCompactPhaseTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok || len(selected) != 1 || selected[0].PartID != "compact-fresh" {
-		t.Fatalf("selected = %+v, ok=%t; want fresh compact output finalized by old job deadline", selected, ok)
+	if ok || len(selected) != 0 {
+		t.Fatalf("selected = %+v, ok=%t; want fresh compact output to keep compaction window open", selected, ok)
 	}
 }
 
@@ -637,7 +637,7 @@ func TestCompactWindowExpiredIgnoresJobsWithoutCompactPhase(t *testing.T) {
 	}
 }
 
-func TestCompactWindowExpiredUsesOldestCompactPhaseTime(t *testing.T) {
+func TestCompactWindowExpiredUsesCurrentCompactReadyTime(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	expired, err := compactWindowExpired([]state.Part{
 		{
@@ -654,8 +654,8 @@ func TestCompactWindowExpiredUsesOldestCompactPhaseTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !expired {
-		t.Fatal("expected job compact window to be expired from oldest compact timestamp")
+	if expired {
+		t.Fatal("expected fresh compact output to keep job compact window open")
 	}
 }
 

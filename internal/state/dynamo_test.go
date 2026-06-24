@@ -334,6 +334,72 @@ func TestSelectCompactBatchPartsUsesSharedPartition(t *testing.T) {
 	}
 }
 
+func TestSelectCompactBatchPartsFillsSharedPartitionBatch(t *testing.T) {
+	selected := selectCompactBatchParts(compactGroup{parts: []Part{
+		{
+			PartID:                     "part-a",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-a": 1,
+			},
+		},
+		{
+			PartID:                     "part-b",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-a": 1,
+			},
+		},
+		{
+			PartID:                     "part-c",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-a": 1,
+			},
+		},
+	}}, CompactClaimOptions{MinInputParts: 2, MaxArtifacts: 8})
+
+	if len(selected) != 3 || selected[0].PartID != "part-a" || selected[1].PartID != "part-b" || selected[2].PartID != "part-c" {
+		t.Fatalf("selected = %+v, want all compatible partition-a parts", selected)
+	}
+}
+
+func TestSelectCompactBatchPartsStopsAtMaxArtifactsWhileFilling(t *testing.T) {
+	selected := selectCompactBatchParts(compactGroup{parts: []Part{
+		{
+			PartID:                     "part-a",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-a": 1,
+			},
+		},
+		{
+			PartID:                     "part-b",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-a": 1,
+			},
+		},
+		{
+			PartID:                     "part-c",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-a": 1,
+			},
+		},
+	}}, CompactClaimOptions{MinInputParts: 2, MaxArtifacts: 2})
+
+	if len(selected) != 2 || selected[0].PartID != "part-a" || selected[1].PartID != "part-b" {
+		t.Fatalf("selected = %+v, want max-artifacts-limited part-a and part-b", selected)
+	}
+}
+
 func TestSelectCompactBatchPartsHonorsRequiredPartitions(t *testing.T) {
 	selected := selectCompactBatchParts(compactGroup{parts: []Part{
 		{
