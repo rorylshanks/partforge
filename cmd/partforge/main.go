@@ -1080,7 +1080,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	}
 	if cfg.CompactLeaseStaleAfter > 0 {
 		now := time.Now().UTC()
-		released, err := cfg.StateStore.ReleaseStaleCompactingParts(ctx, now, cfg.CompactLeaseStaleAfter, now.Add(retryCooldown))
+		released, err := cfg.StateStore.ReleaseStaleCompactingParts(ctx, now, cfg.CompactLeaseStaleAfter, time.Time{})
 		if err != nil {
 			if ctx.Err() != nil {
 				slog.Info("worker shutdown requested while releasing stale compact work", "stage", "shutdown")
@@ -1089,7 +1089,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 			return false, err
 		}
 		if released > 0 {
-			slog.Warn("released stale compacting parts", "stage", "release_stale_compact", "worker_id", cfg.WorkerID, "released", released, "stale_after", cfg.CompactLeaseStaleAfter, "cooldown", retryCooldown)
+			slog.Warn("released stale compacting parts", "stage", "release_stale_compact", "worker_id", cfg.WorkerID, "released", released, "stale_after", cfg.CompactLeaseStaleAfter)
 		}
 	}
 	finalization := compactFinalizationResult{}
@@ -1230,7 +1230,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	compactShutdown.Stop()
 	if err != nil {
 		stateCtx, cancel := workerStateUpdateContext()
-		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC().Add(retryCooldown), time.Now().UTC())
+		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Time{}, time.Now().UTC())
 		cancel()
 		if shutdownForced {
 			if releaseErr != nil {
@@ -1269,7 +1269,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	cancel()
 	if err != nil {
 		releaseCtx, releaseCancel := workerStateUpdateContext()
-		releaseErr := cfg.StateStore.ReleaseCompactBatch(releaseCtx, currentBatch(), cfg.WorkerID, time.Now().UTC().Add(retryCooldown), time.Now().UTC())
+		releaseErr := cfg.StateStore.ReleaseCompactBatch(releaseCtx, currentBatch(), cfg.WorkerID, time.Time{}, time.Now().UTC())
 		releaseCancel()
 		if releaseErr != nil {
 			return true, fmt.Errorf("complete compaction %s/%s: %w; additionally failed to release compact batch: %v", batch.JobID, outputPartID, err, releaseErr)
@@ -2852,16 +2852,16 @@ type jobSummaryOptions struct {
 }
 
 type compactJobSummary struct {
-	ReadyParts       int           `json:"ready_parts"`
-	CompactingParts  int           `json:"compacting_parts"`
-	CooldownParts    int           `json:"cooldown_seed_only_parts"`
-	Window           string        `json:"window"`
-	FinalizeStatus   string        `json:"finalize_status"`
-	FinalizeAfter    string        `json:"finalize_after,omitempty"`
-	FinalizeIn       string        `json:"finalize_in,omitempty"`
-	BlockedBy        []statusCount `json:"blocked_by,omitempty"`
-	BlockedByMessage string        `json:"blocked_by_message,omitempty"`
-	Reason           string        `json:"reason,omitempty"`
+	ReadyParts             int           `json:"ready_parts"`
+	CompactingParts        int           `json:"compacting_parts"`
+	SoloRetryCooldownParts int           `json:"solo_retry_cooldown_parts"`
+	Window                 string        `json:"window"`
+	FinalizeStatus         string        `json:"finalize_status"`
+	FinalizeAfter          string        `json:"finalize_after,omitempty"`
+	FinalizeIn             string        `json:"finalize_in,omitempty"`
+	BlockedBy              []statusCount `json:"blocked_by,omitempty"`
+	BlockedByMessage       string        `json:"blocked_by_message,omitempty"`
+	Reason                 string        `json:"reason,omitempty"`
 }
 
 type statusCount struct {
@@ -3157,7 +3157,7 @@ func compactSummary(parts []state.Part, counts map[state.Status]int, opts jobSum
 			continue
 		}
 		if until, ok := compactCooldownUntil(part); ok && until.After(now) {
-			summary.CooldownParts++
+			summary.SoloRetryCooldownParts++
 		}
 	}
 	blockers := compactFinalizationBlockers(counts)
@@ -3378,10 +3378,10 @@ func printJobSummary(out *os.File, summary jobSummary) {
 func printCompactSummary(out *os.File, compact *compactJobSummary) {
 	fmt.Fprintf(
 		out,
-		"compact: ready=%d compacting=%d cooldown_seed_only=%d window=%s\n",
+		"compact: ready=%d compacting=%d solo_retry_cooldown=%d window=%s\n",
 		compact.ReadyParts,
 		compact.CompactingParts,
-		compact.CooldownParts,
+		compact.SoloRetryCooldownParts,
 		compact.Window,
 	)
 	switch compact.FinalizeStatus {

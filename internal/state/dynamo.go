@@ -1601,7 +1601,7 @@ func (s *Store) ResetCompactTimer(ctx context.Context, part Part, now time.Time)
 			"#job_id = :job_id AND #part_id = :part_id",
 		),
 		UpdateExpression: aws.String(
-			"SET compact_ready_at = :now",
+			"SET compact_ready_at = :now REMOVE compact_cooldown_until",
 		),
 		ExpressionAttributeNames: map[string]string{
 			"#job_id":  "job_id",

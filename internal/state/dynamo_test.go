@@ -118,7 +118,7 @@ func TestSelectCompactBatchPartsAllowsOversizedSingleMultiPartArtifact(t *testin
 	}
 }
 
-func TestSelectCompactBatchPartsSkipsOnlyCooldownCandidates(t *testing.T) {
+func TestSelectCompactBatchPartsSkipsSingleCooldownCandidate(t *testing.T) {
 	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
 	selected := selectCompactBatchParts(compactGroup{
 		now: now,
@@ -135,7 +135,7 @@ func TestSelectCompactBatchPartsSkipsOnlyCooldownCandidates(t *testing.T) {
 		},
 	}, CompactClaimOptions{MinInputParts: 2})
 	if len(selected) != 0 {
-		t.Fatalf("selected = %+v, want cooldown-only part skipped", selected)
+		t.Fatalf("selected = %+v, want single cooldown part skipped", selected)
 	}
 }
 

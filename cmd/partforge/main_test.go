@@ -1082,14 +1082,14 @@ func TestPrintJobSummaryIncludesCompactETA(t *testing.T) {
 			state.StatusCompacting:   1,
 		},
 		Compact: &compactJobSummary{
-			ReadyParts:       1,
-			CompactingParts:  1,
-			CooldownParts:    1,
-			Window:           "2h0m0s",
-			FinalizeStatus:   "blocked",
-			FinalizeAfter:    "2026-06-24T13:30:00Z",
-			FinalizeIn:       "30m0s",
-			BlockedByMessage: "COMPACTING=1",
+			ReadyParts:             1,
+			CompactingParts:        1,
+			SoloRetryCooldownParts: 1,
+			Window:                 "2h0m0s",
+			FinalizeStatus:         "blocked",
+			FinalizeAfter:          "2026-06-24T13:30:00Z",
+			FinalizeIn:             "30m0s",
+			BlockedByMessage:       "COMPACTING=1",
 		},
 	}
 
@@ -1098,7 +1098,7 @@ func TestPrintJobSummaryIncludesCompactETA(t *testing.T) {
 	})
 
 	for _, want := range []string{
-		"compact: ready=1 compacting=1 cooldown_seed_only=1 window=2h0m0s",
+		"compact: ready=1 compacting=1 solo_retry_cooldown=1 window=2h0m0s",
 		"compact_finalize: blocked by COMPACTING=1; eligible after 2026-06-24T13:30:00Z (in 30m0s)",
 	} {
 		if !strings.Contains(got, want) {
