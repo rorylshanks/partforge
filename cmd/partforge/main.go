@@ -1201,6 +1201,15 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 			return true, releaseErr
 		}
 		slog.Info("compact batch did not reduce active part count; released", "stage", "compact_no_reduction", "job_id", batch.JobID, "output_part_id", outputPartID, "input_parts", result.InputStats.Count, "output_parts", result.DestinationStats.Count)
+		finalizeCtx, finalizeCancel := workerStateUpdateContext()
+		finalization, finalizeErr := finalizeCompactReadyJob(finalizeCtx, cfg.StateStore, batch.JobID, cfg.CompactWindow, time.Now().UTC())
+		finalizeCancel()
+		if finalizeErr != nil {
+			return true, finalizeErr
+		}
+		if finalization.Finalized > 0 {
+			slog.Info("finalized compact-ready artifacts after no-reduction compaction", "stage", "finalize_compact", "job_id", batch.JobID, "artifacts", finalization.Finalized)
+		}
 		return true, nil
 	}
 
@@ -1495,30 +1504,43 @@ func finalizeCompactReadyJobs(ctx context.Context, store *state.Store, compactWi
 		return result, err
 	}
 	for _, jobID := range jobIDs {
-		parts, err := store.ListJobParts(ctx, jobID)
+		jobResult, err := finalizeCompactReadyJob(ctx, store, jobID, compactWindow, now)
 		if err != nil {
 			return result, err
 		}
-		expired, err := compactWindowExpired(parts, compactWindow, now)
-		if err != nil {
+		result.Finalized += jobResult.Finalized
+		for expiredJobID := range jobResult.ExpiredJobIDs {
+			result.ExpiredJobIDs[expiredJobID] = struct{}{}
+		}
+	}
+	return result, nil
+}
+
+func finalizeCompactReadyJob(ctx context.Context, store *state.Store, jobID string, compactWindow time.Duration, now time.Time) (compactFinalizationResult, error) {
+	result := compactFinalizationResult{ExpiredJobIDs: map[string]struct{}{}}
+	parts, err := store.ListJobParts(ctx, jobID)
+	if err != nil {
+		return result, err
+	}
+	expired, err := compactWindowExpired(parts, compactWindow, now)
+	if err != nil {
+		return result, err
+	}
+	if expired {
+		result.ExpiredJobIDs[jobID] = struct{}{}
+	}
+	compactReady, ok, err := finalizableCompactReadyParts(parts, compactWindow, now)
+	if err != nil {
+		return result, err
+	}
+	if !ok {
+		return result, nil
+	}
+	for _, part := range compactReady {
+		if err := store.MarkCompactReadyFinished(ctx, part, now); err != nil {
 			return result, err
 		}
-		if expired {
-			result.ExpiredJobIDs[jobID] = struct{}{}
-		}
-		compactReady, ok, err := finalizableCompactReadyParts(parts, compactWindow, now)
-		if err != nil {
-			return result, err
-		}
-		if !ok {
-			continue
-		}
-		for _, part := range compactReady {
-			if err := store.MarkCompactReadyFinished(ctx, part, now); err != nil {
-				return result, err
-			}
-			result.Finalized++
-		}
+		result.Finalized++
 	}
 	return result, nil
 }
