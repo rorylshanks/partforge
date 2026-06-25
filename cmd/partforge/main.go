@@ -57,6 +57,58 @@ type workerRunDirs struct {
 	Scratch    string
 }
 
+type workerRole string
+
+const (
+	workerRoleAll       workerRole = "all"
+	workerRoleInserter  workerRole = "inserter"
+	workerRoleCompactor workerRole = "compactor"
+)
+
+type workerRoleSettings struct {
+	Insert                bool
+	Compact               bool
+	SourceMergeCompactCap bool
+}
+
+func parseWorkerRole(value string) (workerRole, error) {
+	role := workerRole(strings.ToLower(strings.TrimSpace(value)))
+	switch role {
+	case workerRoleAll, workerRoleInserter, workerRoleCompactor:
+		return role, nil
+	default:
+		return "", fmt.Errorf("worker role must be one of all, inserter, compactor; got %q", value)
+	}
+}
+
+func workerSettingsForRole(role workerRole, compact bool) (workerRoleSettings, error) {
+	if role == workerRoleCompactor && !compact {
+		return workerRoleSettings{}, errors.New("role=compactor conflicts with -compact=false")
+	}
+	return workerRoleSettings{
+		Insert:                role == workerRoleAll || role == workerRoleInserter,
+		Compact:               role == workerRoleCompactor || (role == workerRoleAll && compact),
+		SourceMergeCompactCap: compact && role != workerRoleCompactor,
+	}, nil
+}
+
+func workerNoWorkMessage(settings workerRoleSettings) string {
+	switch {
+	case settings.Insert && settings.Compact:
+		return "no ready or compactable work available"
+	case settings.Insert:
+		return "no ready work available"
+	case settings.Compact:
+		return "no compactable work available"
+	default:
+		return "no worker work enabled"
+	}
+}
+
+func workerIdleSleepMessage(settings workerRoleSettings) string {
+	return workerNoWorkMessage(settings) + "; sleeping"
+}
+
 func main() {
 	configureLogger()
 	if err := run(); err != nil {
@@ -661,7 +713,8 @@ func runWorker(ctx context.Context, args []string) error {
 		defaultCompressionCodec = fs.String("default-compression-codec", resources.DefaultCompressionCodec, "destination table default_compression_codec applied before insert-select starts")
 		mergeIdleTimeout        = fs.Duration("merge-idle-timeout", rewrite.DefaultMergeTimeout, "how long destination merges may be idle before freezing current destination parts")
 		mergeMaxRuntime         = fs.Duration("merge-max-runtime", rewrite.DefaultMergeMaxTimeout, "hard cap for a destination merge wait even while ClickHouse keeps making progress")
-		compact                 = fs.Bool("compact", true, "run opportunistic compaction when no READY source work is available")
+		role                    = fs.String("role", string(workerRoleAll), "worker role: all, inserter, or compactor")
+		compact                 = fs.Bool("compact", true, "run opportunistic compaction for role=all workers")
 		compactWindow           = fs.Duration("compact-window", defaultCompactWindow, "how long COMPACT_READY artifacts remain eligible for compaction before being promoted to FINISHED; 0 finalizes as soon as no useful compaction is available")
 		compactMergeIdleTimeout = fs.Duration("compact-merge-idle-timeout", rewrite.DefaultCompactMergeTimeout, "how long compact destination merges may be idle before freezing current compact output")
 		compactMergeMaxRuntime  = fs.Duration("compact-merge-max-runtime", rewrite.DefaultCompactMergeMaxTimeout, "hard cap for a compact merge wait even while ClickHouse keeps making progress")
@@ -682,6 +735,14 @@ func runWorker(ctx context.Context, args []string) error {
 	}
 	if strings.TrimSpace(*defaultCompressionCodec) == "" {
 		return fmt.Errorf("default-compression-codec must not be empty")
+	}
+	selectedRole, err := parseWorkerRole(*role)
+	if err != nil {
+		return err
+	}
+	roleSettings, err := workerSettingsForRole(selectedRole, *compact)
+	if err != nil {
+		return err
 	}
 	if *mergeIdleTimeout < 0 {
 		return fmt.Errorf("merge-idle-timeout must be non-negative, got %s", *mergeIdleTimeout)
@@ -706,7 +767,10 @@ func runWorker(ctx context.Context, args []string) error {
 		"work_dir", *workDir,
 		"clickhouse_url", *clickHouseURL,
 		"shutdown_grace_period", *shutdownGracePeriod,
+		"role", selectedRole,
 		"compact", *compact,
+		"insert_enabled", roleSettings.Insert,
+		"compact_enabled", roleSettings.Compact,
 	)
 	slog.Info("initializing DynamoDB state store", "stage", "init_state", "state_table", *stateTable)
 	stateStore, err := state.New(ctx, state.Config{
@@ -741,7 +805,7 @@ func runWorker(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("derive clickhouse merge background pool size: %w", err)
 	}
-	sourceMergeIdleTimeout, sourceMergeMaxRuntime := sourceMergeWaitTimeouts(*mergeIdleTimeout, *mergeMaxRuntime, *compact)
+	sourceMergeIdleTimeout, sourceMergeMaxRuntime := sourceMergeWaitTimeouts(*mergeIdleTimeout, *mergeMaxRuntime, roleSettings.SourceMergeCompactCap)
 	sourceMergeSettleMinWait := derivedMergeSettleMinWait(sourceMergeIdleTimeout, rewrite.DefaultMergeSettleMinWait)
 	compactStaleAfter := compactLeaseStaleAfter(*compactMergeMaxRuntime, *shutdownGracePeriod)
 	compactHeartbeatInterval := compactLeaseHeartbeatInterval(compactStaleAfter)
@@ -766,6 +830,7 @@ func runWorker(ctx context.Context, args []string) error {
 		"merge_idle_timeout", sourceMergeIdleTimeout,
 		"merge_max_runtime", sourceMergeMaxRuntime,
 		"merge_settle_min_wait", sourceMergeSettleMinWait,
+		"source_merge_compact_cap_enabled", roleSettings.SourceMergeCompactCap,
 		"source_merge_compact_cap", compactSourceMergeWaitCap,
 		"compact_window", *compactWindow,
 		"compact_claim_splay_max", compactClaimSplayMax(*compactWindow),
@@ -794,17 +859,21 @@ func runWorker(ctx context.Context, args []string) error {
 			slog.Info("worker shutdown requested; stopping before claiming more work", "stage", "shutdown")
 			return nil
 		}
-		slog.Info("claiming next ready part", "stage", "claim_work", "worker_id", resolvedWorkerID)
-		part, err := stateStore.ClaimNextReady(ctx, resolvedWorkerID, time.Now().UTC())
-		if err != nil {
-			if ctx.Err() != nil {
-				slog.Info("worker shutdown requested while claiming work", "stage", "shutdown")
-				return nil
+		var part *state.Part
+		if roleSettings.Insert {
+			slog.Info("claiming next ready part", "stage", "claim_work", "worker_id", resolvedWorkerID, "role", selectedRole)
+			var err error
+			part, err = stateStore.ClaimNextReady(ctx, resolvedWorkerID, time.Now().UTC())
+			if err != nil {
+				if ctx.Err() != nil {
+					slog.Info("worker shutdown requested while claiming work", "stage", "shutdown")
+					return nil
+				}
+				return err
 			}
-			return err
 		}
 		if part == nil {
-			if *compact {
+			if roleSettings.Compact {
 				didCompactWork, err := runWorkerCompaction(ctx, workerCompactionConfig{
 					StateStore:               stateStore,
 					WorkerID:                 resolvedWorkerID,
@@ -841,10 +910,10 @@ func runWorker(ctx context.Context, args []string) error {
 				}
 			}
 			if *once {
-				slog.Info("no ready or compactable work available")
+				slog.Info(workerNoWorkMessage(roleSettings), "role", selectedRole)
 				return nil
 			}
-			slog.Info("no ready part available; sleeping", "stage", "claim_work", "poll_interval", *pollInterval)
+			slog.Info(workerIdleSleepMessage(roleSettings), "stage", "claim_work", "role", selectedRole, "poll_interval", *pollInterval)
 			if err := sleepOrDone(ctx, *pollInterval); err != nil {
 				if ctx.Err() != nil {
 					slog.Info("worker shutdown requested while idle", "stage", "shutdown")

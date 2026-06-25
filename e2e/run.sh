@@ -181,6 +181,7 @@ for i in $(seq 1 "$part_count"); do
   worker_log="$ROOT/.e2e/worker-${i}.log"
   CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
     worker \
+    -role=inserter \
     -s3-endpoint=http://localstack:4566 \
     -dynamodb-endpoint=http://localstack:4566 \
     -once 2>&1 | tee "$worker_log"
@@ -191,6 +192,7 @@ for i in $(seq 1 6); do
   compact_log="$ROOT/.e2e/compact-${i}.log"
   CLICKHOUSE_DATA_DIR="$DATA_DIR" docker compose run --rm worker \
     worker \
+    -role=compactor \
     -s3-endpoint=http://localstack:4566 \
     -dynamodb-endpoint=http://localstack:4566 \
     -compact-window=0s \

@@ -835,6 +835,101 @@ func TestSourceMergeWaitTimeoutsCapWhenCompactEnabled(t *testing.T) {
 	}
 }
 
+func TestParseWorkerRole(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want workerRole
+	}{
+		{name: "all", in: "all", want: workerRoleAll},
+		{name: "inserter", in: "inserter", want: workerRoleInserter},
+		{name: "compactor", in: "compactor", want: workerRoleCompactor},
+		{name: "trim case", in: " Compactor ", want: workerRoleCompactor},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseWorkerRole(tt.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("parseWorkerRole(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+
+	if _, err := parseWorkerRole("writer"); err == nil {
+		t.Fatal("expected invalid worker role to fail")
+	}
+}
+
+func TestWorkerSettingsForRole(t *testing.T) {
+	tests := []struct {
+		name    string
+		role    workerRole
+		compact bool
+		want    workerRoleSettings
+	}{
+		{
+			name:    "all compacts opportunistically",
+			role:    workerRoleAll,
+			compact: true,
+			want: workerRoleSettings{
+				Insert:                true,
+				Compact:               true,
+				SourceMergeCompactCap: true,
+			},
+		},
+		{
+			name:    "all with compact disabled only inserts",
+			role:    workerRoleAll,
+			compact: false,
+			want: workerRoleSettings{
+				Insert:                true,
+				Compact:               false,
+				SourceMergeCompactCap: false,
+			},
+		},
+		{
+			name:    "inserter never claims compact work",
+			role:    workerRoleInserter,
+			compact: true,
+			want: workerRoleSettings{
+				Insert:                true,
+				Compact:               false,
+				SourceMergeCompactCap: true,
+			},
+		},
+		{
+			name:    "compactor never claims ready work",
+			role:    workerRoleCompactor,
+			compact: true,
+			want: workerRoleSettings{
+				Insert:                false,
+				Compact:               true,
+				SourceMergeCompactCap: false,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := workerSettingsForRole(tt.role, tt.compact)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("workerSettingsForRole(%q, %v) = %+v, want %+v", tt.role, tt.compact, got, tt.want)
+			}
+		})
+	}
+
+	if _, err := workerSettingsForRole(workerRoleCompactor, false); err == nil {
+		t.Fatal("expected compactor role with compact disabled to fail")
+	}
+}
+
 func TestParseFlagsIgnoresUnknownFlags(t *testing.T) {
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	known := fs.String("known", "", "")
