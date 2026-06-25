@@ -2,6 +2,7 @@ package rewrite
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -34,6 +35,7 @@ type Compactor struct {
 	MergeTreeSettings   MergeTreeSettings
 	RestartClickHouse   func(context.Context) error
 	ReportProgress      CompactProgressReporter
+	ShutdownContext     context.Context
 }
 
 type CompactInput struct {
@@ -120,14 +122,17 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		S3:      manifest.S3Refs{Bucket: item.Inputs[0].Bucket, FinishedKey: item.OutputFinishedKey},
 	}
 
+	phaseCtx, cancelPhase := c.phaseContext(ctx)
+	defer cancelPhase()
+
 	slog.Info("preparing compact destination table", "stage", "compact_prepare_table", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable))
-	if err := c.prepareDestinationTable(ctx, item); err != nil {
+	if err := c.prepareDestinationTable(phaseCtx, item); err != nil {
 		return CompactResult{}, err
 	}
-	if err := p.configureDestinationCompressionCodec(ctx, m); err != nil {
+	if err := p.configureDestinationCompressionCodec(phaseCtx, m); err != nil {
 		return CompactResult{}, err
 	}
-	dataPath, err := p.tableDataPath(ctx, item.DestinationDatabase, item.DestinationTable)
+	dataPath, err := p.tableDataPath(phaseCtx, item.DestinationDatabase, item.DestinationTable)
 	if err != nil {
 		return CompactResult{}, err
 	}
@@ -139,30 +144,30 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 	var inputStats metrics.PartStats
 	for idx, input := range item.Inputs {
 		workDir := filepath.Join(root, "inputs", fmt.Sprintf("%06d", idx))
-		stats, err := c.attachFinishedArtifact(ctx, item, input, detached, workDir)
+		stats, err := c.attachFinishedArtifact(phaseCtx, item, input, detached, workDir)
 		if err != nil {
 			return CompactResult{}, err
 		}
 		inputStats = addPartStats(inputStats, stats)
 	}
 
-	actualInputPartitions, err := p.activePartPartitionStats(ctx, item.DestinationDatabase, item.DestinationTable)
+	actualInputPartitions, err := p.activePartPartitionStats(phaseCtx, item.DestinationDatabase, item.DestinationTable)
 	if err != nil {
 		return CompactResult{}, fmt.Errorf("measure compact input active part partitions: %w", err)
 	}
 	actualInputStats := summarizePartPartitions(actualInputPartitions)
 	slog.Info("attached compact input artifacts", "stage", "compact_attach_inputs", "job_id", item.JobID, "part_id", item.OutputPartID, "input_artifacts", len(item.Inputs), "active_parts", actualInputStats.Count, "active_rows", actualInputStats.Rows, "active_bytes_on_disk", actualInputStats.Bytes)
-	if err := c.reportProgress(ctx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: actualInputStats}); err != nil {
+	if err := c.reportProgress(phaseCtx, item, CompactProgressSnapshot{InputStats: inputStats, DestinationStats: actualInputStats}); err != nil {
 		return CompactResult{}, err
 	}
 	if inputStats.Count < 2 {
 		return CompactResult{OutputPartID: item.OutputPartID, InputStats: inputStats, DestinationStats: actualInputStats, DestinationPartitions: actualInputPartitions, Inputs: attachedInputs}, nil
 	}
 
-	if err := c.configureCompactMergeSettings(ctx, item, actualInputStats.Bytes); err != nil {
+	if err := c.configureCompactMergeSettings(phaseCtx, item, actualInputStats.Bytes); err != nil {
 		return CompactResult{}, err
 	}
-	if err := p.restartClickHouse(ctx, m); err != nil {
+	if err := p.restartClickHouse(phaseCtx, m); err != nil {
 		return CompactResult{}, err
 	}
 	target := mergeWaitTarget{
@@ -171,9 +176,14 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		Database: item.DestinationDatabase,
 		Table:    item.DestinationTable,
 	}
-	if _, err := p.waitForDestinationMerges(ctx, m, nil, target, "compact"); err != nil {
-		return CompactResult{}, err
+	if _, err := p.waitForDestinationMerges(phaseCtx, m, nil, target, "compact"); err != nil {
+		if c.shutdownRequested() && errors.Is(err, context.Canceled) {
+			slog.Info("compact merge wait interrupted by shutdown; measuring current output", "stage", "shutdown", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable))
+		} else {
+			return CompactResult{}, err
+		}
 	}
+	cancelPhase()
 
 	destPartitions, err := p.activePartPartitionStats(ctx, item.DestinationDatabase, item.DestinationTable)
 	if err != nil {
@@ -213,6 +223,25 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		DestinationPartitions: destPartitions,
 		Inputs:                attachedInputs,
 	}, nil
+}
+
+func (c Compactor) phaseContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	phaseCtx, cancel := context.WithCancel(ctx)
+	if c.ShutdownContext == nil {
+		return phaseCtx, cancel
+	}
+	go func() {
+		select {
+		case <-c.ShutdownContext.Done():
+			cancel()
+		case <-phaseCtx.Done():
+		}
+	}()
+	return phaseCtx, cancel
+}
+
+func (c Compactor) shutdownRequested() bool {
+	return c.ShutdownContext != nil && c.ShutdownContext.Err() != nil
 }
 
 func (c Compactor) reportProgress(ctx context.Context, item CompactWorkItem, snapshot CompactProgressSnapshot) error {

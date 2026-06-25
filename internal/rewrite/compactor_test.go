@@ -2,11 +2,13 @@ package rewrite
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/partforge/partforge/internal/chhttp"
 	"github.com/partforge/partforge/internal/metrics"
@@ -62,6 +64,23 @@ func TestCompactProgressRejectsOutputMoreThanAttachedInput(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "exceeds attached input parts") {
 		t.Fatalf("error = %v, want attached input accounting error", err)
+	}
+}
+
+func TestCompactorPhaseContextCancelsOnShutdown(t *testing.T) {
+	shutdownCtx, cancelShutdown := context.WithCancel(context.Background())
+	phaseCtx, cancelPhase := (Compactor{ShutdownContext: shutdownCtx}).phaseContext(context.Background())
+	defer cancelPhase()
+
+	cancelShutdown()
+
+	select {
+	case <-phaseCtx.Done():
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("phase context did not cancel after shutdown")
+	}
+	if !errors.Is(phaseCtx.Err(), context.Canceled) {
+		t.Fatalf("phase context error = %v, want context.Canceled", phaseCtx.Err())
 	}
 }
 

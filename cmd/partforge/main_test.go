@@ -794,14 +794,14 @@ func TestCompactOutputReadyAtUsesLatestInputReadyTime(t *testing.T) {
 }
 
 func TestCompactLeaseTimingDerivedFromRuntime(t *testing.T) {
-	staleAfter := compactLeaseStaleAfter(2*time.Hour, 90*time.Second)
-	if staleAfter != 2*time.Hour+90*time.Second {
-		t.Fatalf("compactLeaseStaleAfter = %s, want 2h1m30s", staleAfter)
+	staleAfter := compactLeaseStaleAfter(2 * time.Hour)
+	if staleAfter != 2*time.Hour {
+		t.Fatalf("compactLeaseStaleAfter = %s, want 2h", staleAfter)
 	}
 	if got := compactLeaseHeartbeatInterval(staleAfter); got != 5*time.Minute {
 		t.Fatalf("compactLeaseHeartbeatInterval = %s, want 5m cap", got)
 	}
-	if got := compactLeaseStaleAfter(time.Minute, 0); got != 5*time.Minute {
+	if got := compactLeaseStaleAfter(time.Minute); got != 5*time.Minute {
 		t.Fatalf("compactLeaseStaleAfter short runtime = %s, want 5m floor", got)
 	}
 }
@@ -1494,57 +1494,13 @@ func TestCreateWorkerRunDirs(t *testing.T) {
 	}
 }
 
-func TestWorkerProcessContextWaitsUntilGracePeriodExpires(t *testing.T) {
+func TestWorkerProcessContextCancelsImmediatelyOnShutdown(t *testing.T) {
 	shutdownCtx, cancelShutdown := context.WithCancel(context.Background())
-	processCtx, shutdown := workerProcessContext(shutdownCtx, 50*time.Millisecond, "job-1", "part-1")
+	processCtx, shutdown := workerProcessContext(shutdownCtx, "job-1", "part-1")
 	defer shutdown.Stop()
 
 	cancelShutdown()
 	waitForShutdownRequested(t, shutdown)
-
-	select {
-	case <-processCtx.Done():
-		t.Fatal("process context canceled before grace period expired")
-	case <-time.After(10 * time.Millisecond):
-	}
-	if shutdown.Forced() {
-		t.Fatal("shutdown forced before grace period expired")
-	}
-
-	select {
-	case <-processCtx.Done():
-	case <-time.After(250 * time.Millisecond):
-		t.Fatal("process context was not canceled after grace period expired")
-	}
-	if !shutdown.Forced() {
-		t.Fatal("shutdown was not marked forced after grace period expired")
-	}
-}
-
-func TestWorkerProcessContextStopBeforeGracePeriodExpires(t *testing.T) {
-	shutdownCtx, cancelShutdown := context.WithCancel(context.Background())
-	processCtx, shutdown := workerProcessContext(shutdownCtx, time.Second, "job-1", "part-1")
-
-	cancelShutdown()
-	waitForShutdownRequested(t, shutdown)
-	shutdown.Stop()
-
-	select {
-	case <-processCtx.Done():
-	case <-time.After(250 * time.Millisecond):
-		t.Fatal("process context was not canceled after stop")
-	}
-	if shutdown.Forced() {
-		t.Fatal("shutdown marked forced after worker stopped during grace period")
-	}
-}
-
-func TestWorkerProcessContextCancelsImmediatelyWithoutGracePeriod(t *testing.T) {
-	shutdownCtx, cancelShutdown := context.WithCancel(context.Background())
-	processCtx, shutdown := workerProcessContext(shutdownCtx, 0, "job-1", "part-1")
-	defer shutdown.Stop()
-
-	cancelShutdown()
 
 	select {
 	case <-processCtx.Done():
@@ -1553,6 +1509,22 @@ func TestWorkerProcessContextCancelsImmediatelyWithoutGracePeriod(t *testing.T) 
 	}
 	if !shutdown.Forced() {
 		t.Fatal("shutdown was not marked forced")
+	}
+}
+
+func TestWorkerProcessContextStopBeforeShutdown(t *testing.T) {
+	shutdownCtx, cancelShutdown := context.WithCancel(context.Background())
+	processCtx, shutdown := workerProcessContext(shutdownCtx, "job-1", "part-1")
+	shutdown.Stop()
+
+	cancelShutdown()
+	select {
+	case <-processCtx.Done():
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("process context was not canceled after worker stopped")
+	}
+	if shutdown.Forced() {
+		t.Fatal("shutdown marked forced after worker stopped")
 	}
 }
 

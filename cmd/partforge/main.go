@@ -38,7 +38,6 @@ const defaultClickHouseURL = "http://127.0.0.1:8123"
 const defaultStateTable = "partforge"
 const defaultConfigPath = "/etc/partforge/config.json"
 const defaultClickHouseClientConfigPath = "/etc/clickhouse-client/config.xml"
-const defaultWorkerShutdownGracePeriod = 90 * time.Second
 const defaultCompactWindow = 2 * time.Hour
 const defaultCompactMaxArtifacts = 8
 const defaultCompactMaxBytes uint64 = 1024 * 1024 * 1024 * 1024
@@ -722,8 +721,8 @@ func runWorker(ctx context.Context, args []string) error {
 		metricsAddr             = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables metrics")
 		metricsPath             = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
 		stateProgressInterval   = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress heartbeats to DynamoDB; <=0 disables progress writes")
-		shutdownGracePeriod     = fs.Duration("shutdown-grace-period", defaultWorkerShutdownGracePeriod, "how long to let an active part finish after shutdown is requested before canceling it and returning it to READY; <=0 cancels immediately")
 	)
+	fs.Duration("shutdown-grace-period", 0, "deprecated; ignored. Shutdown cancels active inserts immediately and interrupts compact merge waits")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -766,7 +765,6 @@ func runWorker(ctx context.Context, args []string) error {
 		"state_table", *stateTable,
 		"work_dir", *workDir,
 		"clickhouse_url", *clickHouseURL,
-		"shutdown_grace_period", *shutdownGracePeriod,
 		"role", selectedRole,
 		"compact", *compact,
 		"insert_enabled", roleSettings.Insert,
@@ -807,7 +805,7 @@ func runWorker(ctx context.Context, args []string) error {
 	}
 	sourceMergeIdleTimeout, sourceMergeMaxRuntime := sourceMergeWaitTimeouts(*mergeIdleTimeout, *mergeMaxRuntime, roleSettings.SourceMergeCompactCap)
 	sourceMergeSettleMinWait := derivedMergeSettleMinWait(sourceMergeIdleTimeout, rewrite.DefaultMergeSettleMinWait)
-	compactStaleAfter := compactLeaseStaleAfter(*compactMergeMaxRuntime, *shutdownGracePeriod)
+	compactStaleAfter := compactLeaseStaleAfter(*compactMergeMaxRuntime)
 	compactHeartbeatInterval := compactLeaseHeartbeatInterval(compactStaleAfter)
 	slog.Info(
 		"configured clickhouse resource settings",
@@ -897,7 +895,6 @@ func runWorker(ctx context.Context, args []string) error {
 					CompactLeaseStaleAfter:   compactStaleAfter,
 					CompactHeartbeatInterval: compactHeartbeatInterval,
 					CompactMaxBytes:          *compactMaxBytes,
-					ShutdownGracePeriod:      *shutdownGracePeriod,
 				})
 				if err != nil {
 					return err
@@ -939,11 +936,12 @@ func runWorker(ctx context.Context, args []string) error {
 			PartID:    part.PartID,
 			Attempt:   part.Attempts,
 		}
-		processCtx, partShutdown := workerProcessContext(ctx, *shutdownGracePeriod, part.JobID, part.PartID)
-		result, err := func() (rewrite.ProcessResult, error) {
+		processCtx, partShutdown := workerProcessContext(ctx, part.JobID, part.PartID)
+		result, cleanupPart, err := func() (rewrite.ProcessResult, func(), error) {
+			cleanup := func() {}
 			runDirs, err := createWorkerRunDirs(*workDir)
 			if err != nil {
-				return rewrite.ProcessResult{}, err
+				return rewrite.ProcessResult{}, cleanup, err
 			}
 			slog.Info(
 				"created worker run directory",
@@ -957,7 +955,7 @@ func runWorker(ctx context.Context, args []string) error {
 			)
 
 			var server *chproc.Server
-			defer func() {
+			cleanup = func() {
 				if server != nil {
 					slog.Info("stopping local ClickHouse server", "stage", "stop_clickhouse", "job_id", part.JobID, "part_id", part.PartID)
 					if err := server.Stop(); err != nil {
@@ -967,7 +965,7 @@ func runWorker(ctx context.Context, args []string) error {
 				if err := os.RemoveAll(runDirs.Root); err != nil {
 					slog.Warn("failed to remove worker run directory", "run_dir", runDirs.Root, "job_id", part.JobID, "part_id", part.PartID, "error", err)
 				}
-			}()
+			}
 
 			startServer := func(ctx context.Context, tuning chproc.Tuning) (*chproc.Server, error) {
 				return chproc.Start(ctx, chproc.Config{
@@ -985,7 +983,7 @@ func runWorker(ctx context.Context, args []string) error {
 			slog.Info("starting local ClickHouse server", "stage", "start_clickhouse", "binary", *clickHouseBinary, "config_file", *clickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", part.JobID, "part_id", part.PartID)
 			server, err = startServer(processCtx, chproc.Tuning{})
 			if err != nil {
-				return rewrite.ProcessResult{}, err
+				return rewrite.ProcessResult{}, cleanup, err
 			}
 
 			ch := chhttp.Client{URL: *clickHouseURL, User: *clickHouseUser, Password: *clickHousePassword}
@@ -1029,21 +1027,30 @@ func runWorker(ctx context.Context, args []string) error {
 					return stateStore.UpdateRewriteProgress(ctx, m.JobID, m.PartID, resolvedWorkerID, stateProgress(snapshot), time.Now().UTC())
 				}
 			}
-			return processor.ProcessPart(processCtx, workItem)
+			result, err := processor.ProcessPart(processCtx, workItem)
+			return result, cleanup, err
 		}()
+		cleanupPartNow := func() {
+			if cleanupPart != nil {
+				cleanupPart()
+				cleanupPart = nil
+			}
+		}
 		shutdownRequested := partShutdown.Requested()
-		shutdownForced := partShutdown.Forced()
 		partShutdown.Stop()
+		shutdownRequested = shutdownRequested || ctx.Err() != nil
 		if err != nil {
-			if shutdownForced {
-				slog.Warn("part processing exceeded shutdown grace period; releasing part back to ready", "stage", "shutdown", "job_id", part.JobID, "part_id", part.PartID, "error", err)
+			if shutdownRequested {
+				slog.Info("part processing canceled by shutdown; releasing part back to ready", "stage", "shutdown", "job_id", part.JobID, "part_id", part.PartID, "error", err)
 				stateCtx, cancel := workerStateUpdateContext()
 				releaseErr := stateStore.ReleaseInProgress(stateCtx, *part, resolvedWorkerID, time.Now().UTC())
 				cancel()
 				if releaseErr != nil {
+					cleanupPartNow()
 					return fmt.Errorf("shutdown release part %s/%s: %w", part.JobID, part.PartID, releaseErr)
 				}
-				slog.Info("released part back to ready after shutdown grace period", "stage", "shutdown", "job_id", part.JobID, "part_id", part.PartID)
+				slog.Info("released part back to ready after shutdown", "stage", "shutdown", "job_id", part.JobID, "part_id", part.PartID)
+				cleanupPartNow()
 				return nil
 			}
 			slog.Info("part processing failed; marking failed", "stage", "mark_failed", "job_id", part.JobID, "part_id", part.PartID, "error", err)
@@ -1051,9 +1058,24 @@ func runWorker(ctx context.Context, args []string) error {
 			markErr := stateStore.MarkFailed(stateCtx, *part, resolvedWorkerID, err, time.Now().UTC())
 			cancel()
 			if markErr != nil {
+				cleanupPartNow()
 				return fmt.Errorf("process part %s/%s: %w; additionally failed to mark failed: %v", part.JobID, part.PartID, err, markErr)
 			}
+			cleanupPartNow()
 			return err
+		}
+		if shutdownRequested {
+			slog.Info("worker shutdown requested before part state commit; releasing part back to ready", "stage", "shutdown", "job_id", part.JobID, "part_id", part.PartID)
+			stateCtx, cancel := workerStateUpdateContext()
+			releaseErr := stateStore.ReleaseInProgress(stateCtx, *part, resolvedWorkerID, time.Now().UTC())
+			cancel()
+			if releaseErr != nil {
+				cleanupPartNow()
+				return fmt.Errorf("shutdown release completed part %s/%s: %w", part.JobID, part.PartID, releaseErr)
+			}
+			slog.Info("released completed part back to ready after shutdown", "stage", "shutdown", "job_id", part.JobID, "part_id", part.PartID)
+			cleanupPartNow()
+			return nil
 		}
 		slog.Info("marking part compact-ready", "stage", "mark_compact_ready", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey, "output_parts", result.DestinationStats.Count, "output_bytes", result.DestinationStats.Bytes)
 		stateCtx, cancel := workerStateUpdateContext()
@@ -1064,13 +1086,11 @@ func runWorker(ctx context.Context, args []string) error {
 		}, partitionCountsFromRewrite(result.DestinationPartitions), time.Now().UTC())
 		cancel()
 		if err != nil {
+			cleanupPartNow()
 			return err
 		}
 		slog.Info("part marked compact-ready", "stage", "mark_compact_ready", "job_id", part.JobID, "part_id", part.PartID, "finished_key", result.FinishedKey)
-		if shutdownRequested {
-			slog.Info("worker shutdown requested; stopping after completed part", "stage", "shutdown", "job_id", part.JobID, "part_id", part.PartID)
-			return nil
-		}
+		cleanupPartNow()
 		if *once {
 			return nil
 		}
@@ -1130,7 +1150,6 @@ type workerCompactionConfig struct {
 	CompactLeaseStaleAfter   time.Duration
 	CompactHeartbeatInterval time.Duration
 	CompactMaxBytes          uint64
-	ShutdownGracePeriod      time.Duration
 }
 
 func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool, error) {
@@ -1231,10 +1250,15 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		DestinationSchema:   batch.Parts[0].DestinationSchema,
 		Inputs:              compactInputs(batch.Parts),
 	}
-	processCtx, compactShutdown := workerProcessContext(ctx, cfg.ShutdownGracePeriod, batch.JobID, outputPartID)
-	processCtx, cancelProcess := context.WithCancel(processCtx)
+	processCtx, cancelProcess := context.WithCancel(context.Background())
 	heartbeatErrCh := startCompactHeartbeat(processCtx, cfg.StateStore, currentBatch, cfg.WorkerID, cfg.CompactHeartbeatInterval, cancelProcess)
-	result, err := processCompactBatch(processCtx, cfg, workItem, currentBatch)
+	result, cleanupCompact, err := processCompactBatch(processCtx, ctx, cfg, workItem, currentBatch)
+	cleanupCompactNow := func() {
+		if cleanupCompact != nil {
+			cleanupCompact()
+			cleanupCompact = nil
+		}
+	}
 	cancelProcess()
 	if heartbeatErr := waitCompactHeartbeat(heartbeatErrCh); heartbeatErr != nil {
 		if err == nil || errors.Is(err, context.Canceled) {
@@ -1243,23 +1267,25 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 			err = fmt.Errorf("%w; additionally compact heartbeat failed: %v", err, heartbeatErr)
 		}
 	}
-	shutdownRequested := compactShutdown.Requested()
-	shutdownForced := compactShutdown.Forced()
-	compactShutdown.Stop()
+	shutdownRequested := ctx.Err() != nil
 	if err != nil {
 		stateCtx, cancel := workerStateUpdateContext()
 		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC())
 		cancel()
-		if shutdownForced {
+		if shutdownRequested {
 			if releaseErr != nil {
+				cleanupCompactNow()
 				return true, fmt.Errorf("shutdown release compact batch %s/%s: %w", batch.JobID, outputPartID, releaseErr)
 			}
-			slog.Info("released compact batch after shutdown grace period", "stage", "shutdown", "job_id", batch.JobID, "output_part_id", outputPartID)
+			slog.Info("released compact batch after shutdown without useful output", "stage", "shutdown", "job_id", batch.JobID, "output_part_id", outputPartID)
+			cleanupCompactNow()
 			return true, nil
 		}
 		if releaseErr != nil {
+			cleanupCompactNow()
 			return true, fmt.Errorf("compact batch %s/%s failed: %w; additionally failed to release compact batch: %v", batch.JobID, outputPartID, err, releaseErr)
 		}
+		cleanupCompactNow()
 		return true, err
 	}
 	if !result.Reduced {
@@ -1267,18 +1293,26 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC())
 		cancel()
 		if releaseErr != nil {
+			cleanupCompactNow()
 			return true, releaseErr
 		}
 		slog.Info("compact batch did not reduce active part count; released", "stage", "compact_no_reduction", "job_id", batch.JobID, "output_part_id", outputPartID, "input_parts", result.InputStats.Count, "output_parts", result.DestinationStats.Count)
+		if shutdownRequested {
+			slog.Info("worker shutdown requested; stopping after compact batch made no useful output", "stage", "shutdown", "job_id", batch.JobID, "output_part_id", outputPartID)
+			cleanupCompactNow()
+			return true, nil
+		}
 		finalizeCtx, finalizeCancel := workerStateUpdateContext()
 		finalization, finalizeErr := finalizeCompactReadyJob(finalizeCtx, cfg.StateStore, batch.JobID, cfg.CompactWindow, time.Now().UTC())
 		finalizeCancel()
 		if finalizeErr != nil {
+			cleanupCompactNow()
 			return true, finalizeErr
 		}
 		if finalization.Finalized > 0 {
 			slog.Info("finalized compact-ready artifacts after no-reduction compaction", "stage", "finalize_compact", "job_id", batch.JobID, "artifacts", finalization.Finalized)
 		}
+		cleanupCompactNow()
 		return true, nil
 	}
 
@@ -1303,26 +1337,30 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		releaseErr := cfg.StateStore.ReleaseCompactBatch(releaseCtx, currentBatch(), cfg.WorkerID, time.Now().UTC())
 		releaseCancel()
 		if releaseErr != nil {
+			cleanupCompactNow()
 			return true, fmt.Errorf("complete compaction %s/%s: %w; additionally failed to release compact batch: %v", batch.JobID, outputPartID, err, releaseErr)
 		}
+		cleanupCompactNow()
 		return true, err
 	}
 	slog.Info("completed compact batch", "stage", "complete_compact", "job_id", batch.JobID, "output_part_id", outputPartID, "finished_key", outputFinishedKey, "input_artifacts", len(batch.Parts), "input_parts", result.InputStats.Count, "output_parts", result.DestinationStats.Count, "output_bytes", result.DestinationStats.Bytes)
 	if shutdownRequested {
 		slog.Info("worker shutdown requested; stopping after completed compaction", "stage", "shutdown", "job_id", batch.JobID, "output_part_id", outputPartID)
 	}
+	cleanupCompactNow()
 	return true, nil
 }
 
-func processCompactBatch(ctx context.Context, cfg workerCompactionConfig, item rewrite.CompactWorkItem, compactBatch func() state.CompactBatch) (rewrite.CompactResult, error) {
+func processCompactBatch(ctx, shutdownCtx context.Context, cfg workerCompactionConfig, item rewrite.CompactWorkItem, compactBatch func() state.CompactBatch) (rewrite.CompactResult, func(), error) {
+	cleanup := func() {}
 	runDirs, err := createWorkerRunDirs(cfg.WorkDir)
 	if err != nil {
-		return rewrite.CompactResult{}, err
+		return rewrite.CompactResult{}, cleanup, err
 	}
 	slog.Info("created compact worker run directory", "stage", "compact_prepare_work_dir", "work_dir", cfg.WorkDir, "run_dir", runDirs.Root, "clickhouse_data_dir", runDirs.ClickHouse, "scratch_dir", runDirs.Scratch, "job_id", item.JobID, "output_part_id", item.OutputPartID)
 
 	var server *chproc.Server
-	defer func() {
+	cleanup = func() {
 		if server != nil {
 			slog.Info("stopping local ClickHouse server", "stage", "compact_stop_clickhouse", "job_id", item.JobID, "output_part_id", item.OutputPartID)
 			if err := server.Stop(); err != nil {
@@ -1332,7 +1370,7 @@ func processCompactBatch(ctx context.Context, cfg workerCompactionConfig, item r
 		if err := os.RemoveAll(runDirs.Root); err != nil {
 			slog.Warn("failed to remove compact worker run directory", "run_dir", runDirs.Root, "job_id", item.JobID, "output_part_id", item.OutputPartID, "error", err)
 		}
-	}()
+	}
 
 	startServer := func(ctx context.Context, tuning chproc.Tuning) (*chproc.Server, error) {
 		return chproc.Start(ctx, chproc.Config{
@@ -1349,7 +1387,7 @@ func processCompactBatch(ctx context.Context, cfg workerCompactionConfig, item r
 	slog.Info("starting local ClickHouse server for compaction", "stage", "compact_start_clickhouse", "binary", cfg.ClickHouseBinary, "config_file", cfg.ClickHouseConfigFile, "clickhouse_data_dir", runDirs.ClickHouse, "job_id", item.JobID, "output_part_id", item.OutputPartID)
 	server, err = startServer(ctx, chproc.Tuning{})
 	if err != nil {
-		return rewrite.CompactResult{}, err
+		return rewrite.CompactResult{}, cleanup, err
 	}
 
 	ch := chhttp.Client{URL: cfg.ClickHouseURL, User: cfg.ClickHouseUser, Password: cfg.ClickHousePassword}
@@ -1367,6 +1405,7 @@ func processCompactBatch(ctx context.Context, cfg workerCompactionConfig, item r
 			MergeSelectingSleepMS:   cfg.MergeSelectingSleepMS,
 			DefaultCompressionCodec: cfg.DefaultCompressionCodec,
 		},
+		ShutdownContext: shutdownCtx,
 	}
 	compactor.ReportProgress = func(ctx context.Context, item rewrite.CompactWorkItem, snapshot rewrite.CompactProgressSnapshot) error {
 		stateCtx, cancel := workerStateUpdateContext()
@@ -1398,7 +1437,8 @@ func processCompactBatch(ctx context.Context, cfg workerCompactionConfig, item r
 		server = restarted
 		return nil
 	}
-	return compactor.Compact(ctx, item)
+	result, err := compactor.Compact(ctx, item)
+	return result, cleanup, err
 }
 
 func compactBatchPartIDs(parts []state.Part) []string {
@@ -1518,18 +1558,14 @@ func sourceMergeWaitTimeouts(idleTimeout, maxRuntime time.Duration, compactEnabl
 	return idleTimeout, maxRuntime
 }
 
-func compactLeaseStaleAfter(maxRuntime, shutdownGracePeriod time.Duration) time.Duration {
+func compactLeaseStaleAfter(maxRuntime time.Duration) time.Duration {
 	if maxRuntime <= 0 {
 		maxRuntime = rewrite.DefaultCompactMergeMaxTimeout
 	}
-	if shutdownGracePeriod < 0 {
-		shutdownGracePeriod = 0
-	}
-	staleAfter := maxRuntime + shutdownGracePeriod
-	if staleAfter < 5*time.Minute {
+	if maxRuntime < 5*time.Minute {
 		return 5 * time.Minute
 	}
-	return staleAfter
+	return maxRuntime
 }
 
 func compactLeaseHeartbeatInterval(staleAfter time.Duration) time.Duration {
@@ -2734,7 +2770,7 @@ func (s workerPartShutdown) Stop() {
 	}
 }
 
-func workerProcessContext(shutdownCtx context.Context, gracePeriod time.Duration, jobID, partID string) (context.Context, workerPartShutdown) {
+func workerProcessContext(shutdownCtx context.Context, jobID, partID string) (context.Context, workerPartShutdown) {
 	processCtx, cancel := context.WithCancel(context.Background())
 	requested := make(chan struct{})
 	forced := make(chan struct{})
@@ -2752,28 +2788,9 @@ func workerProcessContext(shutdownCtx context.Context, gracePeriod time.Duration
 		select {
 		case <-shutdownCtx.Done():
 			close(requested)
-			slog.Info(
-				"worker shutdown requested; waiting for current part",
-				"stage", "shutdown",
-				"job_id", jobID,
-				"part_id", partID,
-				"shutdown_grace_period", gracePeriod,
-			)
-			if gracePeriod <= 0 {
-				close(forced)
-				slog.Warn("worker shutdown grace period expired; canceling current part", "stage", "shutdown", "job_id", jobID, "part_id", partID)
-				cancel()
-				return
-			}
-			timer := time.NewTimer(gracePeriod)
-			defer timer.Stop()
-			select {
-			case <-done:
-			case <-timer.C:
-				close(forced)
-				slog.Warn("worker shutdown grace period expired; canceling current part", "stage", "shutdown", "job_id", jobID, "part_id", partID)
-				cancel()
-			}
+			close(forced)
+			slog.Info("worker shutdown requested; canceling current part", "stage", "shutdown", "job_id", jobID, "part_id", partID)
+			cancel()
 		case <-done:
 		}
 	}()
