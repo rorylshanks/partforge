@@ -113,6 +113,83 @@ func TestExtractFinishedTarballsExtractsMultipleTarballs(t *testing.T) {
 	}
 }
 
+func TestExtractFinishedTarballsFromDirExtractsTarballs(t *testing.T) {
+	root := t.TempDir()
+	partA := createTestPart(t, filepath.Join(root, "parts-a", "all_1_1_0"), "a")
+	partB := createTestPart(t, filepath.Join(root, "parts-b", "all_2_2_0"), "b")
+	tarRoot := filepath.Join(root, "tarballs")
+	if err := os.Mkdir(tarRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFinishedTar(filepath.Join(tarRoot, "all_2_2_0.tar"), []string{partB}); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFinishedTar(filepath.Join(tarRoot, "all_1_1_0.tar"), []string{partA}); err != nil {
+		t.Fatal(err)
+	}
+
+	extractRoot := filepath.Join(root, "extract")
+	got, err := ExtractFinishedTarballsFromDirContext(context.Background(), tarRoot, extractRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"all_1_1_0", "all_2_2_0"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parts = %#v, want %#v", got, want)
+	}
+}
+
+func TestFinishedTarballPaths(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"all_2_2_0.tar", "all_1_1_0.tar"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("tar"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := finishedTarballPaths(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		filepath.Join(root, "all_1_1_0.tar"),
+		filepath.Join(root, "all_2_2_0.tar"),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("tarballs = %#v, want %#v", got, want)
+	}
+}
+
+func TestExtractFinishedTarballsFromDirRejectsRootDirectories(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "all_1_1_0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ExtractFinishedTarballsFromDirContext(context.Background(), root, filepath.Join(root, "extract"))
+	if err == nil {
+		t.Fatal("expected root directory error")
+	}
+	if !strings.Contains(err.Error(), "unexpected directory") {
+		t.Fatalf("error = %v, want unexpected directory", err)
+	}
+}
+
+func TestExtractFinishedTarballsFromDirRejectsNonTarFiles(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "manifest.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ExtractFinishedTarballsFromDirContext(context.Background(), root, filepath.Join(root, "extract"))
+	if err == nil {
+		t.Fatal("expected non-tar file error")
+	}
+	if !strings.Contains(err.Error(), "unexpected non-tar file") {
+		t.Fatalf("error = %v, want unexpected non-tar file", err)
+	}
+}
+
 func TestExtractFinishedTarballsRejectsDuplicatesBeforeExtract(t *testing.T) {
 	root := t.TempDir()
 	left := createTestPart(t, filepath.Join(root, "left", "all_1_1_0"), "left")

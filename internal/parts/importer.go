@@ -11,10 +11,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/partforge/partforge/internal/artifact"
+	artifactpkg "github.com/partforge/partforge/internal/artifact"
 	"github.com/partforge/partforge/internal/chhttp"
 	"github.com/partforge/partforge/internal/fileutil"
-	"github.com/partforge/partforge/internal/manifest"
 	"github.com/partforge/partforge/internal/s3copy"
 )
 
@@ -169,7 +168,7 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact Fi
 	}
 	downloadElapsed := time.Since(downloadStartedAt)
 	slog.Info("downloaded finished artifact", "stage", "download_finished", "job_id", job.JobID, "part_id", artifact.PartID, "files", downloadStats.Files, "bytes", downloadStats.Bytes, "elapsed", downloadElapsed, "bytes_per_second", ratePerSecond(downloadStats.Bytes, downloadElapsed))
-	partNames, err := extractDownloadedFinishedTarballs(ctx, downloadRoot, extractRoot)
+	partNames, err := artifactpkg.ExtractFinishedTarballsFromDirContext(ctx, downloadRoot, extractRoot)
 	if err != nil {
 		return fmt.Errorf("extract downloaded finished parts s3://%s/%s: %w", artifact.Bucket, sourceKey, err)
 	}
@@ -202,44 +201,6 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact Fi
 	}
 	slog.Info("attached finished artifact parts", "stage", "attach_finished_part", "job_id", job.JobID, "part_id", artifact.PartID, "key", artifact.Key, "parts", len(partNames))
 	return nil
-}
-
-func extractDownloadedFinishedTarballs(ctx context.Context, root, extractRoot string) ([]string, error) {
-	tarballs, err := downloadedFinishedTarballs(root)
-	if err != nil {
-		return nil, err
-	}
-	tarPaths := make([]string, 0, len(tarballs))
-	for _, tarball := range tarballs {
-		tarPaths = append(tarPaths, filepath.Join(root, tarball))
-	}
-	return artifact.ExtractFinishedTarballsContext(ctx, tarPaths, extractRoot)
-}
-
-func downloadedFinishedTarballs(root string) ([]string, error) {
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return nil, err
-	}
-	names := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() {
-			return nil, fmt.Errorf("unexpected directory at finished artifact root: %s", filepath.Join(root, entry.Name()))
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return nil, err
-		}
-		if !info.Mode().IsRegular() {
-			return nil, fmt.Errorf("unexpected non-regular file at finished artifact root: %s", filepath.Join(root, entry.Name()))
-		}
-		if !strings.HasSuffix(entry.Name(), manifest.FinishedTarSuffix) {
-			return nil, fmt.Errorf("unexpected non-tar file at finished artifact root: %s", filepath.Join(root, entry.Name()))
-		}
-		names = append(names, entry.Name())
-	}
-	sort.Strings(names)
-	return names, nil
 }
 
 func (i Importer) tableDataPath(ctx context.Context, database, table string) (string, error) {

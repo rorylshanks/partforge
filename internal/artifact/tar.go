@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/partforge/partforge/internal/manifest"
 )
 
 const finishedTarCopyBufferSize = 4 * 1024 * 1024
@@ -129,6 +131,41 @@ func ExtractFinishedTarContext(ctx context.Context, tarPath, destRoot string) ([
 
 func ExtractFinishedTarballsContext(ctx context.Context, tarPaths []string, destRoot string) ([]string, error) {
 	return extractFinishedTarArchivesContext(ctx, tarPaths, destRoot)
+}
+
+func ExtractFinishedTarballsFromDirContext(ctx context.Context, root, destRoot string) ([]string, error) {
+	tarPaths, err := finishedTarballPaths(root)
+	if err != nil {
+		return nil, err
+	}
+	return ExtractFinishedTarballsContext(ctx, tarPaths, destRoot)
+}
+
+func finishedTarballPaths(root string) ([]string, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		entryPath := filepath.Join(root, entry.Name())
+		if entry.IsDir() {
+			return nil, fmt.Errorf("unexpected directory at finished artifact root: %s", entryPath)
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("unexpected non-regular file at finished artifact root: %s", entryPath)
+		}
+		if !strings.HasSuffix(entry.Name(), manifest.FinishedTarSuffix) {
+			return nil, fmt.Errorf("unexpected non-tar file at finished artifact root: %s", entryPath)
+		}
+		paths = append(paths, entryPath)
+	}
+	sort.Strings(paths)
+	return paths, nil
 }
 
 func extractFinishedTarArchivesContext(ctx context.Context, tarPaths []string, destRoot string) ([]string, error) {

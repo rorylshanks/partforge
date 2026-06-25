@@ -7,61 +7,19 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/partforge/partforge/internal/artifact"
 	"github.com/partforge/partforge/internal/chhttp"
-	"github.com/partforge/partforge/internal/manifest"
 	"github.com/partforge/partforge/internal/s3copy"
 )
-
-func TestDownloadedFinishedTarballs(t *testing.T) {
-	root := t.TempDir()
-	for _, name := range []string{"all_2_2_0.tar", "all_1_1_0.tar"} {
-		if err := os.WriteFile(filepath.Join(root, name), []byte("tar"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	got, err := downloadedFinishedTarballs(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []string{"all_1_1_0.tar", "all_2_2_0.tar"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("tarballs = %#v, want %#v", got, want)
-	}
-}
-
-func TestDownloadedFinishedTarballsRejectsRootDirectories(t *testing.T) {
-	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, "all_1_1_0"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := downloadedFinishedTarballs(root); err == nil {
-		t.Fatal("expected root directory error")
-	}
-}
-
-func TestDownloadedFinishedTarballsRejectsNonTarFiles(t *testing.T) {
-	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "manifest.json"), []byte("{}"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := downloadedFinishedTarballs(root); err == nil {
-		t.Fatal("expected non-tar file error")
-	}
-}
 
 func TestImportArtifactDownloadsFinishedTarballs(t *testing.T) {
 	root := t.TempDir()
 	partRoot := filepath.Join(root, "source", "all_1_1_0")
 	createPart(t, partRoot)
-	tarPath := filepath.Join(root, "all_1_1_0"+manifest.FinishedTarSuffix)
+	tarPath := filepath.Join(root, "all_1_1_0.tar")
 	if err := artifact.WriteFinishedTar(tarPath, []string{partRoot}); err != nil {
 		t.Fatal(err)
 	}

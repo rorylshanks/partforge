@@ -8,7 +8,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -328,7 +327,7 @@ func (c Compactor) attachFinishedArtifact(ctx context.Context, item CompactWorkI
 	slog.Info("downloaded compact input artifact", "stage", "compact_download_input", "job_id", item.JobID, "output_part_id", item.OutputPartID, "input_part_id", input.PartID, "files", downloadStats.Files, "bytes", downloadStats.Bytes, "elapsed", time.Since(downloadStartedAt), "bytes_per_second", ratePerSecond(downloadStats.Bytes, time.Since(downloadStartedAt)))
 
 	extractStartedAt := time.Now()
-	partNames, err := extractFinishedTarballs(ctx, downloadRoot, extractRoot)
+	partNames, err := artifact.ExtractFinishedTarballsFromDirContext(ctx, downloadRoot, extractRoot)
 	if err != nil {
 		return metrics.PartStats{}, fmt.Errorf("extract compact input artifact s3://%s/%s: %w", input.Bucket, input.FinishedKey, err)
 	}
@@ -373,44 +372,6 @@ func addPartStats(left, right metrics.PartStats) metrics.PartStats {
 		Rows:  left.Rows + right.Rows,
 		Bytes: left.Bytes + right.Bytes,
 	}
-}
-
-func extractFinishedTarballs(ctx context.Context, root, extractRoot string) ([]string, error) {
-	tarballs, err := finishedTarballs(root)
-	if err != nil {
-		return nil, err
-	}
-	tarPaths := make([]string, 0, len(tarballs))
-	for _, tarball := range tarballs {
-		tarPaths = append(tarPaths, filepath.Join(root, tarball))
-	}
-	return artifact.ExtractFinishedTarballsContext(ctx, tarPaths, extractRoot)
-}
-
-func finishedTarballs(root string) ([]string, error) {
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return nil, err
-	}
-	names := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() {
-			return nil, fmt.Errorf("unexpected directory at finished artifact root: %s", filepath.Join(root, entry.Name()))
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return nil, err
-		}
-		if !info.Mode().IsRegular() {
-			return nil, fmt.Errorf("unexpected non-regular file at finished artifact root: %s", filepath.Join(root, entry.Name()))
-		}
-		if !strings.HasSuffix(entry.Name(), manifest.FinishedTarSuffix) {
-			return nil, fmt.Errorf("unexpected non-tar file at finished artifact root: %s", filepath.Join(root, entry.Name()))
-		}
-		names = append(names, entry.Name())
-	}
-	sort.Strings(names)
-	return names, nil
 }
 
 func CompactFinishedKeyFromInput(inputKey, outputPartID string) (string, error) {
