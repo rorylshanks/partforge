@@ -98,7 +98,7 @@ func ExtractFinishedTarContext(ctx context.Context, tarPath, destRoot string) ([
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, "tar", "--extract", "--file", tarPath, "--directory", destRoot, "--keep-old-files", "--no-same-owner")
+	cmd := exec.CommandContext(ctx, "tar", "--extract", "--file", tarPath, "--directory", destRoot, "--keep-old-files", "--no-same-owner", "-m", "--no-xattrs", "--no-acls", "--no-selinux")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("tar extract %s: %w: %s", tarPath, err, strings.TrimSpace(string(out)))
