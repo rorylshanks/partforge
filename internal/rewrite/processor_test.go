@@ -264,8 +264,8 @@ func TestMergePoolByteSettingsForActiveBytes(t *testing.T) {
 		{
 			name:    "large output caps individual automatic merges",
 			bytes:   4 * 1024 * 1024 * 1024 * 1024,
-			wantMax: 150 * 1024 * 1024 * 1024,
-			wantMin: 150 * 1024 * 1024 * 1024 / 16,
+			wantMax: 1024 * 1024 * 1024 * 1024,
+			wantMin: 1024 * 1024 * 1024 * 1024 / 16,
 		},
 	}
 

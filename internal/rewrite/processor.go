@@ -37,9 +37,9 @@ const defaultMergeWaitLogInterval = 30 * time.Second
 const (
 	autoMergeTargetPartCount             uint64 = 4
 	minMergeMaxBytesAtMaxSpaceInPool     uint64 = 16 * 1024 * 1024 * 1024
-	maxMergeMaxBytesAtMaxSpaceInPool     uint64 = 150 * 1024 * 1024 * 1024
+	maxMergeMaxBytesAtMaxSpaceInPool     uint64 = 1024 * 1024 * 1024 * 1024
 	minMergeMaxBytesAtMinSpaceInPool     uint64 = 1024 * 1024 * 1024
-	maxMergeMaxBytesAtMinSpaceInPool     uint64 = 32 * 1024 * 1024 * 1024
+	maxMergeMaxBytesAtMinSpaceInPool     uint64 = 128 * 1024 * 1024 * 1024
 	mergeMaxBytesAtMinSpacePoolDivisor   uint64 = 16
 	defaultMergeMaxBytesAtMaxSpaceInPool uint64 = 16 * 1024 * 1024 * 1024
 )
