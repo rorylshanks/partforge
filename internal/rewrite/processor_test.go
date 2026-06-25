@@ -1055,8 +1055,8 @@ func TestDefaultMergeTimeout(t *testing.T) {
 	if DefaultCompactMergeTimeout != 15*time.Minute {
 		t.Fatalf("DefaultCompactMergeTimeout = %s, want 15m", DefaultCompactMergeTimeout)
 	}
-	if DefaultCompactMergeMaxTimeout != 2*time.Hour {
-		t.Fatalf("DefaultCompactMergeMaxTimeout = %s, want 2h", DefaultCompactMergeMaxTimeout)
+	if DefaultCompactMergeMaxTimeout != 24*time.Hour {
+		t.Fatalf("DefaultCompactMergeMaxTimeout = %s, want 24h", DefaultCompactMergeMaxTimeout)
 	}
 	if DefaultCompactMergeSettleMinWait != 2*time.Minute {
 		t.Fatalf("DefaultCompactMergeSettleMinWait = %s, want 2m", DefaultCompactMergeSettleMinWait)
