@@ -198,7 +198,7 @@ func TestConfigureDestinationMergeSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864, merge_selecting_sleep_ms = 1000, max_bytes_to_merge_at_max_space_in_pool = 26843545600, max_bytes_to_merge_at_min_space_in_pool = 1677721600"
+	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864, merge_selecting_sleep_ms = 1000, max_bytes_to_merge_at_max_space_in_pool = 161061273600, max_bytes_to_merge_at_min_space_in_pool = 161061273600"
 	if len(queries) != 2 || queries[1] != want {
 		t.Fatalf("queries = %#v, want %q", queries, want)
 	}
@@ -236,52 +236,16 @@ func TestConfigureDestinationCompressionCodec(t *testing.T) {
 	}
 }
 
-func TestMergePoolByteSettingsForActiveBytes(t *testing.T) {
-	tests := []struct {
-		name    string
-		bytes   uint64
-		wantMax uint64
-		wantMin uint64
-	}{
-		{
-			name:    "no active bytes uses safe positive defaults",
-			bytes:   0,
-			wantMax: 16 * 1024 * 1024 * 1024,
-			wantMin: 1024 * 1024 * 1024,
-		},
-		{
-			name:    "tiny output keeps enough headroom for merge selection",
-			bytes:   64 * 1024 * 1024,
-			wantMax: 16 * 1024 * 1024 * 1024,
-			wantMin: 1024 * 1024 * 1024,
-		},
-		{
-			name:    "medium output targets four large parts",
-			bytes:   100 * 1024 * 1024 * 1024,
-			wantMax: 25 * 1024 * 1024 * 1024,
-			wantMin: 25 * 1024 * 1024 * 1024 / 16,
-		},
-		{
-			name:    "large output caps individual automatic merges",
-			bytes:   4 * 1024 * 1024 * 1024 * 1024,
-			wantMax: 1024 * 1024 * 1024 * 1024,
-			wantMin: 1024 * 1024 * 1024 * 1024 / 16,
-		},
+func TestMergePoolByteSettingsUseTargetPartSize(t *testing.T) {
+	got := targetMergePoolByteSettings()
+	if got.MaxBytesAtMaxSpaceInPool != targetMergePartBytes {
+		t.Fatalf("max_bytes_to_merge_at_max_space_in_pool = %d, want %d", got.MaxBytesAtMaxSpaceInPool, targetMergePartBytes)
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := mergePoolByteSettingsForActiveBytes(tt.bytes)
-			if got.MaxBytesAtMaxSpaceInPool != tt.wantMax {
-				t.Fatalf("max_bytes_to_merge_at_max_space_in_pool = %d, want %d", got.MaxBytesAtMaxSpaceInPool, tt.wantMax)
-			}
-			if got.MaxBytesAtMinSpaceInPool != tt.wantMin {
-				t.Fatalf("max_bytes_to_merge_at_min_space_in_pool = %d, want %d", got.MaxBytesAtMinSpaceInPool, tt.wantMin)
-			}
-			if got.MaxBytesAtMinSpaceInPool == 0 || got.MaxBytesAtMinSpaceInPool > got.MaxBytesAtMaxSpaceInPool {
-				t.Fatalf("invalid merge byte settings: %+v", got)
-			}
-		})
+	if got.MaxBytesAtMinSpaceInPool != targetMergePartBytes {
+		t.Fatalf("max_bytes_to_merge_at_min_space_in_pool = %d, want %d", got.MaxBytesAtMinSpaceInPool, targetMergePartBytes)
+	}
+	if got.MaxBytesAtMinSpaceInPool == 0 || got.MaxBytesAtMinSpaceInPool > got.MaxBytesAtMaxSpaceInPool {
+		t.Fatalf("invalid merge byte settings: %+v", got)
 	}
 }
 
@@ -542,7 +506,7 @@ func TestWaitForMergesUsesDefaultTimeout(t *testing.T) {
 	}
 }
 
-func TestWaitForMergesSettlesLargeTailPartsAfterIdleWindow(t *testing.T) {
+func TestWaitForMergesSettlesWhenMergeTargetReachedAfterIdleWindow(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -554,8 +518,10 @@ func TestWaitForMergesSettlesLargeTailPartsAfterIdleWindow(t *testing.T) {
 		switch {
 		case strings.Contains(query, "system.merges"):
 			_, _ = w.Write([]byte("0\n"))
+		case strings.Contains(query, "partition_id, bytes_on_disk"):
+			_, _ = w.Write([]byte("202401\t161061273600\n202401\t53687091200\n"))
 		case strings.Contains(query, "system.parts"):
-			_, _ = w.Write([]byte(largeTailMergeSnapshot()))
+			_, _ = w.Write([]byte("2\t214748364800\t161061273600\n"))
 		default:
 			t.Errorf("unexpected query: %s", query)
 			w.WriteHeader(http.StatusBadRequest)
@@ -574,7 +540,10 @@ func TestWaitForMergesSettlesLargeTailPartsAfterIdleWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !result.Settled {
-		t.Fatal("expected large tail parts to settle")
+		t.Fatal("expected target-sized parts to settle")
+	}
+	if result.Reason != "destination_merge_target_reached" {
+		t.Fatalf("reason = %q, want destination_merge_target_reached", result.Reason)
 	}
 	if result.ActiveParts != 2 {
 		t.Fatalf("active parts = %d, want 2", result.ActiveParts)
@@ -678,6 +647,7 @@ func TestWaitForMergesKeepsWaitingWhenZeroMergesAndManyActiveParts(t *testing.T)
 func TestWaitForMergesKeepsWaitingWhenZeroMergesAndLargeTailParts(t *testing.T) {
 	var mergeRequests int
 	var partRequests int
+	var partSizeRequests int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -690,6 +660,9 @@ func TestWaitForMergesKeepsWaitingWhenZeroMergesAndLargeTailParts(t *testing.T) 
 		case strings.Contains(query, "system.merges"):
 			mergeRequests++
 			_, _ = w.Write([]byte("0\n"))
+		case strings.Contains(query, "partition_id, bytes_on_disk"):
+			partSizeRequests++
+			_, _ = w.Write([]byte("202401\t5368709120\n202401\t5368709120\n"))
 		case strings.Contains(query, "system.parts"):
 			partRequests++
 			_, _ = w.Write([]byte(largeTailMergeSnapshot()))
@@ -704,8 +677,9 @@ func TestWaitForMergesKeepsWaitingWhenZeroMergesAndLargeTailParts(t *testing.T) 
 	defer cancel()
 	_, err := (Processor{
 		ClickHouse:          chhttp.Client{URL: server.URL},
-		MergeSettleMinWait:  time.Hour,
+		MergeSettleMinWait:  time.Millisecond,
 		MergeSettleMinParts: 1,
+		MergePollInterval:   time.Millisecond,
 	}).waitForMerges(ctx, testMergeWaitTarget())
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waitForMerges error = %v, want context deadline exceeded", err)
@@ -715,6 +689,9 @@ func TestWaitForMergesKeepsWaitingWhenZeroMergesAndLargeTailParts(t *testing.T) 
 	}
 	if partRequests == 0 {
 		t.Fatal("expected system.parts to be queried after zero active merges")
+	}
+	if partSizeRequests == 0 {
+		t.Fatal("expected active part sizes to be queried after idle window")
 	}
 }
 
@@ -892,6 +869,56 @@ func TestWaitForMergesSkipsOptimizeFinalWhenPartsAreInDifferentPartitions(t *tes
 			_, _ = w.Write([]byte("202401\t1\t0\t100\n202402\t1\t0\t100\n"))
 		case strings.Contains(query, "system.parts"):
 			_, _ = w.Write([]byte("2\t200\t100\n"))
+		case strings.HasPrefix(query, "OPTIMIZE TABLE "):
+			optimizeRequests++
+		default:
+			t.Errorf("unexpected query: %s", query)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := (Processor{
+		ClickHouse:          chhttp.Client{URL: server.URL},
+		MergeTimeout:        time.Hour,
+		MergeMaxTimeout:     time.Hour,
+		MergeSettleMinWait:  time.Hour,
+		MergeSettleMinParts: 1,
+		MergePollInterval:   time.Millisecond,
+		OptimizeFinalAfter:  time.Millisecond,
+	}).waitForMerges(ctx, testMergeWaitTarget())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForMerges error = %v, want context deadline exceeded", err)
+	}
+	if partitionRequests != 1 {
+		t.Fatalf("partition requests = %d, want 1", partitionRequests)
+	}
+	if optimizeRequests != 0 {
+		t.Fatalf("optimize requests = %d, want 0", optimizeRequests)
+	}
+}
+
+func TestWaitForMergesSkipsOptimizeFinalWhenPartitionExceedsTargetPartBytes(t *testing.T) {
+	var partitionRequests int
+	var optimizeRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case strings.Contains(query, "system.merges"):
+			_, _ = w.Write([]byte("0\n"))
+		case strings.Contains(query, "GROUP BY partition_id"):
+			partitionRequests++
+			_, _ = w.Write([]byte("202401\t2\t0\t214748364800\n"))
+		case strings.Contains(query, "system.parts"):
+			_, _ = w.Write([]byte("2\t214748364800\t107374182400\n"))
 		case strings.HasPrefix(query, "OPTIMIZE TABLE "):
 			optimizeRequests++
 		default:

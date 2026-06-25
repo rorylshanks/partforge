@@ -36,13 +36,7 @@ const defaultMergePollInterval = time.Second
 const defaultMergeWaitLogInterval = 30 * time.Second
 
 const (
-	autoMergeTargetPartCount             uint64 = 4
-	minMergeMaxBytesAtMaxSpaceInPool     uint64 = 16 * 1024 * 1024 * 1024
-	maxMergeMaxBytesAtMaxSpaceInPool     uint64 = 1024 * 1024 * 1024 * 1024
-	minMergeMaxBytesAtMinSpaceInPool     uint64 = 1024 * 1024 * 1024
-	maxMergeMaxBytesAtMinSpaceInPool     uint64 = 128 * 1024 * 1024 * 1024
-	mergeMaxBytesAtMinSpacePoolDivisor   uint64 = 16
-	defaultMergeMaxBytesAtMaxSpaceInPool uint64 = 16 * 1024 * 1024 * 1024
+	targetMergePartBytes uint64 = 150 * 1024 * 1024 * 1024
 )
 
 const (
@@ -642,7 +636,7 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 	if err != nil {
 		return fmt.Errorf("measure destination parts before configuring merge settings: %w", err)
 	}
-	mergeBytes := mergePoolByteSettingsForActiveBytes(stats.Bytes)
+	mergeBytes := targetMergePoolByteSettings()
 	query := "ALTER TABLE " + table +
 		" MODIFY SETTING merge_max_block_size = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSize, 10) +
 		", merge_max_block_size_bytes = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSizeBytes, 10) +
@@ -687,27 +681,15 @@ type mergePoolByteSettings struct {
 	MaxBytesAtMinSpaceInPool uint64
 }
 
-func mergePoolByteSettingsForActiveBytes(activeBytes uint64) mergePoolByteSettings {
-	maxAtMaxSpace := defaultMergeMaxBytesAtMaxSpaceInPool
-	if activeBytes > 0 {
-		target := ceilDivUint64(activeBytes, autoMergeTargetPartCount)
-		maxAtMaxSpace = maxUint64(target, minMergeMaxBytesAtMaxSpaceInPool)
-		maxAtMaxSpace = minUint64(maxAtMaxSpace, maxMergeMaxBytesAtMaxSpaceInPool)
-	}
-	if maxAtMaxSpace == 0 {
-		maxAtMaxSpace = 1
-	}
-
-	maxAtMinSpace := ceilDivUint64(maxAtMaxSpace, mergeMaxBytesAtMinSpacePoolDivisor)
-	maxAtMinSpace = clampUint64(maxAtMinSpace, minMergeMaxBytesAtMinSpaceInPool, maxMergeMaxBytesAtMinSpaceInPool)
-	maxAtMinSpace = minUint64(maxAtMinSpace, maxAtMaxSpace)
-	if maxAtMinSpace == 0 {
-		maxAtMinSpace = 1
+func targetMergePoolByteSettings() mergePoolByteSettings {
+	targetBytes := targetMergePartBytes
+	if targetBytes == 0 {
+		targetBytes = 1
 	}
 
 	return mergePoolByteSettings{
-		MaxBytesAtMaxSpaceInPool: maxAtMaxSpace,
-		MaxBytesAtMinSpaceInPool: maxAtMinSpace,
+		MaxBytesAtMaxSpaceInPool: targetBytes,
+		MaxBytesAtMinSpaceInPool: targetBytes,
 	}
 }
 
@@ -1471,16 +1453,23 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 			}
 			zeroMergesIdle = now.Sub(zeroMergesStableSnapshotSince)
 			if zeroMergesIdle >= minWait {
-				return mergeWaitResult{
-					Settled:          true,
-					Reason:           "destination_merges_idle",
-					ActiveParts:      snapshot.ActiveParts,
-					TotalBytes:       snapshot.TotalBytes,
-					LargestPartBytes: snapshot.LargestPartBytes,
-					ZeroMergesIdle:   zeroMergesIdle,
-					Timeout:          timeout,
-					MaxTimeout:       maxTimeout,
-				}, nil
+				hasMergeableParts, err := p.destinationHasMergeablePartsBelowTarget(ctx, target, minParts, targetMergePartBytes)
+				if err != nil {
+					return mergeWaitResult{}, err
+				}
+				if !hasMergeableParts {
+					return mergeWaitResult{
+						Settled:          true,
+						Reason:           "destination_merge_target_reached",
+						ActiveParts:      snapshot.ActiveParts,
+						TotalBytes:       snapshot.TotalBytes,
+						LargestPartBytes: snapshot.LargestPartBytes,
+						ZeroMergesIdle:   zeroMergesIdle,
+						Timeout:          timeout,
+						MaxTimeout:       maxTimeout,
+					}, nil
+				}
+				reason = "waiting_for_destination_merge_target"
 			}
 			if !now.Before(maxDeadline) {
 				return mergeWaitResult{
@@ -1544,17 +1533,10 @@ func (p Processor) waitForMerges(ctx context.Context, target mergeWaitTarget) (m
 				}
 			}
 			if !now.Before(baseDeadline) {
-				return mergeWaitResult{
-					Reason:           "merge_timeout_no_destination_merges",
-					ActiveParts:      snapshot.ActiveParts,
-					TotalBytes:       snapshot.TotalBytes,
-					LargestPartBytes: snapshot.LargestPartBytes,
-					ZeroMergesIdle:   zeroMergesIdle,
-					Timeout:          timeout,
-					MaxTimeout:       maxTimeout,
-				}, nil
+				reason = "waiting_for_destination_merge_target"
+			} else if reason == "active_destination_merges" {
+				reason = "waiting_for_destination_merge_selection"
 			}
-			reason = "waiting_for_destination_merge_selection"
 		} else {
 			zeroMergesStableSnapshotSince = time.Time{}
 			zeroMergesSnapshot = mergePartSnapshot{}
@@ -1637,11 +1619,61 @@ func (p Processor) destinationMergeablePartitions(ctx context.Context, target me
 	}
 	partitionIDs := make([]string, 0, len(partitions))
 	for _, partition := range partitions {
-		if partition.Parts > 1 {
+		if partition.Parts > 1 && partition.Bytes <= targetMergePartBytes {
 			partitionIDs = append(partitionIDs, partition.PartitionID)
 		}
 	}
 	return partitionIDs, nil
+}
+
+func (p Processor) destinationHasMergeablePartsBelowTarget(ctx context.Context, target mergeWaitTarget, minParts, targetBytes uint64) (bool, error) {
+	if targetBytes == 0 {
+		return false, nil
+	}
+	query := "SELECT partition_id, bytes_on_disk FROM system.parts WHERE database = " +
+		chhttp.StringLiteral(target.Database) + " AND table = " + chhttp.StringLiteral(target.Table) +
+		" AND active ORDER BY partition_id, bytes_on_disk FORMAT TSV"
+	out, err := p.ClickHouse.QueryString(ctx, query)
+	if err != nil {
+		return false, err
+	}
+	rows, err := chhttp.FormatTSVStrings(out, 2)
+	if err != nil {
+		return false, err
+	}
+
+	currentPartition := ""
+	var partitionParts uint64
+	var smallest [2]uint64
+	finishPartition := func() bool {
+		if partitionParts <= minParts || partitionParts < 2 {
+			return false
+		}
+		return smallest[1] <= targetBytes && smallest[0] <= targetBytes-smallest[1]
+	}
+	for _, row := range rows {
+		partitionID := row[0]
+		bytes, err := chhttp.ParseUInt(row[1])
+		if err != nil {
+			return false, err
+		}
+		if partitionID != currentPartition {
+			if currentPartition != "" && finishPartition() {
+				return true, nil
+			}
+			currentPartition = partitionID
+			partitionParts = 0
+			smallest = [2]uint64{}
+		}
+		partitionParts++
+		if partitionParts <= 2 {
+			smallest[partitionParts-1] = bytes
+		}
+	}
+	if currentPartition != "" && finishPartition() {
+		return true, nil
+	}
+	return false, nil
 }
 
 func (s *mergeWaitLogState) maybeLog(
