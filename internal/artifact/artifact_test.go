@@ -1,9 +1,11 @@
 package artifact
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,6 +81,69 @@ func TestFinishedTarRoundTrip(t *testing.T) {
 	}
 }
 
+func TestExtractFinishedTarballsExtractsMultipleTarballs(t *testing.T) {
+	root := t.TempDir()
+	partA := createTestPart(t, filepath.Join(root, "parts-a", "all_1_1_0"), "a")
+	partB := createTestPart(t, filepath.Join(root, "parts-b", "all_2_2_0"), "b")
+
+	tarA := filepath.Join(root, "all_1_1_0.tar")
+	if err := WriteFinishedTar(tarA, []string{partA}); err != nil {
+		t.Fatal(err)
+	}
+	tarB := filepath.Join(root, "all_2_2_0.tar")
+	if err := WriteFinishedTar(tarB, []string{partB}); err != nil {
+		t.Fatal(err)
+	}
+
+	extractRoot := filepath.Join(root, "extract")
+	got, err := ExtractFinishedTarballsContext(context.Background(), []string{tarB, tarA}, extractRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"all_1_1_0", "all_2_2_0"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parts = %#v, want %#v", got, want)
+	}
+	raw, err := os.ReadFile(filepath.Join(extractRoot, "all_2_2_0", "checksums.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "b" {
+		t.Fatalf("extracted file = %q", raw)
+	}
+}
+
+func TestExtractFinishedTarballsRejectsDuplicatesBeforeExtract(t *testing.T) {
+	root := t.TempDir()
+	left := createTestPart(t, filepath.Join(root, "left", "all_1_1_0"), "left")
+	right := createTestPart(t, filepath.Join(root, "right", "all_1_1_0"), "right")
+
+	leftTar := filepath.Join(root, "left.tar")
+	if err := WriteFinishedTar(leftTar, []string{left}); err != nil {
+		t.Fatal(err)
+	}
+	rightTar := filepath.Join(root, "right.tar")
+	if err := WriteFinishedTar(rightTar, []string{right}); err != nil {
+		t.Fatal(err)
+	}
+
+	extractRoot := filepath.Join(root, "extract")
+	_, err := ExtractFinishedTarballsContext(context.Background(), []string{leftTar, rightTar}, extractRoot)
+	if err == nil {
+		t.Fatal("expected duplicate finished part error")
+	}
+	if !strings.Contains(err.Error(), "duplicate finished part") {
+		t.Fatalf("error = %v, want duplicate finished part", err)
+	}
+	entries, err := os.ReadDir(extractRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("extract root entries = %d, want 0", len(entries))
+	}
+}
+
 func TestWriteFinishedTarRejectsDuplicatePartNames(t *testing.T) {
 	root := t.TempDir()
 	left := filepath.Join(root, "left", "all_1_1_0")
@@ -116,4 +181,15 @@ func TestExtractFinishedTarRejectsExistingPartFiles(t *testing.T) {
 	if _, err := ExtractFinishedTar(tarPath, extractRoot); err == nil {
 		t.Fatal("expected extracting over existing part files to fail")
 	}
+}
+
+func createTestPart(t *testing.T, root, checksum string) string {
+	t.Helper()
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "checksums.txt"), []byte(checksum), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return root
 }

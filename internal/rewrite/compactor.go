@@ -380,23 +380,11 @@ func extractFinishedTarballs(ctx context.Context, root, extractRoot string) ([]s
 	if err != nil {
 		return nil, err
 	}
-	partSeen := map[string]struct{}{}
-	var partNames []string
+	tarPaths := make([]string, 0, len(tarballs))
 	for _, tarball := range tarballs {
-		extracted, err := artifact.ExtractFinishedTarContext(ctx, filepath.Join(root, tarball), extractRoot)
-		if err != nil {
-			return nil, fmt.Errorf("extract %s: %w", tarball, err)
-		}
-		for _, partName := range extracted {
-			if _, ok := partSeen[partName]; ok {
-				return nil, fmt.Errorf("duplicate finished part %q in downloaded tarballs", partName)
-			}
-			partSeen[partName] = struct{}{}
-			partNames = append(partNames, partName)
-		}
+		tarPaths = append(tarPaths, filepath.Join(root, tarball))
 	}
-	sort.Strings(partNames)
-	return partNames, nil
+	return artifact.ExtractFinishedTarballsContext(ctx, tarPaths, extractRoot)
 }
 
 func finishedTarballs(root string) ([]string, error) {
