@@ -768,6 +768,161 @@ func TestWaitForMergesResetsIdleWindowWhenActivePartCountChanges(t *testing.T) {
 	}
 }
 
+func TestWaitForMergesRunsOptimizeFinalAfterIdle(t *testing.T) {
+	var optimizeRequests int
+	var optimizeQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case strings.Contains(query, "system.merges"):
+			_, _ = w.Write([]byte("0\n"))
+		case strings.Contains(query, "GROUP BY partition_id"):
+			_, _ = w.Write([]byte("202401\t2\t0\t1073741824\n"))
+		case strings.Contains(query, "system.parts"):
+			if optimizeRequests == 0 {
+				_, _ = w.Write([]byte(multiPartMergeSnapshot()))
+			} else {
+				_, _ = w.Write([]byte("1\t1073741824\t1073741824\n"))
+			}
+		case strings.HasPrefix(query, "OPTIMIZE TABLE "):
+			optimizeRequests++
+			optimizeQuery = query
+		default:
+			t.Errorf("unexpected query: %s", query)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	result, err := (Processor{
+		ClickHouse:          chhttp.Client{URL: server.URL},
+		MergeTimeout:        time.Second,
+		MergeMaxTimeout:     time.Second,
+		MergeSettleMinWait:  time.Hour,
+		MergeSettleMinParts: 1,
+		MergePollInterval:   time.Millisecond,
+		OptimizeFinalAfter:  2 * time.Millisecond,
+	}).waitForMerges(ctx, testMergeWaitTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Settled {
+		t.Fatal("expected merge wait to settle after optimize final")
+	}
+	if result.ActiveParts != 1 {
+		t.Fatalf("active parts = %d, want 1", result.ActiveParts)
+	}
+	if optimizeRequests != 1 {
+		t.Fatalf("optimize requests = %d, want 1", optimizeRequests)
+	}
+	if want := "OPTIMIZE TABLE `db`.`query_log_archive_temp` PARTITION ID '202401' FINAL"; optimizeQuery != want {
+		t.Fatalf("optimize query = %q, want %q", optimizeQuery, want)
+	}
+}
+
+func TestWaitForMergesRunsOptimizeFinalOnceForStableSnapshot(t *testing.T) {
+	var optimizeRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case strings.Contains(query, "system.merges"):
+			_, _ = w.Write([]byte("0\n"))
+		case strings.Contains(query, "GROUP BY partition_id"):
+			_, _ = w.Write([]byte("202401\t4\t0\t1073741824\n"))
+		case strings.Contains(query, "system.parts"):
+			_, _ = w.Write([]byte(multiPartMergeSnapshot()))
+		case strings.HasPrefix(query, "OPTIMIZE TABLE "):
+			optimizeRequests++
+		default:
+			t.Errorf("unexpected query: %s", query)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := (Processor{
+		ClickHouse:          chhttp.Client{URL: server.URL},
+		MergeTimeout:        time.Hour,
+		MergeMaxTimeout:     time.Hour,
+		MergeSettleMinWait:  time.Hour,
+		MergeSettleMinParts: 1,
+		MergePollInterval:   time.Millisecond,
+		OptimizeFinalAfter:  time.Millisecond,
+	}).waitForMerges(ctx, testMergeWaitTarget())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForMerges error = %v, want context deadline exceeded", err)
+	}
+	if optimizeRequests != 1 {
+		t.Fatalf("optimize requests = %d, want 1", optimizeRequests)
+	}
+}
+
+func TestWaitForMergesSkipsOptimizeFinalWhenPartsAreInDifferentPartitions(t *testing.T) {
+	var partitionRequests int
+	var optimizeRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		query := string(body)
+		switch {
+		case strings.Contains(query, "system.merges"):
+			_, _ = w.Write([]byte("0\n"))
+		case strings.Contains(query, "GROUP BY partition_id"):
+			partitionRequests++
+			_, _ = w.Write([]byte("202401\t1\t0\t100\n202402\t1\t0\t100\n"))
+		case strings.Contains(query, "system.parts"):
+			_, _ = w.Write([]byte("2\t200\t100\n"))
+		case strings.HasPrefix(query, "OPTIMIZE TABLE "):
+			optimizeRequests++
+		default:
+			t.Errorf("unexpected query: %s", query)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := (Processor{
+		ClickHouse:          chhttp.Client{URL: server.URL},
+		MergeTimeout:        time.Hour,
+		MergeMaxTimeout:     time.Hour,
+		MergeSettleMinWait:  time.Hour,
+		MergeSettleMinParts: 1,
+		MergePollInterval:   time.Millisecond,
+		OptimizeFinalAfter:  time.Millisecond,
+	}).waitForMerges(ctx, testMergeWaitTarget())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForMerges error = %v, want context deadline exceeded", err)
+	}
+	if partitionRequests != 1 {
+		t.Fatalf("partition requests = %d, want 1", partitionRequests)
+	}
+	if optimizeRequests != 0 {
+		t.Fatalf("optimize requests = %d, want 0", optimizeRequests)
+	}
+}
+
 func TestDestinationMergeCountFiltersToTargetTable(t *testing.T) {
 	var mergeQuery string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -878,6 +1033,9 @@ func TestDefaultMergeTimeout(t *testing.T) {
 	}
 	if DefaultCompactMergeSettleMinWait != 2*time.Minute {
 		t.Fatalf("DefaultCompactMergeSettleMinWait = %s, want 2m", DefaultCompactMergeSettleMinWait)
+	}
+	if DefaultCompactOptimizeFinalAfter != 30*time.Second {
+		t.Fatalf("DefaultCompactOptimizeFinalAfter = %s, want 30s", DefaultCompactOptimizeFinalAfter)
 	}
 	if DefaultMergeSettleMinParts != 1 {
 		t.Fatalf("DefaultMergeSettleMinParts = %d, want 1", DefaultMergeSettleMinParts)

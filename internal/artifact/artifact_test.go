@@ -94,3 +94,26 @@ func TestWriteFinishedTarRejectsDuplicatePartNames(t *testing.T) {
 		t.Fatal("expected duplicate part name error")
 	}
 }
+
+func TestExtractFinishedTarRejectsExistingPartFiles(t *testing.T) {
+	root := t.TempDir()
+	part := filepath.Join(root, "parts", "all_1_1_0")
+	if err := os.MkdirAll(part, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(part, "checksums.txt"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tarPath := filepath.Join(root, "finished.tar")
+	if err := WriteFinishedTar(tarPath, []string{part}); err != nil {
+		t.Fatal(err)
+	}
+	extractRoot := filepath.Join(root, "extract")
+	if _, err := ExtractFinishedTar(tarPath, extractRoot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExtractFinishedTar(tarPath, extractRoot); err == nil {
+		t.Fatal("expected extracting over existing part files to fail")
+	}
+}

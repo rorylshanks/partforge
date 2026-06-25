@@ -169,7 +169,7 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact Fi
 	}
 	downloadElapsed := time.Since(downloadStartedAt)
 	slog.Info("downloaded finished artifact", "stage", "download_finished", "job_id", job.JobID, "part_id", artifact.PartID, "files", downloadStats.Files, "bytes", downloadStats.Bytes, "elapsed", downloadElapsed, "bytes_per_second", ratePerSecond(downloadStats.Bytes, downloadElapsed))
-	partNames, err := extractDownloadedFinishedTarballs(downloadRoot, extractRoot)
+	partNames, err := extractDownloadedFinishedTarballs(ctx, downloadRoot, extractRoot)
 	if err != nil {
 		return fmt.Errorf("extract downloaded finished parts s3://%s/%s: %w", artifact.Bucket, sourceKey, err)
 	}
@@ -204,7 +204,7 @@ func (i Importer) importArtifact(ctx context.Context, job ImportJob, artifact Fi
 	return nil
 }
 
-func extractDownloadedFinishedTarballs(root, extractRoot string) ([]string, error) {
+func extractDownloadedFinishedTarballs(ctx context.Context, root, extractRoot string) ([]string, error) {
 	tarballs, err := downloadedFinishedTarballs(root)
 	if err != nil {
 		return nil, err
@@ -212,7 +212,7 @@ func extractDownloadedFinishedTarballs(root, extractRoot string) ([]string, erro
 	partSeen := map[string]struct{}{}
 	var partNames []string
 	for _, tarball := range tarballs {
-		extracted, err := artifact.ExtractFinishedTar(filepath.Join(root, tarball), extractRoot)
+		extracted, err := artifact.ExtractFinishedTarContext(ctx, filepath.Join(root, tarball), extractRoot)
 		if err != nil {
 			return nil, fmt.Errorf("extract %s: %w", tarball, err)
 		}

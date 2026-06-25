@@ -2,7 +2,7 @@
 
 This document describes the current part rewrite procedure. Source rewrites produce compact-ready artifacts first. Workers then opportunistically compact those artifacts when no source rewrite work is ready, or finalize the remaining compact-ready artifacts after the configured compaction window.
 
-PartForge does not run `OPTIMIZE FINAL`; compaction relies on normal MergeTree background merges in local worker ClickHouse processes.
+Compaction primarily relies on normal MergeTree background merges in local worker ClickHouse processes. While the compactor is still waiting for merges, if a compact destination table has a stable multi-part output with no merge activity for 30 seconds, the compactor runs `OPTIMIZE TABLE ... PARTITION ID ... FINAL` once for each local destination partition that still has multiple active parts.
 
 ## Job-Level Flow
 
@@ -85,7 +85,10 @@ graph TD
     D -- Yes --> G{Active parts <= settle min?}
     G -- Yes --> H[Settled]
     G -- No --> I{Same part snapshot idle for settle min wait?}
-    I -- No --> E
+    I -- No --> J{Compactor optimize-final idle threshold reached?}
+    J -- Yes --> K[Run OPTIMIZE FINAL locally]
+    K --> A
+    J -- No --> E
     I -- Yes --> H
 ```
 
@@ -95,9 +98,9 @@ If the merge wait times out or merge-wait inspection fails, that is not a rewrit
 
 ## Worker Compaction
 
-When `worker -compact=true` finds no `READY` source part, it waits for a small derived random splay and then tries to claim `COMPACT_READY` artifacts for the same job, bucket, destination table, and destination schema. The claim picker is partition-aware: it only claims an initial batch when the selected artifacts have enough active parts in at least one shared destination partition, then fills that partition batch up to the configured artifact and byte limits. It does not count unrelated one-part partitions as compactable work. If other workers are already compacting some partitions for the same destination, the picker tries partitions that are not currently compacting first, then falls back to those busy partitions when no other compactable partition exists.
+When `worker -compact=true` finds no `READY` source part, it waits for a small derived random splay and then tries to claim `COMPACT_READY` artifacts for the same job, bucket, destination table, and destination schema. The claim picker is partition-aware: it only claims a partition when the selected artifacts have enough active parts in that destination partition, and it can add multiple eligible partitions to one batch until the configured artifact or byte limit is reached. It does not count unrelated one-part partitions as compactable work. If other workers are already compacting some partitions for the same destination, the picker tries partitions that are not currently compacting first, then falls back to those busy partitions when no other compactable partition exists.
 
-The compactor downloads and attaches the whole claimed batch before starting the merge wait. ClickHouse assigns attached part names, so the worker does not rename parts before attach. Compaction configures MergeTree merge settings, restarts the local ClickHouse with merge tuning, and lets normal background merges choose what to merge.
+The compactor downloads and attaches the whole claimed batch before starting the merge wait. ClickHouse assigns attached part names, so the worker does not rename parts before attach. Compaction configures MergeTree merge settings, restarts the local ClickHouse with merge tuning, and lets normal background merges choose what to merge. If the merge wait is still active and those merges sit idle for 30 seconds, the compactor finds local destination partitions with more than one active part, runs `OPTIMIZE FINAL` for those partition IDs only, and then resumes the same merge wait. If every partition already has at most one active part, the worker skips the optimize attempt for that stable snapshot.
 
 The compact output is uploaded only if the final active output part count is lower than the active input part count. If compaction does not reduce the count, the worker releases the inputs back to `COMPACT_READY`. The finalization window is measured from the newest current `COMPACT_READY` or `COMPACTING` timestamp. Successful compact outputs inherit the newest input compact-ready timestamp, so deeper compaction does not extend the job-level window automatically. A single artifact larger than `-compact-max-bytes` remains eligible when it already contains enough physical parts to compact; the byte cap only stops adding more artifacts to a batch.
 

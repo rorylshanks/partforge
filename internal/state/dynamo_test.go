@@ -303,7 +303,7 @@ func TestCompactStaleTimeUsesOldestLeaseTimestamp(t *testing.T) {
 	}
 }
 
-func TestSelectCompactBatchPartsRequiresSamePartition(t *testing.T) {
+func TestSelectCompactBatchPartsDoesNotCombineInsufficientPartitions(t *testing.T) {
 	selected := selectCompactBatchParts(compactGroup{parts: []Part{
 		{
 			PartID:                     "part-a",
@@ -325,6 +325,133 @@ func TestSelectCompactBatchPartsRequiresSamePartition(t *testing.T) {
 
 	if len(selected) != 0 {
 		t.Fatalf("selected = %+v, want no cross-partition batch", selected)
+	}
+}
+
+func TestSelectCompactBatchPartsFillsMultipleIdlePartitions(t *testing.T) {
+	selected := selectCompactBatchParts(compactGroup{parts: []Part{
+		{
+			PartID:                     "part-a1",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-a": 1,
+			},
+		},
+		{
+			PartID:                     "part-a2",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-a": 1,
+			},
+		},
+		{
+			PartID:                     "part-b1",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-b": 1,
+			},
+		},
+		{
+			PartID:                     "part-b2",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-b": 1,
+			},
+		},
+	}}, CompactClaimOptions{MinInputParts: 2, MaxArtifacts: 8})
+
+	if len(selected) != 4 ||
+		selected[0].PartID != "part-a1" ||
+		selected[1].PartID != "part-a2" ||
+		selected[2].PartID != "part-b1" ||
+		selected[3].PartID != "part-b2" {
+		t.Fatalf("selected = %+v, want both eligible partitions", selected)
+	}
+}
+
+func TestSelectCompactBatchPartsDoesNotPartiallyFillSecondPartitionAtMaxArtifacts(t *testing.T) {
+	selected := selectCompactBatchParts(compactGroup{parts: []Part{
+		{
+			PartID:                     "part-a1",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-a": 1,
+			},
+		},
+		{
+			PartID:                     "part-a2",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-a": 1,
+			},
+		},
+		{
+			PartID:                     "part-b1",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-b": 1,
+			},
+		},
+		{
+			PartID:                     "part-b2",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-b": 1,
+			},
+		},
+	}}, CompactClaimOptions{MinInputParts: 2, MaxArtifacts: 3})
+
+	if len(selected) != 2 || selected[0].PartID != "part-a1" || selected[1].PartID != "part-a2" {
+		t.Fatalf("selected = %+v, want only complete partition-a batch", selected)
+	}
+}
+
+func TestSelectCompactBatchPartsDoesNotPartiallyFillSecondPartitionAtMaxBytes(t *testing.T) {
+	selected := selectCompactBatchParts(compactGroup{parts: []Part{
+		{
+			PartID:                     "part-a1",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-a": 1,
+			},
+		},
+		{
+			PartID:                     "part-a2",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-a": 1,
+			},
+		},
+		{
+			PartID:                     "part-b1",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-b": 1,
+			},
+		},
+		{
+			PartID:                     "part-b2",
+			DestinationActivePartCount: 1,
+			DestinationActivePartBytes: 100,
+			DestinationActivePartitionCounts: map[string]uint64{
+				"partition-b": 1,
+			},
+		},
+	}}, CompactClaimOptions{MinInputParts: 2, MaxBytes: 350})
+
+	if len(selected) != 2 || selected[0].PartID != "part-a1" || selected[1].PartID != "part-a2" {
+		t.Fatalf("selected = %+v, want only complete partition-a batch", selected)
 	}
 }
 

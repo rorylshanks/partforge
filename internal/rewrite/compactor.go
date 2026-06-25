@@ -32,6 +32,7 @@ type Compactor struct {
 	MergeSettleMinWait  time.Duration
 	MergeSettleMinParts uint64
 	MergePollInterval   time.Duration
+	OptimizeFinalAfter  time.Duration
 	MergeTreeSettings   MergeTreeSettings
 	RestartClickHouse   func(context.Context) error
 	ReportProgress      CompactProgressReporter
@@ -110,6 +111,7 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		MergeSettleMinWait:  compactMergeSettleMinWait(c.MergeSettleMinWait),
 		MergeSettleMinParts: c.MergeSettleMinParts,
 		MergePollInterval:   c.MergePollInterval,
+		OptimizeFinalAfter:  compactOptimizeFinalAfter(c.OptimizeFinalAfter),
 		MergeTreeSettings:   c.MergeTreeSettings,
 		RestartClickHouse:   c.RestartClickHouse,
 	}
@@ -335,29 +337,43 @@ func (c Compactor) attachFinishedArtifact(ctx context.Context, item CompactWorkI
 	}
 	slog.Info("downloaded compact input artifact", "stage", "compact_download_input", "job_id", item.JobID, "output_part_id", item.OutputPartID, "input_part_id", input.PartID, "files", downloadStats.Files, "bytes", downloadStats.Bytes, "elapsed", time.Since(downloadStartedAt), "bytes_per_second", ratePerSecond(downloadStats.Bytes, time.Since(downloadStartedAt)))
 
-	partNames, err := extractFinishedTarballs(downloadRoot, extractRoot)
+	extractStartedAt := time.Now()
+	partNames, err := extractFinishedTarballs(ctx, downloadRoot, extractRoot)
 	if err != nil {
 		return metrics.PartStats{}, fmt.Errorf("extract compact input artifact s3://%s/%s: %w", input.Bucket, input.FinishedKey, err)
 	}
+	extractElapsed := time.Since(extractStartedAt)
+	slog.Info("extracted compact input artifact", "stage", "compact_extract_input", "job_id", item.JobID, "output_part_id", item.OutputPartID, "input_part_id", input.PartID, "parts", len(partNames), "bytes", downloadStats.Bytes, "elapsed", extractElapsed, "bytes_per_second", ratePerSecond(downloadStats.Bytes, extractElapsed))
 	if len(partNames) == 0 {
 		return metrics.PartStats{}, fmt.Errorf("compact input artifact s3://%s/%s contains no part tarballs", input.Bucket, input.FinishedKey)
 	}
+	attachStartedAt := time.Now()
 	for _, partName := range partNames {
+		partStartedAt := time.Now()
 		src := filepath.Join(extractRoot, partName)
 		dst := filepath.Join(detachedPath, partName)
+		partStats, err := fileutil.StatDir(src)
+		if err != nil {
+			return metrics.PartStats{}, fmt.Errorf("stat extracted compact input part %s: %w", partName, err)
+		}
 		if _, err := os.Stat(dst); err == nil {
 			return metrics.PartStats{}, fmt.Errorf("detached compact part destination already exists: %s", dst)
 		} else if !os.IsNotExist(err) {
 			return metrics.PartStats{}, err
 		}
+		moveStartedAt := time.Now()
 		if err := fileutil.MoveDir(src, dst); err != nil {
 			return metrics.PartStats{}, fmt.Errorf("move compact input part %s into detached directory: %w", partName, err)
 		}
+		moveElapsed := time.Since(moveStartedAt)
+		clickHouseStartedAt := time.Now()
 		if err := c.ClickHouse.Exec(ctx, "ALTER TABLE "+chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable)+" ATTACH PART "+chhttp.StringLiteral(partName)); err != nil {
 			return metrics.PartStats{}, fmt.Errorf("attach compact input part %s: %w", partName, err)
 		}
+		clickHouseElapsed := time.Since(clickHouseStartedAt)
+		slog.Info("attached compact input part", "stage", "compact_attach_input_part", "job_id", item.JobID, "output_part_id", item.OutputPartID, "input_part_id", input.PartID, "part", partName, "files", partStats.Files, "bytes", partStats.Bytes, "move_elapsed", moveElapsed, "clickhouse_attach_elapsed", clickHouseElapsed, "elapsed", time.Since(partStartedAt))
 	}
-	slog.Info("attached compact input artifact", "stage", "compact_attach_input", "job_id", item.JobID, "output_part_id", item.OutputPartID, "input_part_id", input.PartID, "parts", len(partNames))
+	slog.Info("attached compact input artifact", "stage", "compact_attach_input", "job_id", item.JobID, "output_part_id", item.OutputPartID, "input_part_id", input.PartID, "parts", len(partNames), "elapsed", time.Since(attachStartedAt))
 	return metrics.PartStats{Count: uint64(len(partNames)), Rows: input.Rows, Bytes: input.Bytes}, nil
 }
 
@@ -369,7 +385,7 @@ func addPartStats(left, right metrics.PartStats) metrics.PartStats {
 	}
 }
 
-func extractFinishedTarballs(root, extractRoot string) ([]string, error) {
+func extractFinishedTarballs(ctx context.Context, root, extractRoot string) ([]string, error) {
 	tarballs, err := finishedTarballs(root)
 	if err != nil {
 		return nil, err
@@ -377,7 +393,7 @@ func extractFinishedTarballs(root, extractRoot string) ([]string, error) {
 	partSeen := map[string]struct{}{}
 	var partNames []string
 	for _, tarball := range tarballs {
-		extracted, err := artifact.ExtractFinishedTar(filepath.Join(root, tarball), extractRoot)
+		extracted, err := artifact.ExtractFinishedTarContext(ctx, filepath.Join(root, tarball), extractRoot)
 		if err != nil {
 			return nil, fmt.Errorf("extract %s: %w", tarball, err)
 		}
@@ -445,6 +461,13 @@ func compactMergeMaxTimeout(timeout time.Duration) time.Duration {
 func compactMergeSettleMinWait(wait time.Duration) time.Duration {
 	if wait == 0 {
 		return DefaultCompactMergeSettleMinWait
+	}
+	return wait
+}
+
+func compactOptimizeFinalAfter(wait time.Duration) time.Duration {
+	if wait == 0 {
+		return DefaultCompactOptimizeFinalAfter
 	}
 	return wait
 }

@@ -887,14 +887,38 @@ func selectCompactBatchParts(group compactGroup, opts CompactClaimOptions) []Par
 	}
 	partitions := orderedCandidatePartitions(group.parts, opts.RequiredPartitionIDs)
 	preferredPartitions := partitionsWithout(partitions, group.compactingPartitionIDs)
-	orderedPartitions := append(preferredPartitions, partitionsWithout(partitions, preferredPartitions)...)
-	for _, partitionID := range orderedPartitions {
-		selected := selectCompactBatchPartsForPartition(group.parts, partitionID, minParts, opts)
-		if len(selected) > 0 {
-			return selected
+	selected, _, _ := selectCompactBatchPartsForPartitions(group.parts, preferredPartitions, minParts, opts, nil, nil, 0)
+	if len(selected) == 0 {
+		fallbackPartitions := partitionsWithout(partitions, preferredPartitions)
+		selected, _, _ = selectCompactBatchPartsForPartitions(group.parts, fallbackPartitions, minParts, opts, nil, nil, 0)
+		return selected
+	}
+	return selected
+}
+
+func selectCompactBatchPartsForPartitions(parts []Part, partitions []string, minParts uint64, opts CompactClaimOptions, selected []Part, selectedIDs map[string]struct{}, inputBytes uint64) ([]Part, map[string]struct{}, uint64) {
+	if selectedIDs == nil {
+		selectedIDs = map[string]struct{}{}
+		for _, part := range selected {
+			selectedIDs[part.PartID] = struct{}{}
+			inputBytes += part.DestinationActivePartBytes
 		}
 	}
-	return nil
+	for _, partitionID := range partitions {
+		additions, addedBytes := selectCompactBatchPartsForPartition(parts, partitionID, minParts, opts, selected, selectedIDs, inputBytes)
+		if len(additions) == 0 {
+			continue
+		}
+		for _, part := range additions {
+			selected = append(selected, part)
+			selectedIDs[part.PartID] = struct{}{}
+		}
+		inputBytes += addedBytes
+		if opts.MaxArtifacts > 0 && len(selected) >= opts.MaxArtifacts {
+			break
+		}
+	}
+	return selected, selectedIDs, inputBytes
 }
 
 func partitionsWithout(partitions, excluded []string) []string {
@@ -934,35 +958,44 @@ func orderedCandidatePartitions(parts []Part, required []string) []string {
 	return partitions
 }
 
-func selectCompactBatchPartsForPartition(parts []Part, partitionID string, minParts uint64, opts CompactClaimOptions) []Part {
-	var selected []Part
-	var inputParts, inputBytes uint64
+func selectCompactBatchPartsForPartition(parts []Part, partitionID string, minParts uint64, opts CompactClaimOptions, selected []Part, selectedIDs map[string]struct{}, inputBytes uint64) ([]Part, uint64) {
+	var additions []Part
+	var partitionInputParts, addedBytes uint64
+	for _, part := range selected {
+		partitionInputParts += part.DestinationActivePartitionCounts[partitionID]
+	}
+	if partitionInputParts >= minParts {
+		return nil, 0
+	}
 	appendCandidate := func(part Part) bool {
+		if _, ok := selectedIDs[part.PartID]; ok {
+			return false
+		}
 		partitionParts := part.DestinationActivePartitionCounts[partitionID]
 		if partitionParts == 0 {
 			return false
 		}
-		if opts.MaxArtifacts > 0 && len(selected) >= opts.MaxArtifacts {
+		if opts.MaxArtifacts > 0 && len(selected)+len(additions) >= opts.MaxArtifacts {
 			return true
 		}
 		partBytes := part.DestinationActivePartBytes
-		if opts.MaxBytes > 0 && inputBytes+partBytes > opts.MaxBytes && len(selected) > 0 {
+		if opts.MaxBytes > 0 && inputBytes+addedBytes+partBytes > opts.MaxBytes && len(selected)+len(additions) > 0 {
 			return true
 		}
-		selected = append(selected, part)
-		inputParts += partitionParts
-		inputBytes += partBytes
-		return opts.MaxArtifacts > 0 && len(selected) >= opts.MaxArtifacts
+		additions = append(additions, part)
+		partitionInputParts += partitionParts
+		addedBytes += partBytes
+		return opts.MaxArtifacts > 0 && len(selected)+len(additions) >= opts.MaxArtifacts
 	}
 	for _, part := range parts {
 		if appendCandidate(part) {
 			break
 		}
 	}
-	if inputParts >= minParts {
-		return selected
+	if partitionInputParts >= minParts {
+		return additions, addedBytes
 	}
-	return nil
+	return nil, 0
 }
 
 func partitionSet(partitionIDs []string) map[string]struct{} {

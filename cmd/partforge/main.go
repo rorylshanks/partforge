@@ -835,6 +835,7 @@ func runWorker(ctx context.Context, args []string) error {
 		"compact_merge_idle_timeout", *compactMergeIdleTimeout,
 		"compact_merge_max_runtime", *compactMergeMaxRuntime,
 		"compact_merge_settle_min_wait", derivedMergeSettleMinWait(*compactMergeIdleTimeout, rewrite.DefaultCompactMergeSettleMinWait),
+		"compact_optimize_final_after", rewrite.DefaultCompactOptimizeFinalAfter,
 		"compact_lease_stale_after", compactStaleAfter,
 		"compact_heartbeat_interval", compactHeartbeatInterval,
 		"compact_max_artifacts", defaultCompactMaxArtifacts,

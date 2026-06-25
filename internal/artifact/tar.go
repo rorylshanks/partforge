@@ -2,14 +2,18 @@ package artifact
 
 import (
 	"archive/tar"
+	"context"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 )
+
+const finishedTarCopyBufferSize = 4 * 1024 * 1024
 
 func WriteFinishedTar(tarPath string, partDirs []string) error {
 	if strings.TrimSpace(tarPath) == "" {
@@ -45,6 +49,7 @@ func WriteFinishedTar(tarPath string, partDirs []string) error {
 
 	tw := tar.NewWriter(tmp)
 	seen := map[string]struct{}{}
+	copyBuffer := make([]byte, finishedTarCopyBufferSize)
 	for _, partDir := range sortedDirs {
 		partName := filepath.Base(filepath.Clean(partDir))
 		if err := validateTarPartName(partName); err != nil {
@@ -58,7 +63,7 @@ func WriteFinishedTar(tarPath string, partDirs []string) error {
 			return fmt.Errorf("duplicate finished part directory %q", partName)
 		}
 		seen[partName] = struct{}{}
-		if err := writePartDirToTar(tw, partDir, partName); err != nil {
+		if err := writePartDirToTar(tw, partDir, partName, copyBuffer); err != nil {
 			_ = tw.Close()
 			_ = tmp.Close()
 			return err
@@ -79,12 +84,29 @@ func WriteFinishedTar(tarPath string, partDirs []string) error {
 }
 
 func ExtractFinishedTar(tarPath, destRoot string) ([]string, error) {
+	return ExtractFinishedTarContext(context.Background(), tarPath, destRoot)
+}
+
+func ExtractFinishedTarContext(ctx context.Context, tarPath, destRoot string) ([]string, error) {
 	if strings.TrimSpace(destRoot) == "" {
 		return nil, fmt.Errorf("finished tar extract destination is required")
 	}
 	if err := os.MkdirAll(destRoot, 0o755); err != nil {
 		return nil, err
 	}
+	partNames, err := validateFinishedTar(tarPath)
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.CommandContext(ctx, "tar", "--extract", "--file", tarPath, "--directory", destRoot, "--keep-old-files", "--no-same-owner")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("tar extract %s: %w: %s", tarPath, err, strings.TrimSpace(string(out)))
+	}
+	return partNames, nil
+}
+
+func validateFinishedTar(tarPath string) ([]string, error) {
 	f, err := os.Open(tarPath)
 	if err != nil {
 		return nil, err
@@ -101,35 +123,13 @@ func ExtractFinishedTar(tarPath, destRoot string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		name, partName, err := cleanFinishedTarEntryName(header.Name)
+		_, partName, err := cleanFinishedTarEntryName(header.Name)
 		if err != nil {
 			return nil, err
 		}
 		partNames[partName] = struct{}{}
-		target, err := finishedTarEntryTarget(destRoot, name)
-		if err != nil {
-			return nil, err
-		}
 		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, header.FileInfo().Mode().Perm()); err != nil {
-				return nil, err
-			}
-		case tar.TypeReg, tar.TypeRegA:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return nil, err
-			}
-			out, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, header.FileInfo().Mode().Perm())
-			if err != nil {
-				return nil, err
-			}
-			if _, err := io.Copy(out, tr); err != nil {
-				_ = out.Close()
-				return nil, err
-			}
-			if err := out.Close(); err != nil {
-				return nil, err
-			}
+		case tar.TypeDir, tar.TypeReg, tar.TypeRegA:
 		default:
 			return nil, fmt.Errorf("unsupported finished tar entry type %c for %s", header.Typeflag, header.Name)
 		}
@@ -143,7 +143,7 @@ func ExtractFinishedTar(tarPath, destRoot string) ([]string, error) {
 	return names, nil
 }
 
-func writePartDirToTar(tw *tar.Writer, partDir, partName string) error {
+func writePartDirToTar(tw *tar.Writer, partDir, partName string, copyBuffer []byte) error {
 	info, err := os.Stat(partDir)
 	if err != nil {
 		return err
@@ -188,7 +188,7 @@ func writePartDirToTar(tw *tar.Writer, partDir, partName string) error {
 		if err != nil {
 			return err
 		}
-		if _, err := io.Copy(tw, f); err != nil {
+		if _, err := io.CopyBuffer(tw, f, copyBuffer); err != nil {
 			_ = f.Close()
 			return err
 		}
@@ -215,18 +215,6 @@ func cleanFinishedTarEntryName(name string) (string, string, error) {
 		return "", "", err
 	}
 	return clean, partName, nil
-}
-
-func finishedTarEntryTarget(destRoot, name string) (string, error) {
-	target := filepath.Join(destRoot, filepath.FromSlash(name))
-	rel, err := filepath.Rel(destRoot, target)
-	if err != nil {
-		return "", err
-	}
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("finished tar entry escapes destination: %s", name)
-	}
-	return target, nil
 }
 
 func validateTarPartName(name string) error {
