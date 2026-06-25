@@ -301,6 +301,24 @@ func TestCompactHeartbeatTimeUsesUpdatedAt(t *testing.T) {
 	}
 }
 
+func TestCompactStaleTimeUsesOldestLeaseTimestamp(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	part := Part{
+		JobID:        "job-1",
+		PartID:       "part-1",
+		UpdatedAt:    formatTime(now),
+		CompactingAt: formatTime(now.Add(-2 * time.Hour)),
+	}
+	got, err := compactStaleTime(part)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := now.Add(-2 * time.Hour)
+	if !got.Equal(want) {
+		t.Fatalf("compactStaleTime = %s, want %s", got, want)
+	}
+}
+
 func TestSelectCompactBatchPartsRequiresSamePartition(t *testing.T) {
 	selected := selectCompactBatchParts(compactGroup{parts: []Part{
 		{

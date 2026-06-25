@@ -593,11 +593,11 @@ func (s *Store) ReleaseStaleCompactingParts(ctx context.Context, now time.Time, 
 	cutoff := now.Add(-staleAfter)
 	released := 0
 	for _, part := range parts {
-		heartbeatAt, err := compactHeartbeatTime(part)
+		staleAt, err := compactStaleTime(part)
 		if err != nil {
 			return released, err
 		}
-		if heartbeatAt.After(cutoff) {
+		if staleAt.After(cutoff) {
 			continue
 		}
 		ok, err := s.releaseStaleCompactingPart(ctx, part, cooldownUntil, now)
@@ -873,6 +873,26 @@ func compactHeartbeatTime(part Part) (time.Time, error) {
 		return t, nil
 	}
 	return time.Time{}, fmt.Errorf("compacting part %s/%s has no updated_at or compacting_at", part.JobID, part.PartID)
+}
+
+func compactStaleTime(part Part) (time.Time, error) {
+	var staleAt time.Time
+	for _, value := range []string{part.UpdatedAt, part.CompactingAt} {
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		t, err := time.Parse(timeFormat, value)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("parse compact stale time for part %s/%s: %w", part.JobID, part.PartID, err)
+		}
+		if staleAt.IsZero() || t.Before(staleAt) {
+			staleAt = t
+		}
+	}
+	if staleAt.IsZero() {
+		return time.Time{}, fmt.Errorf("compacting part %s/%s has no updated_at or compacting_at", part.JobID, part.PartID)
+	}
+	return staleAt, nil
 }
 
 func compactReadyAtForRelease(part Part, now time.Time) string {
