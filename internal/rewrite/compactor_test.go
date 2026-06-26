@@ -14,7 +14,7 @@ import (
 	"github.com/partforge/partforge/internal/metrics"
 )
 
-func TestConfigureCompactMergeSettingsDisablesVerticalMerges(t *testing.T) {
+func TestConfigureCompactMergeSettingsDoesNotSetVerticalMergeAlgorithm(t *testing.T) {
 	var queries []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -46,8 +46,8 @@ func TestConfigureCompactMergeSettingsDisablesVerticalMerges(t *testing.T) {
 	if len(queries) != 1 {
 		t.Fatalf("queries = %#v, want one query", queries)
 	}
-	if !strings.Contains(queries[0], "enable_vertical_merge_algorithm = 0") {
-		t.Fatalf("query = %q, want vertical merge disabled", queries[0])
+	if strings.Contains(queries[0], "enable_vertical_merge_algorithm") {
+		t.Fatalf("query = %q, want vertical merge algorithm unset", queries[0])
 	}
 }
 
@@ -81,6 +81,25 @@ func TestCompactorPhaseContextCancelsOnShutdown(t *testing.T) {
 	}
 	if !errors.Is(phaseCtx.Err(), context.Canceled) {
 		t.Fatalf("phase context error = %v, want context.Canceled", phaseCtx.Err())
+	}
+}
+
+func TestCompactMergeTimeoutUntil(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+
+	timeout, ok := compactMergeTimeoutUntil(time.Time{}, now)
+	if ok || timeout != 0 {
+		t.Fatalf("compactMergeTimeoutUntil without deadline = %s, %t; want 0, false", timeout, ok)
+	}
+
+	timeout, ok = compactMergeTimeoutUntil(now.Add(30*time.Minute), now)
+	if !ok || timeout != 30*time.Minute {
+		t.Fatalf("compactMergeTimeoutUntil future = %s, %t; want 30m, true", timeout, ok)
+	}
+
+	timeout, ok = compactMergeTimeoutUntil(now, now)
+	if !ok || timeout != 0 {
+		t.Fatalf("compactMergeTimeoutUntil elapsed = %s, %t; want 0, true", timeout, ok)
 	}
 }
 

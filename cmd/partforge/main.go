@@ -38,7 +38,7 @@ const defaultClickHouseURL = "http://127.0.0.1:8123"
 const defaultStateTable = "partforge"
 const defaultConfigPath = "/etc/partforge/config.json"
 const defaultClickHouseClientConfigPath = "/etc/clickhouse-client/config.xml"
-const defaultCompactWindow = 2 * time.Hour
+const defaultCompactWindow = 24 * time.Hour
 const defaultCompactMaxArtifacts = 8
 const defaultCompactMaxBytes uint64 = 300 * 1024 * 1024 * 1024
 const compactSourceMergeWaitCap = 5 * time.Minute
@@ -714,14 +714,14 @@ func runWorker(ctx context.Context, args []string) error {
 		mergeMaxRuntime         = fs.Duration("merge-max-runtime", rewrite.DefaultMergeMaxTimeout, "hard cap for a destination merge wait even while ClickHouse keeps making progress")
 		role                    = fs.String("role", string(workerRoleAll), "worker role: all, inserter, or compactor")
 		compact                 = fs.Bool("compact", true, "run opportunistic compaction for role=all workers")
-		compactWindow           = fs.Duration("compact-window", defaultCompactWindow, "how long COMPACT_READY artifacts remain eligible for compaction before being promoted to FINISHED; 0 finalizes as soon as no useful compaction is available")
-		compactMergeIdleTimeout = fs.Duration("compact-merge-idle-timeout", rewrite.DefaultCompactMergeTimeout, "how long compact destination merges may be idle before freezing current compact output")
-		compactMergeMaxRuntime  = fs.Duration("compact-merge-max-runtime", rewrite.DefaultCompactMergeMaxTimeout, "hard cap for a compact merge wait even while ClickHouse keeps making progress")
+		compactWindow           = fs.Duration("compact-window", defaultCompactWindow, "how long COMPACT_READY artifacts remain eligible for compaction before being promoted to FINISHED and the hard cap for claimed compact merge waits; 0 finalizes as soon as no useful compaction is available")
 		compactMaxBytes         = fs.Uint64("compact-max-bytes", defaultCompactMaxBytes, "maximum summed input bytes_on_disk for one compaction batch; 0 disables the byte cap")
 		metricsAddr             = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables metrics")
 		metricsPath             = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
 		stateProgressInterval   = fs.Duration("state-progress-interval", 15*time.Second, "how often to write live per-part progress heartbeats to DynamoDB; <=0 disables progress writes")
 	)
+	fs.Duration("compact-merge-idle-timeout", 0, "deprecated; ignored. Compact merge waits are capped by compact-window")
+	fs.Duration("compact-merge-max-runtime", 0, "deprecated; ignored. Compact merge waits are capped by compact-window")
 	fs.Duration("shutdown-grace-period", 0, "deprecated; ignored. Shutdown cancels active inserts immediately and interrupts compact merge waits")
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -751,12 +751,6 @@ func runWorker(ctx context.Context, args []string) error {
 	}
 	if *compactWindow < 0 {
 		return fmt.Errorf("compact-window must be non-negative, got %s", *compactWindow)
-	}
-	if *compactMergeIdleTimeout < 0 {
-		return fmt.Errorf("compact-merge-idle-timeout must be non-negative, got %s", *compactMergeIdleTimeout)
-	}
-	if *compactMergeMaxRuntime < 0 {
-		return fmt.Errorf("compact-merge-max-runtime must be non-negative, got %s", *compactMergeMaxRuntime)
 	}
 	slog.Info(
 		"worker started",
@@ -805,7 +799,7 @@ func runWorker(ctx context.Context, args []string) error {
 	}
 	sourceMergeIdleTimeout, sourceMergeMaxRuntime := sourceMergeWaitTimeouts(*mergeIdleTimeout, *mergeMaxRuntime, roleSettings.SourceMergeCompactCap)
 	sourceMergeSettleMinWait := derivedMergeSettleMinWait(sourceMergeIdleTimeout, rewrite.DefaultMergeSettleMinWait)
-	compactStaleAfter := compactLeaseStaleAfter(*compactMergeMaxRuntime)
+	compactStaleAfter := compactLeaseStaleAfter(*compactWindow)
 	compactHeartbeatInterval := compactLeaseHeartbeatInterval(compactStaleAfter)
 	slog.Info(
 		"configured clickhouse resource settings",
@@ -832,9 +826,8 @@ func runWorker(ctx context.Context, args []string) error {
 		"source_merge_compact_cap", compactSourceMergeWaitCap,
 		"compact_window", *compactWindow,
 		"compact_claim_splay_max", compactClaimSplayMax(*compactWindow),
-		"compact_merge_idle_timeout", *compactMergeIdleTimeout,
-		"compact_merge_max_runtime", *compactMergeMaxRuntime,
-		"compact_merge_settle_min_wait", derivedMergeSettleMinWait(*compactMergeIdleTimeout, rewrite.DefaultCompactMergeSettleMinWait),
+		"compact_merge_timeout", *compactWindow,
+		"compact_merge_settle_min_wait", rewrite.DefaultCompactMergeSettleMinWait,
 		"compact_optimize_final_after", rewrite.DefaultCompactOptimizeFinalAfter,
 		"compact_lease_stale_after", compactStaleAfter,
 		"compact_heartbeat_interval", compactHeartbeatInterval,
@@ -891,8 +884,6 @@ func runWorker(ctx context.Context, args []string) error {
 					MergeMaxBlockSizeBytes:   mergeTreeSettings.MergeMaxBlockSizeBytes,
 					MergeSelectingSleepMS:    mergeTreeSettings.MergeSelectingSleepMS,
 					CompactWindow:            *compactWindow,
-					CompactMergeIdleTimeout:  *compactMergeIdleTimeout,
-					CompactMergeMaxRuntime:   *compactMergeMaxRuntime,
 					CompactLeaseStaleAfter:   compactStaleAfter,
 					CompactHeartbeatInterval: compactHeartbeatInterval,
 					CompactMaxBytes:          *compactMaxBytes,
@@ -1146,8 +1137,6 @@ type workerCompactionConfig struct {
 	MergeMaxBlockSizeBytes   uint64
 	MergeSelectingSleepMS    uint64
 	CompactWindow            time.Duration
-	CompactMergeIdleTimeout  time.Duration
-	CompactMergeMaxRuntime   time.Duration
 	CompactLeaseStaleAfter   time.Duration
 	CompactHeartbeatInterval time.Duration
 	CompactMaxBytes          uint64
@@ -1251,9 +1240,32 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		DestinationSchema:   batch.Parts[0].DestinationSchema,
 		Inputs:              compactInputs(batch.Parts),
 	}
+	compactDeadline, err := compactBatchDeadline(batch.Parts, cfg.CompactWindow, time.Now().UTC())
+	if err != nil {
+		return true, err
+	}
+	if !compactDeadline.IsZero() && !time.Now().UTC().Before(compactDeadline) {
+		stateCtx, cancel := workerStateUpdateContext()
+		releaseErr := cfg.StateStore.ReleaseCompactBatch(stateCtx, currentBatch(), cfg.WorkerID, time.Now().UTC())
+		cancel()
+		if releaseErr != nil {
+			return true, releaseErr
+		}
+		slog.Info("compact window expired before compact batch started; released", "stage", "compact_window_expired", "job_id", batch.JobID, "output_part_id", outputPartID)
+		finalizeCtx, finalizeCancel := workerStateUpdateContext()
+		finalization, finalizeErr := finalizeCompactReadyJob(finalizeCtx, cfg.StateStore, batch.JobID, cfg.CompactWindow, time.Now().UTC())
+		finalizeCancel()
+		if finalizeErr != nil {
+			return true, finalizeErr
+		}
+		if finalization.Finalized > 0 {
+			slog.Info("finalized compact-ready artifacts after compact window expiration", "stage", "finalize_compact", "job_id", batch.JobID, "artifacts", finalization.Finalized)
+		}
+		return true, nil
+	}
 	processCtx, cancelProcess := context.WithCancel(context.Background())
 	heartbeatErrCh := startCompactHeartbeat(processCtx, cfg.StateStore, currentBatch, cfg.WorkerID, cfg.CompactHeartbeatInterval, cancelProcess)
-	result, cleanupCompact, err := processCompactBatch(processCtx, ctx, cfg, workItem, currentBatch)
+	result, cleanupCompact, err := processCompactBatch(processCtx, ctx, cfg, workItem, currentBatch, compactDeadline)
 	cleanupCompactNow := func() {
 		if cleanupCompact != nil {
 			cleanupCompact()
@@ -1352,7 +1364,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	return true, nil
 }
 
-func processCompactBatch(ctx, shutdownCtx context.Context, cfg workerCompactionConfig, item rewrite.CompactWorkItem, compactBatch func() state.CompactBatch) (rewrite.CompactResult, func(), error) {
+func processCompactBatch(ctx, shutdownCtx context.Context, cfg workerCompactionConfig, item rewrite.CompactWorkItem, compactBatch func() state.CompactBatch, compactDeadline time.Time) (rewrite.CompactResult, func(), error) {
 	cleanup := func() {}
 	runDirs, err := createWorkerRunDirs(cfg.WorkDir)
 	if err != nil {
@@ -1396,10 +1408,8 @@ func processCompactBatch(ctx, shutdownCtx context.Context, cfg workerCompactionC
 		S3Copy:              s3copy.Copier{Binary: cfg.S5cmdBinary, Endpoint: cfg.S3Endpoint},
 		ClickHouse:          ch,
 		WorkDir:             runDirs.Scratch,
-		MergeTimeout:        cfg.CompactMergeIdleTimeout,
-		MergeMaxTimeout:     cfg.CompactMergeMaxRuntime,
-		MergeSettleMinWait:  derivedMergeSettleMinWait(cfg.CompactMergeIdleTimeout, rewrite.DefaultCompactMergeSettleMinWait),
 		MergeSettleMinParts: rewrite.DefaultMergeSettleMinParts,
+		MergeDeadline:       compactDeadline,
 		MergeTreeSettings: rewrite.MergeTreeSettings{
 			MergeMaxBlockSize:       cfg.MergeMaxBlockSize,
 			MergeMaxBlockSizeBytes:  cfg.MergeMaxBlockSizeBytes,
@@ -1449,6 +1459,17 @@ func compactBatchPartIDs(parts []state.Part) []string {
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+func compactBatchDeadline(parts []state.Part, compactWindow time.Duration, now time.Time) (time.Time, error) {
+	if compactWindow <= 0 {
+		return time.Time{}, nil
+	}
+	deadline, ok, reason := compactFinalizeAfter(parts, compactWindow, now)
+	if !ok {
+		return time.Time{}, errors.New(reason)
+	}
+	return deadline, nil
 }
 
 func compactInputs(parts []state.Part) []rewrite.CompactInput {
@@ -1559,14 +1580,14 @@ func sourceMergeWaitTimeouts(idleTimeout, maxRuntime time.Duration, compactEnabl
 	return idleTimeout, maxRuntime
 }
 
-func compactLeaseStaleAfter(maxRuntime time.Duration) time.Duration {
-	if maxRuntime <= 0 {
-		maxRuntime = rewrite.DefaultCompactMergeMaxTimeout
-	}
-	if maxRuntime < 5*time.Minute {
+func compactLeaseStaleAfter(compactWindow time.Duration) time.Duration {
+	if compactWindow <= 0 {
 		return 5 * time.Minute
 	}
-	return maxRuntime
+	if compactWindow < 5*time.Minute {
+		return 5 * time.Minute
+	}
+	return compactWindow
 }
 
 func compactLeaseHeartbeatInterval(staleAfter time.Duration) time.Duration {

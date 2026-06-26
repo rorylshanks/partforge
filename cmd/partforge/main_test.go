@@ -20,6 +20,12 @@ import (
 	"github.com/partforge/partforge/internal/state"
 )
 
+func TestDefaultCompactWindow(t *testing.T) {
+	if defaultCompactWindow != 24*time.Hour {
+		t.Fatalf("defaultCompactWindow = %s, want 24h", defaultCompactWindow)
+	}
+}
+
 func TestSummarizeJob(t *testing.T) {
 	summary := summarizeJob("job-1", []state.Part{
 		{PartID: "part-1", Status: state.StatusImported, ReadRows: 10, ReadBytes: 100, WrittenRows: 9, WrittenBytes: 90, DestinationFailedMerges: 1},
@@ -911,7 +917,48 @@ func TestCompactOutputReadyAtUsesLatestInputReadyTime(t *testing.T) {
 	}
 }
 
-func TestCompactLeaseTimingDerivedFromRuntime(t *testing.T) {
+func TestCompactBatchDeadlineUsesCompactWindow(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	deadline, err := compactBatchDeadline([]state.Part{
+		{
+			PartID:         "part-1",
+			Status:         state.StatusCompacting,
+			CompactReadyAt: now.Add(-3 * time.Hour).Format(time.RFC3339Nano),
+			UpdatedAt:      now.Format(time.RFC3339Nano),
+		},
+		{
+			PartID:         "part-2",
+			Status:         state.StatusCompacting,
+			CompactReadyAt: now.Add(-30 * time.Minute).Format(time.RFC3339Nano),
+			UpdatedAt:      now.Format(time.RFC3339Nano),
+		},
+	}, 24*time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := now.Add(23*time.Hour + 30*time.Minute); !deadline.Equal(want) {
+		t.Fatalf("deadline = %s, want %s", deadline, want)
+	}
+}
+
+func TestCompactBatchDeadlineDisabledForZeroWindow(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	deadline, err := compactBatchDeadline([]state.Part{
+		{
+			PartID:         "part-1",
+			Status:         state.StatusCompacting,
+			CompactReadyAt: now.Add(-time.Hour).Format(time.RFC3339Nano),
+		},
+	}, 0, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !deadline.IsZero() {
+		t.Fatalf("deadline = %s, want zero", deadline)
+	}
+}
+
+func TestCompactLeaseTimingDerivedFromCompactWindow(t *testing.T) {
 	staleAfter := compactLeaseStaleAfter(2 * time.Hour)
 	if staleAfter != 2*time.Hour {
 		t.Fatalf("compactLeaseStaleAfter = %s, want 2h", staleAfter)
@@ -920,7 +967,10 @@ func TestCompactLeaseTimingDerivedFromRuntime(t *testing.T) {
 		t.Fatalf("compactLeaseHeartbeatInterval = %s, want 5m cap", got)
 	}
 	if got := compactLeaseStaleAfter(time.Minute); got != 5*time.Minute {
-		t.Fatalf("compactLeaseStaleAfter short runtime = %s, want 5m floor", got)
+		t.Fatalf("compactLeaseStaleAfter short window = %s, want 5m floor", got)
+	}
+	if got := compactLeaseStaleAfter(0); got != 5*time.Minute {
+		t.Fatalf("compactLeaseStaleAfter zero window = %s, want 5m floor", got)
 	}
 }
 

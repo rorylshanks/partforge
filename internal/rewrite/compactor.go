@@ -31,6 +31,7 @@ type Compactor struct {
 	MergeSettleMinWait  time.Duration
 	MergeSettleMinParts uint64
 	MergePollInterval   time.Duration
+	MergeDeadline       time.Time
 	OptimizeFinalAfter  time.Duration
 	MergeTreeSettings   MergeTreeSettings
 	RestartClickHouse   func(context.Context) error
@@ -177,11 +178,34 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 		Database: item.DestinationDatabase,
 		Table:    item.DestinationTable,
 	}
-	if _, err := p.waitForDestinationMerges(phaseCtx, m, nil, target, "compact"); err != nil {
-		if c.shutdownRequested() && errors.Is(err, context.Canceled) {
-			slog.Info("compact merge wait interrupted by shutdown; measuring current output", "stage", "shutdown", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable))
+	waitForMerges := true
+	waitCtx := phaseCtx
+	cancelWait := func() {}
+	deadlineActive := false
+	if mergeWaitTimeout, ok := compactMergeTimeoutUntil(c.MergeDeadline, time.Now()); ok {
+		deadlineActive = true
+		if mergeWaitTimeout <= 0 {
+			waitForMerges = false
+			slog.Info("compact merge deadline reached before destination merge wait; measuring current output", "stage", "compact_window_expired", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable), "deadline", c.MergeDeadline)
 		} else {
-			return CompactResult{}, err
+			p.MergeTimeout = mergeWaitTimeout
+			p.MergeMaxTimeout = mergeWaitTimeout
+			waitCtx, cancelWait = context.WithDeadline(phaseCtx, c.MergeDeadline)
+			slog.Info("using compact window as destination merge timeout", "stage", stageWaitMerges, "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", target.tableSQL(), "timeout", mergeWaitTimeout, "deadline", c.MergeDeadline)
+		}
+	}
+	if waitForMerges {
+		if _, err := p.waitForDestinationMerges(waitCtx, m, nil, target, "compact"); err != nil {
+			cancelWait()
+			if deadlineActive && errors.Is(err, context.DeadlineExceeded) {
+				slog.Info("compact merge deadline reached; measuring current output", "stage", "compact_window_expired", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable), "deadline", c.MergeDeadline)
+			} else if c.shutdownRequested() && errors.Is(err, context.Canceled) {
+				slog.Info("compact merge wait interrupted by shutdown; measuring current output", "stage", "shutdown", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable))
+			} else {
+				return CompactResult{}, err
+			}
+		} else {
+			cancelWait()
 		}
 	}
 	cancelPhase()
@@ -287,8 +311,7 @@ func (c Compactor) configureCompactMergeSettings(ctx context.Context, item Compa
 		", merge_max_block_size_bytes = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSizeBytes, 10) +
 		", merge_selecting_sleep_ms = " + strconv.FormatUint(mergeTreeSettings.MergeSelectingSleepMS, 10) +
 		", max_bytes_to_merge_at_max_space_in_pool = " + strconv.FormatUint(mergeBytes.MaxBytesAtMaxSpaceInPool, 10) +
-		", max_bytes_to_merge_at_min_space_in_pool = " + strconv.FormatUint(mergeBytes.MaxBytesAtMinSpaceInPool, 10) +
-		", enable_vertical_merge_algorithm = 0"
+		", max_bytes_to_merge_at_min_space_in_pool = " + strconv.FormatUint(mergeBytes.MaxBytesAtMinSpaceInPool, 10)
 	if err := c.ClickHouse.Exec(ctx, query); err != nil {
 		return fmt.Errorf("configure compact destination table merge settings: %w", err)
 	}
@@ -304,7 +327,6 @@ func (c Compactor) configureCompactMergeSettings(ctx context.Context, item Compa
 		"destination_active_bytes_on_disk", activeBytes,
 		"max_bytes_to_merge_at_max_space_in_pool", mergeBytes.MaxBytesAtMaxSpaceInPool,
 		"max_bytes_to_merge_at_min_space_in_pool", mergeBytes.MaxBytesAtMinSpaceInPool,
-		"enable_vertical_merge_algorithm", false,
 	)
 	return nil
 }
@@ -395,6 +417,16 @@ func compactMergeMaxTimeout(timeout time.Duration) time.Duration {
 		return DefaultCompactMergeMaxTimeout
 	}
 	return timeout
+}
+
+func compactMergeTimeoutUntil(deadline, now time.Time) (time.Duration, bool) {
+	if deadline.IsZero() {
+		return 0, false
+	}
+	if !now.Before(deadline) {
+		return 0, true
+	}
+	return deadline.Sub(now), true
 }
 
 func compactMergeSettleMinWait(wait time.Duration) time.Duration {
