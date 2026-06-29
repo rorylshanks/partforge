@@ -103,6 +103,28 @@ func TestCompactMergeTimeoutUntil(t *testing.T) {
 	}
 }
 
+func TestCompactMergeTimeoutsForDeadlineKeepsIdleTimeout(t *testing.T) {
+	timeout, maxTimeout := compactMergeTimeoutsForDeadline(15*time.Minute, 24*time.Hour, 2*time.Hour)
+
+	if timeout != 15*time.Minute {
+		t.Fatalf("timeout = %s, want compact idle timeout", timeout)
+	}
+	if maxTimeout != 2*time.Hour {
+		t.Fatalf("max timeout = %s, want compact window deadline", maxTimeout)
+	}
+}
+
+func TestCompactMergeTimeoutsForDeadlineCapsIdleTimeout(t *testing.T) {
+	timeout, maxTimeout := compactMergeTimeoutsForDeadline(15*time.Minute, 24*time.Hour, time.Minute)
+
+	if timeout != time.Minute {
+		t.Fatalf("timeout = %s, want remaining deadline", timeout)
+	}
+	if maxTimeout != time.Minute {
+		t.Fatalf("max timeout = %s, want remaining deadline", maxTimeout)
+	}
+}
+
 func TestAddPartStats(t *testing.T) {
 	got := addPartStats(
 		metrics.PartStats{Count: 1, Rows: 2, Bytes: 3},

@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -153,6 +154,8 @@ func run() error {
 		return runRetryFailed(ctx, os.Args[2:])
 	case "set-part-state":
 		return runSetPartState(ctx, os.Args[2:])
+	case "finalize-compaction", "finalise-compaction":
+		return runFinalizeCompaction(ctx, os.Args[2:])
 	case "reset-compact-timer":
 		return runResetCompactTimer(ctx, os.Args[2:])
 	case "reset-job":
@@ -184,6 +187,7 @@ func usage() {
   partforge job-status      [flags]
   partforge retry-failed    [flags]
   partforge set-part-state  [flags]
+  partforge finalize-compaction [flags]
   partforge reset-compact-timer [flags]
   partforge reset-job       [flags]
   partforge reset-compaction [flags]
@@ -198,6 +202,7 @@ Commands:
   job-status        Show part state counts, progress, and failed part errors for one job.
   retry-failed      Move failed parts back to their retryable state.
   set-part-state    Force selected part rows into a stable state for admin recovery.
+  finalize-compaction Request compacting workers to save and finish current useful output.
   reset-compact-timer Restart selected compact rows' compact-window timer.
   reset-job         Delete generated compact rows and move original job parts back to READY.
   reset-compaction  Delete generated compact rows and move original rewritten parts back to COMPACT_READY.
@@ -722,6 +727,7 @@ func runWorker(ctx context.Context, args []string) error {
 		compact                   = fs.Bool("compact", true, "run opportunistic compaction for role=all workers")
 		compactWindow             = fs.Duration("compact-window", defaultCompactWindow, "how long COMPACT_READY artifacts remain eligible for compaction before being promoted to FINISHED and the hard cap for claimed compact merge waits; 0 finalizes as soon as no useful compaction is available")
 		compactOptimizeFinalAfter = fs.Duration("compact-optimize-final-after", rewrite.DefaultCompactOptimizeFinalAfter, "how long compaction waits with mergeable idle parts before running OPTIMIZE FINAL; 0 uses the default")
+		compactMaxArtifacts       = fs.Int("compact-max-artifacts", defaultCompactMaxArtifacts, "maximum input artifacts for one compaction batch")
 		compactMaxBytes           = fs.Uint64("compact-max-bytes", defaultCompactMaxBytes, "maximum summed input bytes_on_disk for one compaction batch; 0 disables the byte cap")
 		metricsAddr               = fs.String("metrics-addr", ":2112", "Prometheus metrics listen address; empty disables metrics")
 		metricsPath               = fs.String("metrics-path", "/metrics", "Prometheus metrics HTTP path")
@@ -764,6 +770,9 @@ func runWorker(ctx context.Context, args []string) error {
 	}
 	if *compactOptimizeFinalAfter < 0 {
 		return fmt.Errorf("compact-optimize-final-after must be non-negative, got %s", *compactOptimizeFinalAfter)
+	}
+	if *compactMaxArtifacts < 1 || *compactMaxArtifacts > state.MaxCompactBatchParts {
+		return fmt.Errorf("compact-max-artifacts must be between 1 and %d, got %d", state.MaxCompactBatchParts, *compactMaxArtifacts)
 	}
 	if *clickHouseScrapeTimeout <= 0 {
 		return fmt.Errorf("clickhouse-prometheus-scrape-timeout must be greater than zero, got %s", *clickHouseScrapeTimeout)
@@ -862,12 +871,13 @@ func runWorker(ctx context.Context, args []string) error {
 		"source_merge_compact_cap", compactSourceMergeWaitCap,
 		"compact_window", *compactWindow,
 		"compact_claim_splay_max", compactClaimSplayMax(*compactWindow),
-		"compact_merge_timeout", *compactWindow,
+		"compact_merge_timeout", rewrite.DefaultCompactMergeTimeout,
+		"compact_merge_max_timeout", *compactWindow,
 		"compact_merge_settle_min_wait", rewrite.DefaultCompactMergeSettleMinWait,
 		"compact_optimize_final_after", effectiveCompactOptimizeFinalAfter,
 		"compact_lease_stale_after", compactStaleAfter,
 		"compact_heartbeat_interval", compactHeartbeatInterval,
-		"compact_max_artifacts", defaultCompactMaxArtifacts,
+		"compact_max_artifacts", *compactMaxArtifacts,
 		"compact_max_bytes", *compactMaxBytes,
 		"compact_min_input_parts", compactMinInputParts,
 		"clickhouse_prometheus_enabled", clickHousePrometheusConfig.Enabled,
@@ -933,6 +943,7 @@ func runWorker(ctx context.Context, args []string) error {
 					CompactOptimizeFinalAfter:  effectiveCompactOptimizeFinalAfter,
 					CompactLeaseStaleAfter:     compactStaleAfter,
 					CompactHeartbeatInterval:   compactHeartbeatInterval,
+					CompactMaxArtifacts:        *compactMaxArtifacts,
 					CompactMaxBytes:            *compactMaxBytes,
 					Metrics:                    recorder,
 					PrometheusMetrics:          prometheusMetrics,
@@ -1206,6 +1217,7 @@ type workerCompactionConfig struct {
 	CompactOptimizeFinalAfter  time.Duration
 	CompactLeaseStaleAfter     time.Duration
 	CompactHeartbeatInterval   time.Duration
+	CompactMaxArtifacts        int
 	CompactMaxBytes            uint64
 	Metrics                    metrics.Recorder
 	PrometheusMetrics          *metrics.Prometheus
@@ -1256,7 +1268,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	}
 	slog.Info("claiming compact-ready batch", "stage", "claim_compact", "worker_id", cfg.WorkerID)
 	batch, err := cfg.StateStore.ClaimNextCompactBatch(ctx, cfg.WorkerID, time.Now().UTC(), state.CompactClaimOptions{
-		MaxArtifacts:   defaultCompactMaxArtifacts,
+		MaxArtifacts:   cfg.CompactMaxArtifacts,
 		MaxBytes:       cfg.CompactMaxBytes,
 		MinInputParts:  compactMinInputParts,
 		ExcludedJobIDs: finalization.ExpiredJobIDs,
@@ -1336,13 +1348,18 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		return true, nil
 	}
 	processCtx, cancelProcess := context.WithCancel(context.Background())
-	heartbeatErrCh := startCompactHeartbeat(processCtx, cfg.StateStore, currentBatch, cfg.WorkerID, cfg.CompactHeartbeatInterval, cancelProcess)
+	manualFinalizeCtx, requestManualFinalize := context.WithCancel(context.Background())
+	var manualFinalizeRequested atomic.Bool
+	heartbeatErrCh := startCompactHeartbeat(processCtx, cfg.StateStore, currentBatch, cfg.WorkerID, cfg.CompactHeartbeatInterval, cancelProcess, func() {
+		manualFinalizeRequested.Store(true)
+		requestManualFinalize()
+	})
 	cfg.Metrics.CompactionStarted(batch.JobID, outputPartID, uint64(len(batch.Parts)), metrics.PartStats{
 		Count: batch.InputPartCount,
 		Rows:  batch.InputRows,
 		Bytes: batch.InputBytes,
 	})
-	result, cleanupCompact, err := processCompactBatch(processCtx, ctx, cfg, workItem, currentBatch, compactDeadline)
+	result, cleanupCompact, err := processCompactBatch(processCtx, ctx, manualFinalizeCtx, cfg, workItem, currentBatch, compactDeadline)
 	cleanupCompactNow := func() {
 		if cleanupCompact != nil {
 			cleanupCompact()
@@ -1435,8 +1452,19 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 		cleanupCompactNow()
 		return true, err
 	}
+	if manualFinalizeRequested.Load() {
+		output.Status = state.StatusCompactReady
+		stateCtx, cancel := workerStateUpdateContext()
+		err = cfg.StateStore.MarkCompactReadyFinished(stateCtx, output, time.Now().UTC())
+		cancel()
+		if err != nil {
+			cleanupCompactNow()
+			return true, err
+		}
+		output.Status = state.StatusFinished
+	}
 	cfg.Metrics.CompactionCompleted(batch.JobID, outputPartID, result.InputStats, result.DestinationStats)
-	slog.Info("completed compact batch", "stage", "complete_compact", "job_id", batch.JobID, "output_part_id", outputPartID, "finished_key", outputFinishedKey, "input_artifacts", len(batch.Parts), "input_parts", result.InputStats.Count, "output_parts", result.DestinationStats.Count, "output_bytes", result.DestinationStats.Bytes)
+	slog.Info("completed compact batch", "stage", "complete_compact", "job_id", batch.JobID, "output_part_id", outputPartID, "finished_key", outputFinishedKey, "input_artifacts", len(batch.Parts), "input_parts", result.InputStats.Count, "output_parts", result.DestinationStats.Count, "output_bytes", result.DestinationStats.Bytes, "manual_finalize", manualFinalizeRequested.Load())
 	if shutdownRequested {
 		slog.Info("worker shutdown requested; stopping after completed compaction", "stage", "shutdown", "job_id", batch.JobID, "output_part_id", outputPartID)
 	}
@@ -1444,7 +1472,7 @@ func runWorkerCompaction(ctx context.Context, cfg workerCompactionConfig) (bool,
 	return true, nil
 }
 
-func processCompactBatch(ctx, shutdownCtx context.Context, cfg workerCompactionConfig, item rewrite.CompactWorkItem, compactBatch func() state.CompactBatch, compactDeadline time.Time) (rewrite.CompactResult, func(), error) {
+func processCompactBatch(ctx, shutdownCtx, manualFinalizeCtx context.Context, cfg workerCompactionConfig, item rewrite.CompactWorkItem, compactBatch func() state.CompactBatch, compactDeadline time.Time) (rewrite.CompactResult, func(), error) {
 	cleanup := func() {}
 	runDirs, err := createWorkerRunDirs(cfg.WorkDir)
 	if err != nil {
@@ -1510,7 +1538,8 @@ func processCompactBatch(ctx, shutdownCtx context.Context, cfg workerCompactionC
 			MergeSelectingSleepMS:   cfg.MergeSelectingSleepMS,
 			DefaultCompressionCodec: cfg.DefaultCompressionCodec,
 		},
-		ShutdownContext: shutdownCtx,
+		ShutdownContext:  shutdownCtx,
+		MergeStopContext: manualFinalizeCtx,
 	}
 	compactor.ReportProgress = func(ctx context.Context, item rewrite.CompactWorkItem, snapshot rewrite.CompactProgressSnapshot) error {
 		cfg.Metrics.SetCompactPartStats("input", item.JobID, item.OutputPartID, snapshot.InputStats)
@@ -2330,6 +2359,98 @@ func runSetPartState(ctx context.Context, args []string) error {
 	return nil
 }
 
+func runFinalizeCompaction(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("finalize-compaction", flag.ExitOnError)
+	var (
+		configPath     = fs.String("config", defaultConfigPath, "JSON config file path")
+		jobID          = fs.String("job-id", "", "job id containing compacting parts")
+		partIDs        partIDListFlag
+		outputPartID   = fs.String("output-part-id", "", "compact output part id from worker logs or compact progress")
+		all            = fs.Bool("all", false, "request finalization for all COMPACTING rows in the job")
+		force          = fs.Bool("force", false, "required to request compaction finalization")
+		stateTable     = fs.String("state-table", defaultStateTable, "DynamoDB state table")
+		region         = fs.String("aws-region", "", "AWS region for DynamoDB; empty resolves from AWS config, IMDS, then us-east-1")
+		dynamoEndpoint = fs.String("dynamodb-endpoint", "", "optional DynamoDB endpoint, e.g. LocalStack")
+		jsonOutput     = fs.Bool("json", false, "print JSON output")
+	)
+	fs.Var(&partIDs, "part-id", "specific COMPACTING state part id to finalize; may be repeated")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if err := applyConfigDefaults(fs, *configPath, "finalize-compaction"); err != nil {
+		return err
+	}
+	if *jobID == "" {
+		return errors.New("job-id is required")
+	}
+	if !*force {
+		return errors.New("finalize-compaction requires -force")
+	}
+	selectors := 0
+	if *all {
+		selectors++
+	}
+	if len(partIDs) > 0 {
+		selectors++
+	}
+	if strings.TrimSpace(*outputPartID) != "" {
+		selectors++
+	}
+	if selectors != 1 {
+		return errors.New("exactly one of -all, -part-id, or -output-part-id is required")
+	}
+
+	stateStore, err := state.New(ctx, state.Config{
+		Region:   *region,
+		Endpoint: *dynamoEndpoint,
+		Table:    *stateTable,
+	})
+	if err != nil {
+		return err
+	}
+	jobParts, err := stateStore.ListJobParts(ctx, *jobID)
+	if err != nil {
+		return err
+	}
+	selectedParts, err := selectFinalizeCompactionParts(jobParts, finalizeCompactionSelection{
+		All:          *all,
+		PartIDs:      []string(partIDs),
+		OutputPartID: *outputPartID,
+	})
+	if err != nil {
+		return err
+	}
+	if len(selectedParts) == 0 {
+		return fmt.Errorf("no COMPACTING parts matched finalize-compaction selection for job %s", *jobID)
+	}
+
+	now := time.Now().UTC()
+	rows := make([]finalizeCompactionPartRow, 0, len(selectedParts))
+	for _, part := range selectedParts {
+		if err := stateStore.RequestCompactFinalization(ctx, part, now); err != nil {
+			return err
+		}
+		rows = append(rows, finalizeCompactionPartRow{
+			PartID:       part.PartID,
+			WorkerID:     part.WorkerID,
+			OutputPartID: part.CompactOutputPartID,
+			RequestedAt:  now.Format(time.RFC3339Nano),
+		})
+	}
+
+	out := finalizeCompactionOutput{
+		JobID:       *jobID,
+		RequestedAt: now.Format(time.RFC3339Nano),
+		Requested:   len(rows),
+		Parts:       rows,
+	}
+	if *jsonOutput {
+		return writeJSON(os.Stdout, out)
+	}
+	printFinalizeCompactionResult(os.Stdout, out)
+	return nil
+}
+
 func runResetCompactTimer(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("reset-compact-timer", flag.ExitOnError)
 	var (
@@ -3002,7 +3123,7 @@ func workerStateUpdateContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), workerStateUpdateTimeout)
 }
 
-func startCompactHeartbeat(ctx context.Context, store *state.Store, batch func() state.CompactBatch, workerID string, interval time.Duration, cancelProcess context.CancelFunc) <-chan error {
+func startCompactHeartbeat(ctx context.Context, store *state.Store, batch func() state.CompactBatch, workerID string, interval time.Duration, cancelProcess context.CancelFunc, requestFinalize func()) <-chan error {
 	errCh := make(chan error, 1)
 	if interval <= 0 {
 		close(errCh)
@@ -3012,18 +3133,25 @@ func startCompactHeartbeat(ctx context.Context, store *state.Store, batch func()
 	go func() {
 		defer ticker.Stop()
 		defer close(errCh)
+		finalizeRequested := false
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
 				stateCtx, cancel := workerStateUpdateContext()
-				err := store.HeartbeatCompactBatch(stateCtx, batch(), workerID, time.Now().UTC())
+				requested, err := store.HeartbeatCompactBatch(stateCtx, batch(), workerID, time.Now().UTC())
 				cancel()
 				if err != nil {
 					errCh <- err
 					cancelProcess()
 					return
+				}
+				if requested && !finalizeRequested {
+					finalizeRequested = true
+					if requestFinalize != nil {
+						requestFinalize()
+					}
 				}
 			}
 		}
@@ -3182,6 +3310,20 @@ type setPartStateResult struct {
 	PartID string `json:"part_id"`
 	From   string `json:"from"`
 	To     string `json:"to"`
+}
+
+type finalizeCompactionOutput struct {
+	JobID       string                      `json:"job_id"`
+	RequestedAt string                      `json:"requested_at"`
+	Requested   int                         `json:"requested"`
+	Parts       []finalizeCompactionPartRow `json:"parts"`
+}
+
+type finalizeCompactionPartRow struct {
+	PartID       string `json:"part_id"`
+	WorkerID     string `json:"worker_id,omitempty"`
+	OutputPartID string `json:"output_part_id,omitempty"`
+	RequestedAt  string `json:"requested_at"`
 }
 
 type resetCompactTimerOutput struct {
@@ -3852,6 +3994,12 @@ type setPartStateSelection struct {
 	Status  state.Status
 }
 
+type finalizeCompactionSelection struct {
+	All          bool
+	PartIDs      []string
+	OutputPartID string
+}
+
 type partIDListFlag []string
 
 func (f *partIDListFlag) String() string {
@@ -3906,6 +4054,41 @@ func selectSetPartStateParts(parts []state.Part, selection setPartStateSelection
 		return selected, nil
 	}
 	return nil, errors.New("set-part-state selection is empty")
+}
+
+func selectFinalizeCompactionParts(parts []state.Part, selection finalizeCompactionSelection) ([]state.Part, error) {
+	if selection.All {
+		selected := make([]state.Part, 0)
+		for _, part := range parts {
+			if part.Status == state.StatusCompacting {
+				selected = append(selected, part)
+			}
+		}
+		return selected, nil
+	}
+	if len(selection.PartIDs) > 0 {
+		selected, err := selectDeletePartsByID(parts, selection.PartIDs)
+		if err != nil {
+			return nil, err
+		}
+		for _, part := range selected {
+			if part.Status != state.StatusCompacting {
+				return nil, fmt.Errorf("part %s is %s, expected %s", part.PartID, part.Status, state.StatusCompacting)
+			}
+		}
+		return selected, nil
+	}
+	outputPartID := strings.TrimSpace(selection.OutputPartID)
+	if outputPartID != "" {
+		selected := make([]state.Part, 0)
+		for _, part := range parts {
+			if part.Status == state.StatusCompacting && part.CompactOutputPartID == outputPartID {
+				selected = append(selected, part)
+			}
+		}
+		return selected, nil
+	}
+	return nil, errors.New("finalize-compaction selection is empty")
 }
 
 func selectDeletePartsByID(parts []state.Part, partIDs []string) ([]state.Part, error) {
@@ -4309,6 +4492,21 @@ func printSetPartStateResult(out *os.File, result setPartStateOutput) {
 	fmt.Fprintln(tw, "\nPART_ID\tFROM\tTO")
 	for _, part := range result.Parts {
 		fmt.Fprintf(tw, "%s\t%s\t%s\n", part.PartID, part.From, part.To)
+	}
+	_ = tw.Flush()
+}
+
+func printFinalizeCompactionResult(out *os.File, result finalizeCompactionOutput) {
+	fmt.Fprintf(out, "job_id: %s\n", result.JobID)
+	fmt.Fprintf(out, "requested_at: %s\n", result.RequestedAt)
+	fmt.Fprintf(out, "requested: %d\n", result.Requested)
+	if len(result.Parts) == 0 {
+		return
+	}
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "\nPART_ID\tWORKER\tOUTPUT_PART_ID\tREQUESTED_AT")
+	for _, part := range result.Parts {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", part.PartID, part.WorkerID, part.OutputPartID, part.RequestedAt)
 	}
 	_ = tw.Flush()
 }

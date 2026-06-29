@@ -37,6 +37,7 @@ type Compactor struct {
 	RestartClickHouse   func(context.Context) error
 	ReportProgress      CompactProgressReporter
 	ShutdownContext     context.Context
+	MergeStopContext    context.Context
 }
 
 type CompactInput struct {
@@ -186,16 +187,15 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 			waitForMerges = false
 			slog.Info("compact merge deadline reached before destination merge wait; measuring current output", "stage", "compact_window_expired", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable), "deadline", c.MergeDeadline)
 		} else {
-			p.MergeTimeout = mergeWaitTimeout
-			p.MergeMaxTimeout = mergeWaitTimeout
-			slog.Info("using compact window as destination merge timeout", "stage", stageWaitMerges, "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", target.tableSQL(), "timeout", mergeWaitTimeout, "deadline", c.MergeDeadline)
+			p.MergeTimeout, p.MergeMaxTimeout = compactMergeTimeoutsForDeadline(p.MergeTimeout, p.MergeMaxTimeout, mergeWaitTimeout)
+			slog.Info("using compact window as destination merge max timeout", "stage", stageWaitMerges, "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", target.tableSQL(), "timeout", p.MergeTimeout, "max_timeout", p.MergeMaxTimeout, "deadline", c.MergeDeadline)
 		}
 	}
 	if waitForMerges {
-		waitCtx := phaseCtx
+		waitCtx := c.mergeWaitContext(phaseCtx)
 		cancelWait := func() {}
 		if deadlineActive {
-			waitCtx, cancelWait = context.WithDeadline(phaseCtx, c.MergeDeadline)
+			waitCtx, cancelWait = context.WithDeadline(waitCtx, c.MergeDeadline)
 		}
 		err := func() error {
 			defer cancelWait()
@@ -207,6 +207,8 @@ func (c Compactor) Compact(ctx context.Context, item CompactWorkItem) (CompactRe
 				slog.Info("compact merge deadline reached; measuring current output", "stage", "compact_window_expired", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable), "deadline", c.MergeDeadline)
 			} else if c.shutdownRequested() && errors.Is(err, context.Canceled) {
 				slog.Info("compact merge wait interrupted by shutdown; measuring current output", "stage", "shutdown", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable))
+			} else if c.mergeStopRequested() && errors.Is(err, context.Canceled) {
+				slog.Info("compact merge wait manually finalized; measuring current output", "stage", "manual_finalize_compact", "job_id", item.JobID, "part_id", item.OutputPartID, "destination_table", chhttp.TableSQL(item.DestinationDatabase, item.DestinationTable))
 			} else {
 				return CompactResult{}, err
 			}
@@ -269,8 +271,27 @@ func (c Compactor) phaseContext(ctx context.Context) (context.Context, context.C
 	return phaseCtx, cancel
 }
 
+func (c Compactor) mergeWaitContext(ctx context.Context) context.Context {
+	if c.MergeStopContext == nil {
+		return ctx
+	}
+	waitCtx, cancel := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-c.MergeStopContext.Done():
+			cancel()
+		case <-waitCtx.Done():
+		}
+	}()
+	return waitCtx
+}
+
 func (c Compactor) shutdownRequested() bool {
 	return c.ShutdownContext != nil && c.ShutdownContext.Err() != nil
+}
+
+func (c Compactor) mergeStopRequested() bool {
+	return c.MergeStopContext != nil && c.MergeStopContext.Err() != nil
 }
 
 func (c Compactor) reportProgress(ctx context.Context, item CompactWorkItem, snapshot CompactProgressSnapshot) error {
@@ -431,6 +452,17 @@ func compactMergeTimeoutUntil(deadline, now time.Time) (time.Duration, bool) {
 		return 0, true
 	}
 	return deadline.Sub(now), true
+}
+
+func compactMergeTimeoutsForDeadline(timeout, maxTimeout, remaining time.Duration) (time.Duration, time.Duration) {
+	if remaining < 0 {
+		remaining = 0
+	}
+	maxTimeout = remaining
+	if timeout > maxTimeout {
+		timeout = maxTimeout
+	}
+	return timeout, maxTimeout
 }
 
 func compactMergeSettleMinWait(wait time.Duration) time.Duration {

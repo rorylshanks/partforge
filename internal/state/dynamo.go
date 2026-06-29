@@ -28,6 +28,8 @@ const (
 	StatusImported     Status = "IMPORTED"
 	StatusFailed       Status = "FAILED"
 
+	MaxCompactBatchParts = 99
+
 	readyIndexName = "gsi1"
 	timeFormat     = "2006-01-02T15:04:05.000000000Z"
 	defaultRegion  = "us-east-1"
@@ -79,14 +81,15 @@ type Part struct {
 	CompactCooldownUntil string   `dynamodbav:"compact_cooldown_until,omitempty"`
 	SupersededBy         string   `dynamodbav:"superseded_by,omitempty"`
 
-	CompactOutputPartID    string `dynamodbav:"compact_output_part_id,omitempty"`
-	CompactProgressAt      string `dynamodbav:"compact_progress_at,omitempty"`
-	CompactInputPartCount  uint64 `dynamodbav:"compact_input_part_count,omitempty"`
-	CompactInputRows       uint64 `dynamodbav:"compact_input_rows,omitempty"`
-	CompactInputBytes      uint64 `dynamodbav:"compact_input_bytes,omitempty"`
-	CompactOutputPartCount uint64 `dynamodbav:"compact_output_part_count,omitempty"`
-	CompactOutputRows      uint64 `dynamodbav:"compact_output_rows,omitempty"`
-	CompactOutputBytes     uint64 `dynamodbav:"compact_output_bytes,omitempty"`
+	CompactOutputPartID        string `dynamodbav:"compact_output_part_id,omitempty"`
+	CompactProgressAt          string `dynamodbav:"compact_progress_at,omitempty"`
+	CompactFinalizeRequestedAt string `dynamodbav:"compact_finalize_requested_at,omitempty"`
+	CompactInputPartCount      uint64 `dynamodbav:"compact_input_part_count,omitempty"`
+	CompactInputRows           uint64 `dynamodbav:"compact_input_rows,omitempty"`
+	CompactInputBytes          uint64 `dynamodbav:"compact_input_bytes,omitempty"`
+	CompactOutputPartCount     uint64 `dynamodbav:"compact_output_part_count,omitempty"`
+	CompactOutputRows          uint64 `dynamodbav:"compact_output_rows,omitempty"`
+	CompactOutputBytes         uint64 `dynamodbav:"compact_output_bytes,omitempty"`
 
 	ProgressUpdatedAt                string            `dynamodbav:"progress_updated_at,omitempty"`
 	ReadRows                         uint64            `dynamodbav:"read_rows,omitempty"`
@@ -502,12 +505,13 @@ func (s *Store) ReleaseCompactBatch(ctx context.Context, batch CompactBatch, wor
 	return nil
 }
 
-func (s *Store) HeartbeatCompactBatch(ctx context.Context, batch CompactBatch, workerID string, now time.Time) error {
+func (s *Store) HeartbeatCompactBatch(ctx context.Context, batch CompactBatch, workerID string, now time.Time) (bool, error) {
 	if strings.TrimSpace(workerID) == "" {
-		return errors.New("worker id is required")
+		return false, errors.New("worker id is required")
 	}
+	finalizeRequested := false
 	for _, part := range batch.Parts {
-		_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		out, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 			TableName:           aws.String(s.table),
 			Key:                 part.key(),
 			ConditionExpression: aws.String(compactOwnedOrUnownedReadyCondition()),
@@ -526,10 +530,38 @@ func (s *Store) HeartbeatCompactBatch(ctx context.Context, batch CompactBatch, w
 				":now":           stringAttr(formatTime(now)),
 				":worker":        stringAttr(workerID),
 			},
+			ReturnValues: types.ReturnValueAllNew,
 		})
 		if err != nil {
-			return fmt.Errorf("heartbeat compacting part %s/%s: %w", part.JobID, part.PartID, err)
+			return false, fmt.Errorf("heartbeat compacting part %s/%s: %w", part.JobID, part.PartID, err)
 		}
+		updated, err := unmarshalPart(out.Attributes)
+		if err != nil {
+			return false, err
+		}
+		if strings.TrimSpace(updated.CompactFinalizeRequestedAt) != "" {
+			finalizeRequested = true
+		}
+	}
+	return finalizeRequested, nil
+}
+
+func (s *Store) RequestCompactFinalization(ctx context.Context, part Part, now time.Time) error {
+	_, err := s.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:           aws.String(s.table),
+		Key:                 part.key(),
+		ConditionExpression: aws.String("#status = :compacting"),
+		UpdateExpression:    aws.String("SET compact_finalize_requested_at = :now, updated_at = :now"),
+		ExpressionAttributeNames: map[string]string{
+			"#status": "status",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":compacting": stringAttr(string(StatusCompacting)),
+			":now":        stringAttr(formatTime(now)),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("request compact finalization for %s/%s: %w", part.JobID, part.PartID, err)
 	}
 	return nil
 }
@@ -650,7 +682,7 @@ func (s *Store) CompleteCompaction(ctx context.Context, batch CompactBatch, outp
 	if len(batch.Parts) == 0 {
 		return errors.New("compact batch has no input parts")
 	}
-	if len(batch.Parts) > 99 {
+	if len(batch.Parts) > MaxCompactBatchParts {
 		return fmt.Errorf("compact batch has %d input parts, exceeds DynamoDB transaction limit", len(batch.Parts))
 	}
 	if err := validatePart(output); err != nil {
@@ -1903,6 +1935,7 @@ func compactProgressRemoveAttributes() []string {
 	return []string{
 		"compact_output_part_id",
 		"compact_progress_at",
+		"compact_finalize_requested_at",
 		"compact_input_part_count",
 		"compact_input_rows",
 		"compact_input_bytes",

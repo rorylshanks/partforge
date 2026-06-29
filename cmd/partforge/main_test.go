@@ -455,6 +455,32 @@ func TestSelectSetPartStatePartsRejectsUnknownStatus(t *testing.T) {
 	}
 }
 
+func TestSelectFinalizeCompactionPartsByOutputPartID(t *testing.T) {
+	parts := []state.Part{
+		{PartID: "part-1", Status: state.StatusCompacting, CompactOutputPartID: "compact-out"},
+		{PartID: "part-2", Status: state.StatusCompacting, CompactOutputPartID: "compact-out"},
+		{PartID: "part-3", Status: state.StatusCompacting, CompactOutputPartID: "compact-other"},
+		{PartID: "part-4", Status: state.StatusCompactReady, CompactOutputPartID: "compact-out"},
+	}
+
+	selected, err := selectFinalizeCompactionParts(parts, finalizeCompactionSelection{OutputPartID: "compact-out"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 2 || selected[0].PartID != "part-1" || selected[1].PartID != "part-2" {
+		t.Fatalf("selected = %+v, want compact-out compacting rows", selected)
+	}
+}
+
+func TestSelectFinalizeCompactionPartsRejectsNonCompactingPartID(t *testing.T) {
+	_, err := selectFinalizeCompactionParts([]state.Part{
+		{PartID: "part-1", Status: state.StatusCompactReady},
+	}, finalizeCompactionSelection{PartIDs: []string{"part-1"}})
+	if err == nil {
+		t.Fatal("expected non-compacting part error")
+	}
+}
+
 func TestAdminSettableStatusRejectsWorkerOwnedStates(t *testing.T) {
 	for _, status := range []state.Status{state.StatusReady, state.StatusCompactReady, state.StatusFinished} {
 		if !adminSettableStatus(status) {
