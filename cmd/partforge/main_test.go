@@ -14,10 +14,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/partforge/partforge/internal/freeze"
-	"github.com/partforge/partforge/internal/metrics"
-	"github.com/partforge/partforge/internal/rewrite"
-	"github.com/partforge/partforge/internal/state"
+	"github.com/PostHog/partforge/internal/freeze"
+	"github.com/PostHog/partforge/internal/metrics"
+	"github.com/PostHog/partforge/internal/rewrite"
+	"github.com/PostHog/partforge/internal/state"
 )
 
 func TestDefaultCompactWindow(t *testing.T) {

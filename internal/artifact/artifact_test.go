@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/partforge/partforge/internal/manifest"
+	"github.com/PostHog/partforge/internal/manifest"
 )
 
 func TestManifestRoundTrip(t *testing.T) {

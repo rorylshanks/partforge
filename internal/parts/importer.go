@@ -11,10 +11,10 @@ import (
 	"syscall"
 	"time"
 
-	artifactpkg "github.com/partforge/partforge/internal/artifact"
-	"github.com/partforge/partforge/internal/chhttp"
-	"github.com/partforge/partforge/internal/fileutil"
-	"github.com/partforge/partforge/internal/s3copy"
+	artifactpkg "github.com/PostHog/partforge/internal/artifact"
+	"github.com/PostHog/partforge/internal/chhttp"
+	"github.com/PostHog/partforge/internal/fileutil"
+	"github.com/PostHog/partforge/internal/s3copy"
 )
 
 type Importer struct {

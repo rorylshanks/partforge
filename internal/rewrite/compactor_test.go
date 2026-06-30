@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/partforge/partforge/internal/chhttp"
-	"github.com/partforge/partforge/internal/metrics"
+	"github.com/PostHog/partforge/internal/chhttp"
+	"github.com/PostHog/partforge/internal/metrics"
 )
 
 func TestConfigureCompactMergeSettingsDoesNotSetVerticalMergeAlgorithm(t *testing.T) {

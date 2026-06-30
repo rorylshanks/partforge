@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/partforge/partforge/internal/artifact"
-	"github.com/partforge/partforge/internal/chhttp"
-	"github.com/partforge/partforge/internal/s3copy"
+	"github.com/PostHog/partforge/internal/artifact"
+	"github.com/PostHog/partforge/internal/chhttp"
+	"github.com/PostHog/partforge/internal/s3copy"
 )
 
 func TestImportArtifactDownloadsFinishedTarballs(t *testing.T) {

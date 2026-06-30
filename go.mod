@@ -1,4 +1,4 @@
-module github.com/partforge/partforge
+module github.com/PostHog/partforge
 
 go 1.24
 

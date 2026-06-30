@@ -14,7 +14,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/partforge/partforge/internal/manifest"
+	"github.com/PostHog/partforge/internal/manifest"
 )
 
 const finishedTarCopyBufferSize = 4 * 1024 * 1024

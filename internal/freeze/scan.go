@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/partforge/partforge/internal/chhttp"
+	"github.com/PostHog/partforge/internal/chhttp"
 )
 
 type Part struct {

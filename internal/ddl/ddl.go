@@ -5,7 +5,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/partforge/partforge/internal/chhttp"
+	"github.com/PostHog/partforge/internal/chhttp"
 )
 
 func NormalizeCreateTable(query string) (string, error) {

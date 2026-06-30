@@ -13,11 +13,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/partforge/partforge/internal/artifact"
-	"github.com/partforge/partforge/internal/chhttp"
-	"github.com/partforge/partforge/internal/freeze"
-	"github.com/partforge/partforge/internal/manifest"
-	"github.com/partforge/partforge/internal/s3copy"
+	"github.com/PostHog/partforge/internal/artifact"
+	"github.com/PostHog/partforge/internal/chhttp"
+	"github.com/PostHog/partforge/internal/freeze"
+	"github.com/PostHog/partforge/internal/manifest"
+	"github.com/PostHog/partforge/internal/s3copy"
 )
 
 func TestReduceInsertSelectThreadSettings(t *testing.T) {

@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/partforge/partforge/internal/manifest"
+	"github.com/PostHog/partforge/internal/manifest"
 )
 
 const ManifestName = "manifest.json"

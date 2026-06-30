@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/partforge/partforge/internal/manifest"
+	"github.com/PostHog/partforge/internal/manifest"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	dto "github.com/prometheus/client_model/go"

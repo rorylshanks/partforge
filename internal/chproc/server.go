@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/partforge/partforge/internal/chhttp"
+	"github.com/PostHog/partforge/internal/chhttp"
 )
 
 type Config struct {
