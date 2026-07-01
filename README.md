@@ -2,19 +2,11 @@
 
 Distributed ClickHouse MergeTree part rewriting for large schema migrations.
 
-## What it is
+PartForge rewrites a large ClickHouse table into a new schema without loading the production cluster. Doing it in place - one giant `INSERT INTO new SELECT ... FROM old` or a mutation - competes with production queries for CPU, memory, and disk, and is hard to resume if it fails partway. PartForge instead freezes the source table's parts and rewrites each one on disposable workers:
 
-PartForge rewrites a large ClickHouse table into a new schema **off the production cluster**. Instead of running one giant `INSERT INTO new SELECT ... FROM old` (or a mutation) on the live cluster, it freezes the source table's parts, ships each frozen part to disposable workers that each run their own local ClickHouse, rewrites parts in parallel, optionally compacts the output, and attaches the finished parts into the destination table.
-
-## The problem it solves
-
-Rewriting a very large ClickHouse table in place is slow and disruptive: the rewrite competes with production queries for CPU, memory, and disk on the cluster you can least afford to overload, and a single long-running statement is hard to resume if it fails partway.
-
-PartForge moves that work off the cluster and breaks it into independent, per-part units:
-
-- **Off-cluster.** The heavy `INSERT ... SELECT` runs in throwaway worker containers, not on your production nodes. The cluster only does a cheap `FREEZE` at the start and `ATTACH PART` at the end.
-- **Parallel and horizontally scalable.** Each part is an independent unit of work; add more workers to go faster.
-- **Resumable.** Every part's state lives in DynamoDB, so a failed or interrupted job picks up where it left off, and individual failed parts can be retried.
+- **Off-cluster** — the heavy `INSERT ... SELECT` runs in throwaway worker containers, each with its own local ClickHouse; the production cluster only does a cheap `FREEZE` up front and `ATTACH PART` at the end.
+- **Parallel and horizontally scalable** — each part is an independent unit of work; add workers to go faster.
+- **Resumable** — every part's state lives in DynamoDB, so an interrupted job picks up where it left off and failed parts can be retried.
 
 ## When to use it
 
@@ -39,24 +31,82 @@ on source node         parts to S3;          local ClickHouse;         destinati
                        register READY        compact; FINISHED         (mark IMPORTED)
 ```
 
-Part state lifecycle:
+## Getting started
+
+Two SQL files define your migration; everything else is mechanical. Write them, then run four commands.
+
+### 1. Destination schema — `dest.sql`
+
+A single, **database-qualified** `CREATE TABLE` for the new table. The worker runs it **verbatim** to create the target table in its local ClickHouse.
+
+- The `db.table` name must **differ** from the source table's name.
+- Use a plain `MergeTree`-family engine (**not** `Replicated*`) — this is a throwaway local table in the worker.
+- Columns, `ORDER BY`, `PARTITION BY`, codecs, and table `SETTINGS` are whatever you want the new table to be.
+
+```sql
+CREATE TABLE dst_db.events_new
+(
+    id UInt64,
+    name String,
+    amount_text String,          -- was UInt32 `amount`
+    event_date Date,
+    migrated UInt8               -- new column
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (event_date, id)        -- changed sort key
+```
+
+### 2. Insert-select — `insert.sql`
+
+A single `INSERT INTO <dest> SELECT ... FROM <source>` statement. The worker runs it **verbatim** against **one attached source part at a time**.
+
+- `INSERT INTO` must name the same `db.table` as `dest.sql`.
+- `FROM` must name the original source `db.table` (the `-database`/`-table` you pass to `upload-freeze`). The worker recreates the source table locally under that name, normalizing `Replicated*MergeTree` to plain `MergeTree`.
+- The `SELECT` columns line up with the destination columns, exactly like a normal ClickHouse insert.
+- It must be correct **per part** — see [When to use it](#when-to-use-it). No `GROUP BY`, `DISTINCT`, windows, joins, or `ORDER BY ... LIMIT`.
+
+```sql
+INSERT INTO dst_db.events_new
+SELECT
+    id,
+    name,
+    toString(amount) AS amount_text,
+    event_date,
+    1 AS migrated
+FROM src_db.events
+```
+
+You don't hand-tune memory or thread settings — the worker derives insert and merge settings from the container's CPU and memory. A query-level `SETTINGS` clause is passed through if you genuinely need one.
+
+### 3. Run the pipeline
+
+Run the worker from the published image (`ghcr.io/<owner>/partforge`) — it starts its own `clickhouse-server` and shells out to `s5cmd`, both of which the image bundles. `upload-freeze` and `import-finished` use the `partforge` binary directly, near the ClickHouse nodes.
+
+```sh
+# a. Freeze the source table (on the source ClickHouse node)
+clickhouse-client --query "ALTER TABLE src_db.events FREEZE WITH NAME 'migration_001'"
+
+# b. Register parts — reads the source ClickHouse disks, uploads to S3
+partforge upload-freeze \
+  -database=src_db -table=events -freeze=migration_001 \
+  -destination-schema-file=dest.sql -insert-select-file=insert.sql \
+  -bucket=partforge
+
+# c. Rewrite — run as many worker containers as you want
+docker run --rm ghcr.io/posthog/partforge:latest worker
+
+# d. Import the finished parts into the destination table
+partforge import-finished -database=dst_db -table=events_new -job-id=<job-id>
+```
+
+`upload-freeze` prints the `job-id`. For LocalStack add `-s3-endpoint=http://localhost:4566 -dynamodb-endpoint=http://localhost:4566` to each command. Scale the rewrite by running more worker containers, ideally on ECS — see [docs/deployment.md](docs/deployment.md). Full flag reference, config, and per-stage detail are in **[docs/setup.md](docs/setup.md)**.
+
+Part state lifecycle (tracked in DynamoDB, so a job is resumable):
 
 ```
 READY -> IN_PROGRESS -> COMPACT_READY <-> COMPACTING -> FINISHED -> IMPORTING -> IMPORTED
                              (failures land in FAILED and can be retried)
-```
-
-1. **Freeze** the source table: `ALTER TABLE db.table FREEZE WITH NAME 'name'`.
-2. **`upload-freeze`** scans `system.disks`, writes a manifest into each frozen part, uploads it to S3, and registers a `READY` row per part.
-3. **`worker`** claims a part, rewrites it in a local ClickHouse using your `INSERT ... SELECT`, uploads the result, and — when no rewrite work is left — compacts finished artifacts into fewer, larger parts before promoting them to `FINISHED`.
-4. **`import-finished`** attaches the finished parts into the destination table near the destination node.
-
-## Try it
-
-The end-to-end script runs the whole pipeline against LocalStack and a ClickHouse container and verifies the result. It's the fastest way to see PartForge work and doubles as a minimal example (the migration it runs lives in `e2e/sql/`):
-
-```sh
-./e2e/run.sh    # requires Docker
 ```
 
 ## Documentation
