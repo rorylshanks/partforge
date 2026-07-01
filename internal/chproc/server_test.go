@@ -93,6 +93,22 @@ func TestArgsIncludeMergeSchedulingPolicy(t *testing.T) {
 	}
 }
 
+func TestArgsIncludeMergeConcurrencyRatio(t *testing.T) {
+	cfg := Config{Binary: "clickhouse", Tuning: Tuning{MergeConcurrencyRatio: 4.0 / 13.0}}
+	got, err := cfg.args()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"server",
+		"--",
+		"--background_merges_mutations_concurrency_ratio=0.3076923076923077",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+}
+
 func TestArgsIncludePrometheusConfig(t *testing.T) {
 	cfg := Config{Binary: "clickhouse", Prometheus: PrometheusConfig{Enabled: true, Port: 9363, Endpoint: "/metrics"}}
 	got, err := cfg.args()
@@ -152,6 +168,14 @@ func TestArgsRejectInvalidBackgroundPoolSize(t *testing.T) {
 	_, err := cfg.args()
 	if err == nil {
 		t.Fatal("expected invalid background pool size error")
+	}
+}
+
+func TestArgsRejectInvalidMergeConcurrencyRatio(t *testing.T) {
+	cfg := Config{Binary: "clickhouse", Tuning: Tuning{MergeConcurrencyRatio: -1}}
+	_, err := cfg.args()
+	if err == nil {
+		t.Fatal("expected invalid merge concurrency ratio error")
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -31,6 +32,7 @@ type Config struct {
 
 type Tuning struct {
 	BackgroundPoolSize    int
+	MergeConcurrencyRatio float64
 	MergeSchedulingPolicy string
 }
 
@@ -123,6 +125,12 @@ func (cfg Config) args() ([]string, error) {
 	}
 	if cfg.Tuning.BackgroundPoolSize > 0 {
 		configOverrides = append(configOverrides, fmt.Sprintf("--background_pool_size=%d", cfg.Tuning.BackgroundPoolSize))
+	}
+	if cfg.Tuning.MergeConcurrencyRatio < 0 {
+		return nil, fmt.Errorf("merge concurrency ratio must be non-negative, got %g", cfg.Tuning.MergeConcurrencyRatio)
+	}
+	if cfg.Tuning.MergeConcurrencyRatio > 0 {
+		configOverrides = append(configOverrides, "--background_merges_mutations_concurrency_ratio="+strconv.FormatFloat(cfg.Tuning.MergeConcurrencyRatio, 'f', -1, 64))
 	}
 	mergeSchedulingPolicy := strings.TrimSpace(cfg.Tuning.MergeSchedulingPolicy)
 	if mergeSchedulingPolicy != "" {

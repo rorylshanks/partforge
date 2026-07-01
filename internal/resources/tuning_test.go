@@ -199,6 +199,53 @@ func TestMergeBackgroundPoolSize(t *testing.T) {
 	}
 }
 
+func TestMergeConcurrencyRatio(t *testing.T) {
+	tests := []struct {
+		name       string
+		limits     Limits
+		poolSize   int
+		wantRatio  float64
+		wantMerges int
+	}{
+		{
+			name:       "small worker keeps clickhouse pool but caps merge slots to cpu count",
+			limits:     Limits{CPUs: 4},
+			poolSize:   13,
+			wantRatio:  4.0 / 13.0,
+			wantMerges: 4,
+		},
+		{
+			name:       "single cpu worker keeps minimum valid merge slots",
+			limits:     Limits{CPUs: 1},
+			poolSize:   13,
+			wantRatio:  2.0 / 13.0,
+			wantMerges: 2,
+		},
+		{
+			name:       "larger worker uses one merge slot per pool thread",
+			limits:     Limits{CPUs: 16},
+			poolSize:   16,
+			wantRatio:  1,
+			wantMerges: 16,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotRatio, gotMerges, err := MergeConcurrencyRatio(tt.limits, tt.poolSize)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotRatio != tt.wantRatio {
+				t.Fatalf("ratio = %g, want %g", gotRatio, tt.wantRatio)
+			}
+			if gotMerges != tt.wantMerges {
+				t.Fatalf("merge slots = %d, want %d", gotMerges, tt.wantMerges)
+			}
+		})
+	}
+}
+
 func mustParseUintSetting(t *testing.T, raw string) uint64 {
 	t.Helper()
 	value, err := strconv.ParseUint(raw, 10, 64)
@@ -211,6 +258,15 @@ func mustParseUintSetting(t *testing.T, raw string) uint64 {
 func TestMergeBackgroundPoolSizeRejectsInvalidCPUCount(t *testing.T) {
 	if _, err := MergeBackgroundPoolSize(Limits{}); err == nil {
 		t.Fatal("expected invalid cpu count error")
+	}
+}
+
+func TestMergeConcurrencyRatioRejectsInvalidLimits(t *testing.T) {
+	if _, _, err := MergeConcurrencyRatio(Limits{}, 13); err == nil {
+		t.Fatal("expected invalid cpu count error")
+	}
+	if _, _, err := MergeConcurrencyRatio(Limits{CPUs: 4}, 0); err == nil {
+		t.Fatal("expected invalid background pool size error")
 	}
 }
 
@@ -261,6 +317,9 @@ func TestMergeTreeSettingsForLimits(t *testing.T) {
 			}
 			if settings.DefaultCompressionCodec != DefaultCompressionCodec {
 				t.Fatalf("default_compression_codec = %q, want %q", settings.DefaultCompressionCodec, DefaultCompressionCodec)
+			}
+			if settings.PoolFreeEntriesThreshold != mergePoolFreeEntriesThreshold {
+				t.Fatalf("pool free entries threshold = %d, want %d", settings.PoolFreeEntriesThreshold, mergePoolFreeEntriesThreshold)
 			}
 		})
 	}

@@ -104,10 +104,11 @@ type Processor struct {
 }
 
 type MergeTreeSettings struct {
-	MergeMaxBlockSize       uint64
-	MergeMaxBlockSizeBytes  uint64
-	MergeSelectingSleepMS   uint64
-	DefaultCompressionCodec string
+	MergeMaxBlockSize        uint64
+	MergeMaxBlockSizeBytes   uint64
+	MergeSelectingSleepMS    uint64
+	DefaultCompressionCodec  string
+	PoolFreeEntriesThreshold uint64
 }
 
 type ProgressReporter func(context.Context, manifest.Manifest, ProgressSnapshot) error
@@ -424,6 +425,9 @@ func (p Processor) rewritePart(ctx context.Context, m manifest.Manifest, sourceP
 	if err := p.ClickHouse.Exec(ctx, sourceDDL); err != nil {
 		return rewriteResult{}, fmt.Errorf("create source table: %w", err)
 	}
+	if err := p.configureSourceMergePoolSettings(ctx, m); err != nil {
+		return rewriteResult{}, err
+	}
 	slog.Info("creating worker destination table", "stage", "prepare_worker_tables", "job_id", m.JobID, "part_id", m.PartID, "destination_table", chhttp.TableSQL(m.Dest.Database, m.Dest.Table))
 	if err := p.ClickHouse.Exec(ctx, destDDL); err != nil {
 		return rewriteResult{}, fmt.Errorf("create destination table: %w", err)
@@ -599,6 +603,30 @@ func (p Processor) runInsertSelectWithRetries(ctx context.Context, m manifest.Ma
 	}
 }
 
+func (p Processor) configureSourceMergePoolSettings(ctx context.Context, m manifest.Manifest) error {
+	mergeTreeSettings := p.MergeTreeSettings
+	table := chhttp.TableSQL(m.Source.Database, m.Source.Table)
+	if mergeTreeSettings.PoolFreeEntriesThreshold == 0 {
+		return fmt.Errorf("pool free entries threshold must be greater than zero")
+	}
+	query := "ALTER TABLE " + table +
+		" MODIFY SETTING number_of_free_entries_in_pool_to_lower_max_size_of_merge = " + strconv.FormatUint(mergeTreeSettings.PoolFreeEntriesThreshold, 10) +
+		", number_of_free_entries_in_pool_to_execute_mutation = " + strconv.FormatUint(mergeTreeSettings.PoolFreeEntriesThreshold, 10) +
+		", number_of_free_entries_in_pool_to_execute_optimize_entire_partition = " + strconv.FormatUint(mergeTreeSettings.PoolFreeEntriesThreshold, 10)
+	if err := p.ClickHouse.Exec(ctx, query); err != nil {
+		return fmt.Errorf("configure source table merge pool settings: %w", err)
+	}
+	slog.Info(
+		"configured source merge pool settings",
+		"stage", stagePrepareWorkerTables,
+		"job_id", m.JobID,
+		"part_id", m.PartID,
+		"source_table", table,
+		"pool_free_entries_threshold", mergeTreeSettings.PoolFreeEntriesThreshold,
+	)
+	return nil
+}
+
 func (p Processor) configureDestinationCompressionCodec(ctx context.Context, m manifest.Manifest) error {
 	mergeTreeSettings := p.MergeTreeSettings
 	table := chhttp.TableSQL(m.Dest.Database, m.Dest.Table)
@@ -633,6 +661,9 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 	if mergeTreeSettings.MergeSelectingSleepMS == 0 {
 		return fmt.Errorf("merge_selecting_sleep_ms must be greater than zero")
 	}
+	if mergeTreeSettings.PoolFreeEntriesThreshold == 0 {
+		return fmt.Errorf("pool free entries threshold must be greater than zero")
+	}
 	stats, err := p.activePartStats(ctx, m.Dest.Database, m.Dest.Table)
 	if err != nil {
 		return fmt.Errorf("measure destination parts before configuring merge settings: %w", err)
@@ -642,6 +673,9 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 		" MODIFY SETTING merge_max_block_size = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSize, 10) +
 		", merge_max_block_size_bytes = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSizeBytes, 10) +
 		", merge_selecting_sleep_ms = " + strconv.FormatUint(mergeTreeSettings.MergeSelectingSleepMS, 10) +
+		", number_of_free_entries_in_pool_to_lower_max_size_of_merge = " + strconv.FormatUint(mergeTreeSettings.PoolFreeEntriesThreshold, 10) +
+		", number_of_free_entries_in_pool_to_execute_mutation = " + strconv.FormatUint(mergeTreeSettings.PoolFreeEntriesThreshold, 10) +
+		", number_of_free_entries_in_pool_to_execute_optimize_entire_partition = " + strconv.FormatUint(mergeTreeSettings.PoolFreeEntriesThreshold, 10) +
 		", max_bytes_to_merge_at_max_space_in_pool = " + strconv.FormatUint(mergeBytes.MaxBytesAtMaxSpaceInPool, 10) +
 		", max_bytes_to_merge_at_min_space_in_pool = " + strconv.FormatUint(mergeBytes.MaxBytesAtMinSpaceInPool, 10)
 	if err := p.ClickHouse.Exec(ctx, query); err != nil {
@@ -656,6 +690,7 @@ func (p Processor) configureDestinationMergeSettings(ctx context.Context, m mani
 		"merge_max_block_size", mergeTreeSettings.MergeMaxBlockSize,
 		"merge_max_block_size_bytes", mergeTreeSettings.MergeMaxBlockSizeBytes,
 		"merge_selecting_sleep_ms", mergeTreeSettings.MergeSelectingSleepMS,
+		"pool_free_entries_threshold", mergeTreeSettings.PoolFreeEntriesThreshold,
 		"destination_active_parts", stats.Count,
 		"destination_active_bytes_on_disk", stats.Bytes,
 		"max_bytes_to_merge_at_max_space_in_pool", mergeBytes.MaxBytesAtMaxSpaceInPool,

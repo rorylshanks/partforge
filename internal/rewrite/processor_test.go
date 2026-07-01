@@ -186,9 +186,10 @@ func TestConfigureDestinationMergeSettings(t *testing.T) {
 	err := (Processor{
 		ClickHouse: chhttp.Client{URL: server.URL},
 		MergeTreeSettings: MergeTreeSettings{
-			MergeMaxBlockSize:      32768,
-			MergeMaxBlockSizeBytes: 67108864,
-			MergeSelectingSleepMS:  1000,
+			MergeMaxBlockSize:        32768,
+			MergeMaxBlockSizeBytes:   67108864,
+			MergeSelectingSleepMS:    1000,
+			PoolFreeEntriesThreshold: 1,
 		},
 	}).configureDestinationMergeSettings(context.Background(), manifest.Manifest{
 		JobID:  "job-1",
@@ -198,7 +199,7 @@ func TestConfigureDestinationMergeSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864, merge_selecting_sleep_ms = 1000, max_bytes_to_merge_at_max_space_in_pool = 161061273600, max_bytes_to_merge_at_min_space_in_pool = 161061273600"
+	want := "ALTER TABLE `db`.`query_log_archive_temp` MODIFY SETTING merge_max_block_size = 32768, merge_max_block_size_bytes = 67108864, merge_selecting_sleep_ms = 1000, number_of_free_entries_in_pool_to_lower_max_size_of_merge = 1, number_of_free_entries_in_pool_to_execute_mutation = 1, number_of_free_entries_in_pool_to_execute_optimize_entire_partition = 1, max_bytes_to_merge_at_max_space_in_pool = 161061273600, max_bytes_to_merge_at_min_space_in_pool = 161061273600"
 	if len(queries) != 2 || queries[1] != want {
 		t.Fatalf("queries = %#v, want %q", queries, want)
 	}
@@ -275,10 +276,11 @@ func TestRunInsertSelectRetryDoesNotApplyDestinationMergeSettings(t *testing.T) 
 			"max_insert_threads": "2",
 		},
 		MergeTreeSettings: MergeTreeSettings{
-			MergeMaxBlockSize:       32768,
-			MergeMaxBlockSizeBytes:  67108864,
-			MergeSelectingSleepMS:   1000,
-			DefaultCompressionCodec: "ZSTD(5)",
+			MergeMaxBlockSize:        32768,
+			MergeMaxBlockSizeBytes:   67108864,
+			MergeSelectingSleepMS:    1000,
+			DefaultCompressionCodec:  "ZSTD(5)",
+			PoolFreeEntriesThreshold: 1,
 		},
 	}).runInsertSelectWithRetries(context.Background(), manifest.Manifest{
 		JobID:  "job-1",

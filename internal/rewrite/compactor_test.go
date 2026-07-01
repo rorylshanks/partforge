@@ -30,9 +30,10 @@ func TestConfigureCompactMergeSettingsDoesNotSetVerticalMergeAlgorithm(t *testin
 	err := (Compactor{
 		ClickHouse: chhttp.Client{URL: server.URL},
 		MergeTreeSettings: MergeTreeSettings{
-			MergeMaxBlockSize:      32768,
-			MergeMaxBlockSizeBytes: 67108864,
-			MergeSelectingSleepMS:  1000,
+			MergeMaxBlockSize:        32768,
+			MergeMaxBlockSizeBytes:   67108864,
+			MergeSelectingSleepMS:    1000,
+			PoolFreeEntriesThreshold: 1,
 		},
 	}).configureCompactMergeSettings(context.Background(), CompactWorkItem{
 		JobID:               "job-1",

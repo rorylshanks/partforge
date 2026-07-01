@@ -23,6 +23,7 @@ const (
 	mergeMemoryBudgetPercent        uint64 = 60
 	mergeMemoryConcurrencyDivisor   uint64 = 8
 	minMergeBackgroundPoolSize             = 13
+	minMergeConcurrency                    = 2
 	minMergeMaxBlockSizeBytes       uint64 = 4 * 1024 * 1024
 	maxMergeMaxBlockSizeBytes       uint64 = 256 * 1024 * 1024
 	minMergeMaxBlockSizeRows        uint64 = 8192
@@ -30,6 +31,7 @@ const (
 	targetMergeAverageRowSizeBytes  uint64 = 1024
 	defaultMergeSelectingSleepMS    uint64 = 1000
 	defaultMergeSchedulingPolicy           = "shortest_task_first"
+	mergePoolFreeEntriesThreshold   uint64 = 1
 )
 
 type Limits struct {
@@ -47,12 +49,27 @@ func MergeBackgroundPoolSize(limits Limits) (int, error) {
 	return limits.CPUs, nil
 }
 
+func MergeConcurrencyRatio(limits Limits, backgroundPoolSize int) (float64, int, error) {
+	if limits.CPUs < 1 {
+		return 0, 0, fmt.Errorf("cpu limit must be at least 1, got %d", limits.CPUs)
+	}
+	if backgroundPoolSize < 1 {
+		return 0, 0, fmt.Errorf("background pool size must be at least 1, got %d", backgroundPoolSize)
+	}
+	concurrency := limits.CPUs
+	if concurrency < minMergeConcurrency {
+		concurrency = minMergeConcurrency
+	}
+	return float64(concurrency) / float64(backgroundPoolSize), concurrency, nil
+}
+
 type MergeTreeSettings struct {
-	MergeMaxBlockSize       uint64
-	MergeMaxBlockSizeBytes  uint64
-	MergeSelectingSleepMS   uint64
-	MergeSchedulingPolicy   string
-	DefaultCompressionCodec string
+	MergeMaxBlockSize        uint64
+	MergeMaxBlockSizeBytes   uint64
+	MergeSelectingSleepMS    uint64
+	MergeSchedulingPolicy    string
+	DefaultCompressionCodec  string
+	PoolFreeEntriesThreshold uint64
 }
 
 func DetectLimits() (Limits, error) {
@@ -130,11 +147,12 @@ func MergeTreeSettingsForLimits(limits Limits) (MergeTreeSettings, error) {
 	mergeMaxBlockSize = clampUint64(mergeMaxBlockSize, minMergeMaxBlockSizeRows, maxMergeMaxBlockSizeRows)
 	mergeMaxBlockSize = roundDownToMultiple(mergeMaxBlockSize, minMergeMaxBlockSizeRows)
 	return MergeTreeSettings{
-		MergeMaxBlockSize:       mergeMaxBlockSize,
-		MergeMaxBlockSizeBytes:  mergeMaxBlockSizeBytes,
-		MergeSelectingSleepMS:   defaultMergeSelectingSleepMS,
-		MergeSchedulingPolicy:   defaultMergeSchedulingPolicy,
-		DefaultCompressionCodec: DefaultCompressionCodec,
+		MergeMaxBlockSize:        mergeMaxBlockSize,
+		MergeMaxBlockSizeBytes:   mergeMaxBlockSizeBytes,
+		MergeSelectingSleepMS:    defaultMergeSelectingSleepMS,
+		MergeSchedulingPolicy:    defaultMergeSchedulingPolicy,
+		DefaultCompressionCodec:  DefaultCompressionCodec,
+		PoolFreeEntriesThreshold: mergePoolFreeEntriesThreshold,
 	}, nil
 }
 

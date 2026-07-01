@@ -330,11 +330,17 @@ func (c Compactor) configureCompactMergeSettings(ctx context.Context, item Compa
 	if mergeTreeSettings.MergeSelectingSleepMS == 0 {
 		return fmt.Errorf("merge_selecting_sleep_ms must be greater than zero")
 	}
+	if mergeTreeSettings.PoolFreeEntriesThreshold == 0 {
+		return fmt.Errorf("pool free entries threshold must be greater than zero")
+	}
 	mergeBytes := targetMergePoolByteSettings()
 	query := "ALTER TABLE " + table +
 		" MODIFY SETTING merge_max_block_size = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSize, 10) +
 		", merge_max_block_size_bytes = " + strconv.FormatUint(mergeTreeSettings.MergeMaxBlockSizeBytes, 10) +
 		", merge_selecting_sleep_ms = " + strconv.FormatUint(mergeTreeSettings.MergeSelectingSleepMS, 10) +
+		", number_of_free_entries_in_pool_to_lower_max_size_of_merge = " + strconv.FormatUint(mergeTreeSettings.PoolFreeEntriesThreshold, 10) +
+		", number_of_free_entries_in_pool_to_execute_mutation = " + strconv.FormatUint(mergeTreeSettings.PoolFreeEntriesThreshold, 10) +
+		", number_of_free_entries_in_pool_to_execute_optimize_entire_partition = " + strconv.FormatUint(mergeTreeSettings.PoolFreeEntriesThreshold, 10) +
 		", max_bytes_to_merge_at_max_space_in_pool = " + strconv.FormatUint(mergeBytes.MaxBytesAtMaxSpaceInPool, 10) +
 		", max_bytes_to_merge_at_min_space_in_pool = " + strconv.FormatUint(mergeBytes.MaxBytesAtMinSpaceInPool, 10)
 	if err := c.ClickHouse.Exec(ctx, query); err != nil {
@@ -349,6 +355,7 @@ func (c Compactor) configureCompactMergeSettings(ctx context.Context, item Compa
 		"merge_max_block_size", mergeTreeSettings.MergeMaxBlockSize,
 		"merge_max_block_size_bytes", mergeTreeSettings.MergeMaxBlockSizeBytes,
 		"merge_selecting_sleep_ms", mergeTreeSettings.MergeSelectingSleepMS,
+		"pool_free_entries_threshold", mergeTreeSettings.PoolFreeEntriesThreshold,
 		"destination_active_bytes_on_disk", activeBytes,
 		"max_bytes_to_merge_at_max_space_in_pool", mergeBytes.MaxBytesAtMaxSpaceInPool,
 		"max_bytes_to_merge_at_min_space_in_pool", mergeBytes.MaxBytesAtMinSpaceInPool,
