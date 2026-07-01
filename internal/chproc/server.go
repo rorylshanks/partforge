@@ -109,8 +109,16 @@ func (cfg Config) args() ([]string, error) {
 	if !strings.Contains(filepath.Base(cfg.Binary), "clickhouse-server") {
 		args = append(args, "server")
 	}
-	if cfg.ConfigFile != "" {
-		args = append(args, "--config-file="+cfg.ConfigFile)
+	configFile := strings.TrimSpace(cfg.ConfigFile)
+	if cfg.Tuning.MergePoolFreeEntriesThreshold > 0 {
+		var err error
+		configFile, err = cfg.generatedConfigFile(configFile)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if configFile != "" {
+		args = append(args, "--config-file="+configFile)
 	}
 	var configOverrides []string
 	if strings.TrimSpace(cfg.DataDir) != "" {
@@ -137,14 +145,6 @@ func (cfg Config) args() ([]string, error) {
 	if mergeSchedulingPolicy != "" {
 		configOverrides = append(configOverrides, "--background_merges_mutations_scheduling_policy="+mergeSchedulingPolicy)
 	}
-	if cfg.Tuning.MergePoolFreeEntriesThreshold > 0 {
-		threshold := strconv.FormatUint(cfg.Tuning.MergePoolFreeEntriesThreshold, 10)
-		configOverrides = append(configOverrides,
-			"--merge_tree.number_of_free_entries_in_pool_to_lower_max_size_of_merge="+threshold,
-			"--merge_tree.number_of_free_entries_in_pool_to_execute_mutation="+threshold,
-			"--merge_tree.number_of_free_entries_in_pool_to_execute_optimize_entire_partition="+threshold,
-		)
-	}
 	prometheusOverrides, err := prometheusConfigOverrides(cfg.Prometheus)
 	if err != nil {
 		return nil, err
@@ -155,6 +155,103 @@ func (cfg Config) args() ([]string, error) {
 		args = append(args, configOverrides...)
 	}
 	return args, nil
+}
+
+func (cfg Config) generatedConfigFile(configFile string) (string, error) {
+	if strings.TrimSpace(configFile) == "" {
+		return "", fmt.Errorf("config file is required when merge pool free entries threshold is set")
+	}
+	configFile, err := filepath.Abs(configFile)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Stat(configFile); err != nil {
+		return "", fmt.Errorf("stat clickhouse config file %s: %w", configFile, err)
+	}
+
+	root, err := generatedConfigRoot(cfg.DataDir)
+	if err != nil {
+		return "", err
+	}
+	if err := os.RemoveAll(root); err != nil {
+		return "", fmt.Errorf("remove generated clickhouse config directory: %w", err)
+	}
+	configD := filepath.Join(root, "config.d")
+	if err := os.MkdirAll(configD, 0o755); err != nil {
+		return "", fmt.Errorf("create generated clickhouse config directory: %w", err)
+	}
+
+	baseDir := filepath.Dir(configFile)
+	if err := os.Symlink(configFile, filepath.Join(root, "config.xml")); err != nil {
+		return "", fmt.Errorf("symlink clickhouse config file: %w", err)
+	}
+	if err := symlinkIfExists(filepath.Join(baseDir, "users.xml"), filepath.Join(root, "users.xml")); err != nil {
+		return "", err
+	}
+	if err := symlinkIfExists(filepath.Join(baseDir, "users.d"), filepath.Join(root, "users.d")); err != nil {
+		return "", err
+	}
+	if err := symlinkDirectoryEntries(filepath.Join(baseDir, "config.d"), configD); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(configD, "partforge-merge-tree.xml"), []byte(mergeTreeConfigXML(cfg.Tuning.MergePoolFreeEntriesThreshold)), 0o644); err != nil {
+		return "", fmt.Errorf("write generated clickhouse merge-tree config: %w", err)
+	}
+	return filepath.Join(root, "config.xml"), nil
+}
+
+func generatedConfigRoot(dataDir string) (string, error) {
+	if strings.TrimSpace(dataDir) == "" {
+		return os.MkdirTemp("", "partforge-clickhouse-config-*")
+	}
+	root, err := filepath.Abs(dataDir)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Clean(root), "partforge-config"), nil
+}
+
+func symlinkIfExists(source, target string) error {
+	if _, err := os.Stat(source); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat clickhouse config path %s: %w", source, err)
+	}
+	if err := os.Symlink(source, target); err != nil {
+		return fmt.Errorf("symlink clickhouse config path %s: %w", source, err)
+	}
+	return nil
+}
+
+func symlinkDirectoryEntries(sourceDir, targetDir string) error {
+	entries, err := os.ReadDir(sourceDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read clickhouse config directory %s: %w", sourceDir, err)
+	}
+	for _, entry := range entries {
+		source := filepath.Join(sourceDir, entry.Name())
+		target := filepath.Join(targetDir, entry.Name())
+		if err := os.Symlink(source, target); err != nil {
+			return fmt.Errorf("symlink clickhouse config path %s: %w", source, err)
+		}
+	}
+	return nil
+}
+
+func mergeTreeConfigXML(threshold uint64) string {
+	value := strconv.FormatUint(threshold, 10)
+	return `<clickhouse>
+  <merge_tree>
+    <number_of_free_entries_in_pool_to_lower_max_size_of_merge>` + value + `</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+    <number_of_free_entries_in_pool_to_execute_mutation>` + value + `</number_of_free_entries_in_pool_to_execute_mutation>
+    <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>` + value + `</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>
+  </merge_tree>
+</clickhouse>
+`
 }
 
 func prometheusConfigOverrides(cfg PrometheusConfig) ([]string, error) {
